@@ -155,7 +155,11 @@ class WriterAgent(BaseAgent):
         Select these segments as the basis for outline generation. Note that we only focus on relevance to the question, so when generating the outline, do not add unrelated sections just for the sake of length. Additionally, the sections should flow logically and not be too disjointed, as this would harm the readability of the final output.  
         - The overall structure must be **logically clear**, with **no repetition or redundancy** between chapters.  
         - **Note1:** The generated outline must not only have chapter-level headings (Level 1) highly relevant to the user’s question, but the subheadings (Level 2) must also be highly relevant to the user’s question. It is not permitted to generate chapter titles with weak relevance, whether Level 1 or Level 2.
-        - **Note2:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, be careful not to generate too many Level 2 headings, limit them to 4. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
+        - **Note2:** STRICT NUMBERING AND MARKDOWN FORMAT REQUIRED: 
+            - Level 1 headings (Chapters) MUST use Markdown '##' (H2) and Chinese numerals followed by a dunhao (e.g., "## 一、引言", "## 二、核心概念"). Do NOT use "1." or "Chapter 1".
+            - Level 2 headings (Subsections) MUST use Markdown '###' (H3) and hierarchical Arabic numbering (e.g., "### 1.1 背景", "### 1.2 目标", "### 2.1 主要发现").
+            - This structure is CRITICAL for the final PDF table of contents.
+        - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 4-8) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
         
         2. FILE CLASSIFICATION  
         - Use the search_result_classifier tool to reasonably split the outline generated above and accurately assign key files to each chapter of the outline.
@@ -230,31 +234,63 @@ For each function call, return a JSON object placed within the [unused11][unused
             return res
 
         key_files_dict = {}
+        # 【关键修复】使用行号作为文件序号，确保和 merge_reports 一致
+        file_path_to_line_num = {}
 
         server_analysis_path = f"doc_analysis/file_analysis.jsonl"
         self.logger.debug(f"Loading analysis from MCP server: {server_analysis_path}")
         file_analysis_list = load_json_from_server(server_analysis_path)
 
-        for file_info in file_analysis_list:
+        # 【关键修复】用于过滤无效文件的关键词
+        invalid_content_keywords = [
+            '安全验证', 'CAPTCHA', 'captcha', '验证码',
+            '404', '403', 'Forbidden', 'placeholder page', 'error page',
+            'no substantive content', 'lacks substantive content',
+            'does not provide any substantive', '没有实质性的信息',
+            'currently missing', 'content is missing', '内容缺失'
+        ]
+
+        for line_num, file_info in enumerate(file_analysis_list, 1):
             if file_info.get('file_path'):
-                key_files_dict[file_info.get('file_path')] = file_info
+                file_path = file_info.get('file_path')
+                doc_time = file_info.get('doc_time', '')
+                core_content = file_info.get('core_content', '')
+                
+                # 跳过处理失败的文件
+                if doc_time == "Processing failed":
+                    self.logger.warning(f"跳过处理失败的文件 [{line_num}]: {file_path}")
+                    continue
+                
+                # 跳过内容无效的文件
+                is_invalid = any(kw.lower() in core_content.lower() for kw in invalid_content_keywords)
+                if is_invalid:
+                    self.logger.warning(f"跳过内容无效的文件 [{line_num}]: {file_path}")
+                    continue
+                
+                key_files_dict[file_path] = file_info
+                file_path_to_line_num[file_path] = line_num
 
         file_core_content = ""
         if hasattr(task_input, 'key_files') and task_input.key_files:
             message += "Key Files:\n"
-            for i, file_ in enumerate(task_input.key_files, 1):
+            valid_file_count = 0
+            for file_ in task_input.key_files:
                 file_path = file_.get('file_path')
                 if file_path in key_files_dict:
+                    valid_file_count += 1
+                    # 【关键修复】使用 file_analysis.jsonl 的行号作为引用序号
+                    line_num = file_path_to_line_num.get(file_path, valid_file_count)
                     file_info = key_files_dict[file_path]
                     doc_time = file_info.get('doc_time', 'Not specified')
                     source_authority = file_info.get('source_authority', 'Not assessed')
                     task_relevance = file_info.get('task_relevance', 'Not assessed')
                     information_richness = file_info.get('information_richness', 'Not assessed')
-                    message += f"{i}. File: {file_path}\n"
+                    message += f"{line_num}. File: {file_path}\n"
 
-                    file_core_content += f"[{str(i)}]doc_time:{doc_time}|||source_authority:{source_authority}|||task_relevance:{task_relevance}|||information_richness:{information_richness}|||summary_content:{file_info.get('core_content', '')}\n"
+                    file_core_content += f"[{str(line_num)}]doc_time:{doc_time}|||source_authority:{source_authority}|||task_relevance:{task_relevance}|||information_richness:{information_richness}|||summary_content:{file_info.get('core_content', '')}\n"
             message += "\n"
             message += f"file_core_content: {file_core_content}\n"
+            self.logger.info(f"Writer 使用 {valid_file_count} 个有效文件（已过滤处理失败和内容无效的文件）")
         else:
             message += "Key Files: None provided\n"
 

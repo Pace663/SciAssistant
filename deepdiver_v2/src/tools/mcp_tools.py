@@ -33,8 +33,8 @@ from typing import Optional
 
 import feedparser
 from .paper import Paper
-from .normalizer import Area, CompanyStatus, DateRange, normalize_company_name
-
+from config.logging_config import get_logger
+logger = get_logger()
 # from markdown_pdf import MarkdownPdf, Section  # 改用 ReportLab
 
 # ReportLab imports for PDF generation
@@ -43,16 +43,30 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Preformatted, \
-        Image as RLImage, HRFlowable
+        Image as RLImage, HRFlowable, Flowable
     from reportlab.lib import colors
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY, TA_RIGHT
+    
+    # 尝试导入 Bookmark 和 TableOfContents（用于创建 PDF 书签）
+    try:
+        from reportlab.platypus.tableofcontents import TableOfContents
+        from reportlab.platypus.paragraph import Paragraph as BaseParagraph
+        BOOKMARK_AVAILABLE = True
+    except ImportError:
+        BOOKMARK_AVAILABLE = False
+        logger.info("提示: TableOfContents 不可用，PDF 将不包含书签导航")
 
     REPORTLAB_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     REPORTLAB_AVAILABLE = False
-    logger.warning("警告: ReportLab 未安装，请运行: pip install reportlab")
+    BOOKMARK_AVAILABLE = False
+    logger.warning(f"警告: ReportLab 未安装或导入失败: {e}，请运行: pip install reportlab")
+except Exception as e:
+    REPORTLAB_AVAILABLE = False
+    BOOKMARK_AVAILABLE = False
+    logger.error(f"错误: ReportLab 导入时发生异常: {e}")
 
 # 尝试导入matplotlib用于渲染数学公式
 try:
@@ -526,9 +540,29 @@ def _process_inline_formatting(text: str) -> str:
         # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
         return f'[{num}] <font name="EmojiFont">📎</font> {title}, <a href="{url}" color="#04B5BB">{url}</a>{date_part}'
 
+    # 辅助函数：判断URL是否为PDF链接
+    def is_pdf_url(url):
+        if not url:
+            return False
+        url_lower = url.lower()
+        # 1. 以.pdf结尾
+        if url_lower.endswith('.pdf'):
+            return True
+        # 2. arxiv.org/pdf/xxxx 格式（不以.pdf结尾）
+        if 'arxiv.org/pdf/' in url_lower:
+            return True
+        # 3. medrxiv/biorxiv的PDF格式
+        if ('medrxiv.org/content/' in url_lower or 'biorxiv.org/content/' in url_lower) and '.full.pdf' in url_lower:
+            return True
+        return False
+
     # 改进的正则表达式1：根据URL是否以.pdf结尾来判断PDF引用（不管标题是什么）
     # 这样可以正确识别标题不含.pdf但URL是PDF的情况，如：[1] BD CD Marker Handbook, https://example.com/file.pdf
     text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?\.pdf)(?:，(.+?))?(?=\s*\n|\s*$)',
+                  replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 改进的正则表达式1.1：匹配arxiv.org/pdf/格式的PDF链接（不以.pdf结尾）
+    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://arxiv\.org/pdf/[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 格式2: [数字] 标题，URL，日期 - 网页引用
@@ -703,13 +737,72 @@ def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
     return ''.join(out)
 
 
+class PDFBookmark(Flowable):
+    """自定义 PDF 书签类，用于在 PDF 中创建可点击的目录导航"""
+    def __init__(self, title: str, level: int, key: str = None):
+        Flowable.__init__(self)
+        self.title = title
+        self.level = level
+        self.key = key or f'bookmark_{id(self)}'
+    
+    def wrap(self, availWidth, availHeight):
+        """计算书签占用的空间（不占用空间）"""
+        return 0, 0
+
+    def draw(self):
+        """在 PDF 中绘制（添加）书签"""
+        # 使用 canvas.bookmarkPage 创建书签锚点
+        self.canv.bookmarkPage(self.key)
+        # 使用 canvas.addOutlineEntry 添加到 PDF 大纲（目录）
+        self.canv.addOutlineEntry(self.title, self.key, level=self.level)
+
+
+def _find_font_with_priority(font_name: str, system_paths: List[str]) -> Optional[str]:
+    """
+    按优先级查找字体文件：先查找 ./Font/ 目录，再回退到系统路径
+    
+    Args:
+        font_name: 字体名称（如 'simhei', 'simsun', 'arial'）
+        system_paths: 系统字体路径列表（按优先级排序）
+    
+    Returns:
+        找到的字体文件路径，如果都找不到则返回 None
+    """
+    # 1. 优先从相对路径 ./Font/ 中查找
+    font_dir = Path("./../../../Font")
+
+    if font_dir.exists() and font_dir.is_dir():
+        # 支持的字体文件扩展名
+        extensions = ['.ttf', '.ttc', '.TTF', '.TTC']
+        
+        for ext in extensions:
+            # 尝试不同的文件名格式
+            font_file = font_dir / f"{font_name}{ext}"
+            if font_file.exists():
+                return str(font_file.absolute())
+            
+            # 尝试大写文件名
+            font_file_upper = font_dir / f"{font_name.upper()}{ext}"
+            if font_file_upper.exists():
+                return str(font_file_upper.absolute())
+    
+    # 2. 回退到系统路径查找
+    for system_path in system_paths:
+        if system_path and os.path.exists(system_path):
+            return system_path
+    
+    # 3. 都找不到
+    logger.warning(f"字体 '{font_name}' 在 ./Font/ 和系统路径中均未找到")
+    return None
+
+
 def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> bool:
     """
     使用 ReportLab 将 Markdown 内容转换为 PDF，支持中文字体（黑体标题，宋体正文）
 
     Args:
         markdown_content: Markdown 格式的内容
-        output_path: PDF 输出路径
+        output_path: 输出 PDF 文件路径
 
     Returns:
         bool: 是否成功生成 PDF
@@ -719,94 +812,114 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         return False
 
     try:
-        # 注册中文字体（使用系统字体）
+        # 注册中文字体（优先从 ./Font/ 目录加载，回退到系统字体）
         import platform
         system = platform.system()
 
-        # 根据操作系统选择字体路径
+        # 根据操作系统选择系统字体路径（作为回退选项）
         if system == "Windows":
-            # Windows 字体路径
-            simsun_path = "C:/Windows/Fonts/simsun.ttc"  # 宋体
-            simhei_path = "C:/Windows/Fonts/simhei.ttf"  # 黑体
-            arial_path = "C:/Windows/Fonts/arial.ttf"  # Arial
-            symbol_path = "C:/Windows/Fonts/seguisym.ttf"  # Segoe UI Symbol（优先）
-            emoji_path = "C:/Windows/Fonts/seguiemj.ttf"  # Segoe UI Emoji（备选）
+            # Windows 系统字体路径
+            simsun_system_paths = ["C:/Windows/Fonts/simsun.ttf"]
+            simhei_system_paths = ["C:/Windows/Fonts/simhei.ttf"]
+            arial_system_paths = ["C:/Windows/Fonts/arial.ttf"]
+            symbol_system_paths = ["C:/Windows/Fonts/seguisym.ttf"]
+            emoji_system_paths = ["C:/Windows/Fonts/seguiemj.ttf", "C:/Windows/Fonts/seguisym.ttf"]
         elif system == "Linux":
-            # Linux 字体路径（可能需要安装中文字体包）
-            simsun_path = "/usr/share/fonts/dejavu/SIMSUN.TTC"
-            simhei_path = "/usr/share/fonts/dejavu/SIMHEI.TTF"
-            arial_path = "/usr/share/fonts/dejavu/ARIAL.TTF"  # Linux Arial path (if installed)
-            symbol_path = "/usr/share/fonts/dejavu/DejaVuSans.ttf"  # Linux fallback
-            # 使用黑白emoji字体（多个可能的路径）
-            emoji_paths = [
-                "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",  # Noto Emoji 黑白版本
+            # Linux 系统字体路径
+            simsun_system_paths = ["/usr/share/fonts/dejavu/SIMSUN.TTC"]
+            simhei_system_paths = ["/usr/share/fonts/dejavu/SIMHEI.TTF"]
+            arial_system_paths = ["/usr/share/fonts/dejavu/ARIAL.TTF"]
+            symbol_system_paths = ["/usr/share/fonts/dejavu/DejaVuSans.ttf"]
+            emoji_system_paths = [
+                "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
                 "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
                 "/usr/share/fonts/google-noto-emoji/NotoEmoji-Regular.ttf",
-                symbol_path  # 最后的备选方案：DejaVuSans
+                "/usr/share/fonts/dejavu/DejaVuSans.ttf"
             ]
-            emoji_path = None
-            for path in emoji_paths:
-                if os.path.exists(path):
-                    emoji_path = path
-                    break
-            if not emoji_path:
-                emoji_path = symbol_path  # 默认使用symbol_path
         else:  # macOS
-            simsun_path = "/System/Library/Fonts/STHeiti Light.ttc"
-            simhei_path = "/System/Library/Fonts/STHeiti Medium.ttc"
-            arial_path = "/Library/Fonts/Arial.ttf"
-            symbol_path = "/System/Library/Fonts/AppleSymbols.ttf"  # Apple Symbols
-            emoji_path = "/System/Library/Fonts/Apple Color Emoji.ttc"  # Apple Color Emoji
+            simsun_system_paths = ["/System/Library/Fonts/STHeiti Light.ttc"]
+            simhei_system_paths = ["/System/Library/Fonts/STHeiti Medium.ttc"]
+            arial_system_paths = ["/Library/Fonts/Arial.ttf"]
+            symbol_system_paths = ["/System/Library/Fonts/AppleSymbols.ttf"]
+            emoji_system_paths = ["/System/Library/Fonts/Apple Color Emoji.ttc"]
+
+        # 使用优先级查找加载字体
+        simsun_path = _find_font_with_priority('simsun', simsun_system_paths)
+        simhei_path = _find_font_with_priority('simhei', simhei_system_paths)
+        arial_path = _find_font_with_priority('arial', arial_system_paths)
+        symbol_path = _find_font_with_priority('symbol', symbol_system_paths)
 
         # 注册字体
         try:
-            pdfmetrics.registerFont(TTFont('SimSun', simsun_path))
-            pdfmetrics.registerFont(TTFont('SimHei', simhei_path))
-            # 尝试注册Arial字体以支持特殊符号
-            if os.path.exists(arial_path):
+            from reportlab.pdfbase.pdfmetrics import registerFontFamily
+            
+            # 注册宋体
+            if simsun_path:
+                pdfmetrics.registerFont(TTFont('SimSun', simsun_path))
+                # 注册宋体字体族（让 bold 和 italic 都指向同一个字体）
+                registerFontFamily('SimSun', normal='SimSun', bold='SimSun', italic='SimSun', boldItalic='SimSun')
+            else:
+                raise FileNotFoundError("宋体字体文件未找到")
+            
+            # 注册黑体
+            if simhei_path:
+                pdfmetrics.registerFont(TTFont('SimHei', simhei_path))
+                # 注册黑体字体族（让 bold 和 italic 都指向同一个字体）
+                registerFontFamily('SimHei', normal='SimHei', bold='SimHei', italic='SimHei', boldItalic='SimHei')
+            else:
+                raise FileNotFoundError("黑体字体文件未找到")
+            
+            # 注册Arial字体（可选）
+            if arial_path:
                 pdfmetrics.registerFont(TTFont('Arial', arial_path))
+                registerFontFamily('Arial', normal='Arial', bold='Arial', italic='Arial', boldItalic='Arial')
             else:
-                logger.warning(f"Arial字体文件不存在: {arial_path}")
+                logger.warning("Arial字体文件未找到，将使用默认字体")
 
-            # 尝试注册符号字体
-            if os.path.exists(symbol_path):
+            # 注册符号字体（可选）
+            if symbol_path:
                 pdfmetrics.registerFont(TTFont('SymbolFont', symbol_path))
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont', boldItalic='SymbolFont')
+            elif arial_path:
+                pdfmetrics.registerFont(TTFont('SymbolFont', arial_path))
+                registerFontFamily('SymbolFont', normal='SymbolFont', bold='SymbolFont', italic='SymbolFont', boldItalic='SymbolFont')
+                logger.info(f"使用Arial作为符号字体备选")
             else:
-                # 如果没有专门的符号字体，尝试用Arial
-                if os.path.exists(arial_path):
-                    pdfmetrics.registerFont(TTFont('SymbolFont', arial_path))
-                else:
-                    logger.warning(f"符号字体文件不存在: {symbol_path}")
+                logger.warning("符号字体文件未找到")
 
-            # 尝试注册emoji字体（用于显示📎 🌐等图标）
+            # 注册emoji字体（用于显示📎 🌐等图标）
             emoji_registered = False
-            if emoji_path and os.path.exists(emoji_path):
-                try:
-                    pdfmetrics.registerFont(TTFont('EmojiFont', emoji_path))
-                    logger.info(f"成功注册Emoji字体: {emoji_path}")
-                    emoji_registered = True
-                except Exception as e:
-                    logger.warning(f"注册Emoji字体失败 {emoji_path}: {e}，尝试备选方案")
+            emoji_path = None
 
-            # 如果emoji字体注册失败，使用symbol_path作为备选
+            # 尝试从多个路径加载emoji字体
+            for sys_path in emoji_system_paths:
+                emoji_path = _find_font_with_priority('emoji', [sys_path])
+                if emoji_path:
+                    try:
+                        pdfmetrics.registerFont(TTFont('EmojiFont', emoji_path))
+                        emoji_registered = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"注册Emoji字体失败 {emoji_path}: {e}")
+            
+            # 如果emoji字体注册失败，使用备选方案
             if not emoji_registered:
-                if os.path.exists(symbol_path):
+                if symbol_path:
                     pdfmetrics.registerFont(TTFont('EmojiFont', symbol_path))
                     logger.info(f"使用符号字体作为Emoji备选: {symbol_path}")
                     emoji_registered = True
-                elif os.path.exists(arial_path):
+                elif arial_path:
                     pdfmetrics.registerFont(TTFont('EmojiFont', arial_path))
                     logger.info(f"使用Arial字体作为Emoji备选: {arial_path}")
                     emoji_registered = True
                 else:
-                    logger.warning(f"Emoji字体文件不存在: {emoji_path}，emoji图标可能无法显示")
+                    logger.warning("Emoji字体文件未找到，emoji图标可能无法显示")
 
-            # 注册emoji字体族（关键：让bold和italic都指向同一个字体，避免"Can't map determine family/bold/italic"错误）
+            # 注册emoji字体族（让bold和italic都指向同一个字体，避免"Can't map determine family/bold/italic"错误）
             if emoji_registered:
                 from reportlab.pdfbase.pdfmetrics import registerFontFamily
                 registerFontFamily('EmojiFont', normal='EmojiFont', bold='EmojiFont', italic='EmojiFont',
                                    boldItalic='EmojiFont')
-                logger.info(f"成功注册EmojiFont字体族")
 
         except Exception as e:
             logger.warning(f"警告: 无法注册字体: {e}，将使用默认字体")
@@ -964,6 +1077,9 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         in_math_block = False
         code_block_lines = []
         math_block_lines = []
+        
+        # 跟踪上一个标题的大纲层级，防止层级跳跃（如从1直接跳到3）导致的错误
+        last_outline_level = -1
 
         while i < len(lines):
             line = lines[i].strip()
@@ -1216,24 +1332,51 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                     continue
 
             # 处理标题（从最长的开始匹配，避免误匹配）
+            target_level = -1
+            style = None
+            prefix_len = 0
+            
             if line.startswith('###### '):
-                text = _process_inline_formatting(line[7:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h6))
+                target_level = 5
+                style = style_h6
+                prefix_len = 7
             elif line.startswith('##### '):
-                text = _process_inline_formatting(line[6:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h5))
+                target_level = 4
+                style = style_h5
+                prefix_len = 6
             elif line.startswith('#### '):
-                text = _process_inline_formatting(line[5:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h4))
+                target_level = 3
+                style = style_h4
+                prefix_len = 5
             elif line.startswith('### '):
-                text = _process_inline_formatting(line[4:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h3))
+                target_level = 2
+                style = style_h3
+                prefix_len = 4
             elif line.startswith('## '):
-                text = _process_inline_formatting(line[3:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h2))
+                target_level = 1
+                style = style_h2
+                prefix_len = 3
             elif line.startswith('# '):
-                text = _process_inline_formatting(line[2:].strip())
-                story.append(Paragraph(f'<b>{text}</b>', style_h1))
+                target_level = 0
+                style = style_h1
+                prefix_len = 2
+            
+            if target_level != -1:
+                raw_text = line[prefix_len:].strip()
+                text = _process_inline_formatting(raw_text)
+                
+                # 计算安全的大纲层级：不能跳级（例如从1跳到3），但可以跳回（例如从3跳到1）
+                # 规则：新层级最多只能比上一个层级大1
+                safe_level = min(target_level, last_outline_level + 1)
+                last_outline_level = safe_level
+                
+                # 创建书签（目录项），使用纯文本作为书签标题
+                clean_title = re.sub(r'<[^>]+>', '', raw_text)  # 移除 HTML 标签
+                bookmark_key = f'heading_{len(story)}'
+                
+                story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
+                story.append(Paragraph(f'<b>{text}</b>', style))
+                
             elif line.startswith('* ') or line.startswith('- '):
                 # 无序列表
                 text = line[2:].strip()
@@ -1841,20 +1984,29 @@ class MCPTools:
 
     def _extract_original_filename(self, filename: str) -> str:
         """
-        从文件名中提取原始文件名（去掉file_id前缀）
+        从文件名中提取原始文件名（去掉file_id前缀和缓存文件的.txt后缀）
 
         Args:
             filename: 可能包含file_id前缀的文件名，格式如 'file_id_filename.ext' 或 'filename.ext'
 
         Returns:
-            原始文件名（去掉file_id前缀）
+            原始文件名（去掉file_id前缀和缓存文件的.txt后缀）
         """
+        result = filename
         if '_' in filename:
             parts = filename.split('_', 1)
             # 如果第一部分是file_id（8位以上十六进制），则使用第二部分
             if len(parts) > 1 and len(parts[0]) >= 8 and re.match(r'^[a-f0-9]{8,}', parts[0].lower()):
-                return parts[1]
-        return filename
+                result = parts[1]
+        
+        # 去掉缓存文件的.txt后缀（如 .doc.txt, .docx.txt, .pdf.txt）
+        # 但保留原生.txt文件的扩展名
+        if (result.endswith('.doc.txt') or
+                result.endswith('.docx.txt') or
+                result.endswith('.pdf.txt')):
+            result = result[:-4]
+        
+        return result
 
     def _extract_title_from_filename(self, filename: str) -> str:
         """
@@ -2558,7 +2710,7 @@ class MCPTools:
             if is_english:
                 footer_text = f'Generated by {username} and SciAssistant'
             else:
-                footer_text = f'本文章由{username}和SciAssistant生成'
+                footer_text = f'本文由用户{username}和SciAssistant共同创作生成'
 
             # 使用 font 标签设置颜色 (#808080 灰色)，div 标签控制对齐
             header_section += f' <div style="text-align: right;"> <font color="#808080">——{footer_text}</font> </div> \n\n'
@@ -2818,10 +2970,28 @@ class MCPTools:
                 if file_path:
                     analysis_data = file_analysis_data.get(file_path, {})
                     doc_time = analysis_data.get('doc_time', 'Unknown')
+                    core_content = analysis_data.get('core_content', '')
+                    task_relevance = analysis_data.get('task_relevance', '')
+                    information_richness = analysis_data.get('information_richness', '')
 
-                    # 跳过处理失败的文件（不在参考文献列表中显示）
+                    # 【关键修复】跳过条件与 Writer 保持完全一致，避免序号错位
+                    # 跳过处理失败的文件
                     if doc_time == "Processing failed":
                         logger.error(f"跳过处理失败的文件 {num}: {file_path}")
+                        continue
+
+                    # 跳过内容无效的文件（与 Writer 使用相同的关键词列表）
+                    invalid_content_keywords = [
+                        '安全验证', 'CAPTCHA', 'captcha', '验证码',
+                        '404', '403', 'Forbidden', 'placeholder page', 'error page',
+                        'no substantive content', 'lacks substantive content',
+                        'does not provide any substantive', '没有实质性的信息',
+                        'currently missing', 'content is missing', '内容缺失'
+                    ]
+                    
+                    is_invalid_content = any(kw.lower() in core_content.lower() for kw in invalid_content_keywords)
+                    if is_invalid_content:
+                        logger.warning(f"跳过内容无效的文件 {num}: {file_path}")
                         continue
 
                     title = "Unknown Title"
@@ -3155,13 +3325,32 @@ class MCPTools:
             logger.info(f"\n序号重新映射: {old_to_new_num}")
 
             # 替换正文中的引用序号为连续序号，并添加超链接
+            # 【关键修复】只用负向前视 (?!</a>) 来避免匹配已在 <a> 标签内的引用
+            # 这样可以正确处理连续引用如 [4][5]，同时避免重复替换
             for old_num, new_num in old_to_new_num.items():
-                # 替换普通引用标记: [old] -> <sup><a href="#ref-new" style="color: #04B5BB;">[new]</a></sup> （蓝色超链接）
+                # 只检查 [数字] 后面是否紧跟 </a>，如果是则跳过（已被处理）
+                # 这允许 </sup>[5] 中的 [5] 被正确替换
                 merged_content = re.sub(
-                    rf'\[{old_num}\]',
+                    rf'\[{old_num}\](?!</a>)',
                     f'<sup><a href="#ref-{unique_id}-{new_num}" style="color: #04B5BB; text-decoration: none;">[{new_num}]</a></sup>',
                     merged_content
                 )
+
+            # 【兜底处理】检查并移除未匹配的纯文本引用
+            # 查找所有未被转换为上标的 [数字] 引用（即没有对应参考文献的引用）
+            remaining_plain_refs = re.findall(r'\[(\d+)\](?!</a>)', merged_content)
+            if remaining_plain_refs:
+                unique_remaining = sorted(set(int(r) for r in remaining_plain_refs))
+                logger.warning(f"发现 {len(unique_remaining)} 个未匹配的引用，将被移除: {unique_remaining}")
+                
+                # 直接移除这些无效引用，只保留实际存在于参考文献列表中的引用
+                for ref_num in unique_remaining:
+                    merged_content = re.sub(
+                        rf'\[{ref_num}\](?!</a>)',
+                        '',
+                        merged_content
+                    )
+                logger.info(f"已移除 {len(unique_remaining)} 个无效引用")
 
             # 重新写入更新后的正文
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -4268,7 +4457,8 @@ Strictly follow the following format for output:
                 max_tokens = model_config.get('max_tokens', 8192)
             logger.debug(f"Starting document extraction: tasks={tasks}")
 
-            # 验证并自动补全：仅当任务包含 library_refs 或 user_uploads 文件时才进行补全
+            # 【关键修复】始终检查并自动补全 library_refs 和 user_uploads 目录的文件
+            # 不再依赖 Agent 是否传入了这些目录的文件，而是主动扫描目录
             task_files = [t.get('file_path', '') for t in tasks]
 
             # 规范化路径：移除 ./ 前缀以便统一比较
@@ -4277,26 +4467,21 @@ Strictly follow the following format for output:
 
             normalized_task_files = [normalize_path(f) for f in task_files]
 
-            # 检查任务中是否包含 library_refs 或 user_uploads 文件
-            has_library_files = any(f.startswith('library_refs/') for f in normalized_task_files)
-            has_upload_files = any(f.startswith('user_uploads/') for f in normalized_task_files)
+            # 始终扫描 library_refs 和 user_uploads 目录
+            library_refs_dir = self.workspace_path / "library_refs"
+            user_uploads_dir = self.workspace_path / "user_uploads"
 
-            # 只有当任务涉及这些目录时，才进行补全验证
-            if has_library_files or has_upload_files:
-                library_refs_dir = self.workspace_path / "library_refs"
-                user_uploads_dir = self.workspace_path / "user_uploads"
+            expected_files = []
+            # 扫描两个目录中的所有可能的文件扩展名
+            if library_refs_dir.exists():
+                for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
+                    expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
+            if user_uploads_dir.exists():
+                for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
+                    expected_files.extend([f"user_uploads/{f.name}" for f in user_uploads_dir.glob(ext)])
 
-                expected_files = []
-                # 只要进入补全逻辑，就扫描两个目录（不管任务中是否包含该目录的文件）
-                if library_refs_dir.exists():
-                    # 扫描所有可能的文件扩展名
-                    for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
-                        expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
-                if user_uploads_dir.exists():
-                    # 扫描所有可能的文件扩展名
-                    for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
-                        expected_files.extend([f"user_uploads/{f.name}" for f in user_uploads_dir.glob(ext)])
-
+            # 如果这两个目录有文件，则进行补全检查
+            if expected_files:
                 # 智能匹配：基于文件主体名称（保留原始扩展名，移除 .txt 后缀）
                 def get_core_name(path: str) -> str:
                     """
@@ -4356,49 +4541,49 @@ Strictly follow the following format for output:
                     logger.info(f"✅ 已补全，总任务数: {len(tasks)}")
                 else:
                     logger.info(f"✅ 所有 library_refs/user_uploads 文件已包含")
-
             else:
-                # 任务只涉及 research 等其他目录，不进行补全
-                logger.info(f"跳过补全验证（非 library_refs/user_uploads 目录）")
+                # library_refs 和 user_uploads 目录都没有文件，无需补全
+                logger.info(f"跳过补全验证（library_refs/user_uploads 目录无文件）")
 
-            # 【关键修复】过滤掉文档转换后的 .txt 文件，避免重复分析
-            # 如果同时存在 xxx.pdf 和 xxx.pdf.txt，只保留 .pdf
-            # 如果同时存在 xxx.docx 和 xxx.docx.txt，只保留 .docx
-            # 如果同时存在 xxx.doc 和 xxx.doc.txt，只保留 .doc
-            # 但保留原本就是 .txt 的文件（如 research/xxx.txt）
+            # 【关键修复】过滤掉二进制源文件，优先使用转换后的 .txt 文件
+            # 如果同时存在 xxx.pdf 和 xxx.pdf.txt，只保留 .pdf.txt（可读取）
+            # 如果同时存在 xxx.docx 和 xxx.docx.txt，只保留 .docx.txt
+            # 如果同时存在 xxx.doc 和 xxx.doc.txt，只保留 .doc.txt
+            # 如果只存在 xxx.pdf（无 .txt 版本），仍然保留（虽然可能读取失败）
             filtered_tasks = []
-            source_files = set()  # 存储所有源文件（pdf, docx, doc）
+            txt_converted_files = set()  # 存储所有转换后的 .txt 文件对应的源文件名
 
             # 定义需要检查的源文件扩展名
             source_extensions = ['.pdf', '.docx', '.doc']
 
-            # 第一遍：收集所有源文件
-            for task in tasks:
-                file_path = task.get('file_path', '')
-                normalized_path = file_path.lstrip('./')
-
-                # 检查是否是源文件
-                for ext in source_extensions:
-                    if normalized_path.endswith(ext):
-                        source_files.add(normalized_path)
-                        break
-
-            # 第二遍：过滤任务
+            # 第一遍：收集所有转换后的 .txt 文件对应的源文件
             for task in tasks:
                 file_path = task.get('file_path', '')
                 normalized_path = file_path.lstrip('./')
 
                 # 检查是否是转换后的 .txt 文件（xxx.pdf.txt, xxx.docx.txt, xxx.doc.txt）
-                should_skip = False
                 if normalized_path.endswith('.txt'):
-                    # 检查是否是从源文件转换而来的 .txt
                     for ext in source_extensions:
                         potential_source = normalized_path[:-4]  # 去掉 .txt
-                        if potential_source.endswith(ext) and potential_source in source_files:
-                            # 找到对应的源文件，跳过这个 .txt
-                            logger.info(f"⏭️ 跳过 {file_path}（对应的源文件 {potential_source.split('/')[-1]} 已存在）")
-                            should_skip = True
+                        if potential_source.endswith(ext):
+                            txt_converted_files.add(potential_source)
                             break
+
+            # 第二遍：过滤任务 - 如果源文件有对应的 .txt 版本，则跳过源文件
+            for task in tasks:
+                file_path = task.get('file_path', '')
+                normalized_path = file_path.lstrip('./')
+
+                # 检查是否是二进制源文件（pdf, docx, doc）
+                should_skip = False
+                for ext in source_extensions:
+                    if normalized_path.endswith(ext):
+                        # 检查是否有对应的 .txt 转换文件
+                        if normalized_path in txt_converted_files:
+                            # 找到对应的 .txt 文件，跳过这个源文件
+                            logger.info(f"⏭️ 跳过 {file_path}（已有转换后的 {normalized_path}.txt）")
+                            should_skip = True
+                        break
 
                 if not should_skip:
                     filtered_tasks.append(task)
@@ -4643,7 +4828,28 @@ Strictly follow the following format for output:
             full_save_path = self.workspace_path / analysis_path / "file_analysis.jsonl"
             full_save_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Read existing data to avoid duplicates
+            # 【关键修复】使用核心名称作为 key 进行去重，避免重复记录
+            def get_core_key(path: str) -> str:
+                """
+                获取文件的核心 key，用于去重
+                - 移除 ./ 前缀
+                - 移除转换后缀 .pdf.txt -> .pdf, .docx.txt -> .docx, .doc.txt -> .doc
+                例如：./user_uploads/xxx.pdf 和 user_uploads/xxx.pdf.txt 都会映射到 user_uploads/xxx.pdf
+                """
+                # 移除 ./ 前缀
+                normalized = path.lstrip('./')
+                # 移除转换后的 .txt 后缀
+                for ext in ['.pdf.txt', '.docx.txt', '.doc.txt']:
+                    if normalized.endswith(ext):
+                        normalized = normalized[:-4]  # 移除 .txt
+                        break
+                return normalized
+
+            def is_successful_result(data: dict) -> bool:
+                """判断分析结果是否成功"""
+                return data.get('doc_time') != 'Processing failed'
+
+            # Read existing data to avoid duplicates (智能去重：优先保留成功记录)
             existing_data = {}
             if full_save_path.exists():
                 try:
@@ -4652,16 +4858,48 @@ Strictly follow the following format for output:
                             try:
                                 data = json.loads(line.strip())
                                 if data.get('file_path'):
-                                    existing_data[data['file_path']] = data
+                                    core_key = get_core_key(data['file_path'])
+                                    existing = existing_data.get(core_key)
+                                    
+                                    # 智能覆盖：优先保留成功的记录
+                                    should_replace = True
+                                    if existing:
+                                        existing_success = is_successful_result(existing)
+                                        new_success = is_successful_result(data)
+                                        
+                                        if existing_success and not new_success:
+                                            # 已有成功的结果，不用失败的覆盖
+                                            should_replace = False
+                                    
+                                    if should_replace:
+                                        existing_data[core_key] = data
                             except json.JSONDecodeError:
                                 continue  # Skip malformed lines
                 except Exception as e:
                     logger.error(f"Warning: Failed to read existing analysis file: {e}")
 
-            # Merge new results (new data overwrites old data for same file_path)
+            # Merge new results (智能覆盖：成功覆盖失败，不用失败覆盖成功)
             for result in structured_results:
                 if result.get('file_path'):
-                    existing_data[result['file_path']] = result
+                    core_key = get_core_key(result['file_path'])
+                    existing = existing_data.get(core_key)
+                    
+                    # 决定是否覆盖
+                    should_replace = True
+                    if existing:
+                        existing_success = is_successful_result(existing)
+                        new_success = is_successful_result(result)
+                        
+                        if existing_success and not new_success:
+                            # 已有成功的结果，不用失败的覆盖
+                            logger.info(f"保留已有成功结果: {core_key}")
+                            should_replace = False
+                        elif new_success and not existing_success:
+                            # 新结果成功，覆盖旧的失败结果
+                            logger.info(f"用成功结果覆盖失败记录: {core_key}")
+                    
+                    if should_replace:
+                        existing_data[core_key] = result
 
             # Write back all data (overwrite mode to ensure no duplicates)
             # 【关键修复】用户上传文件优先排序，文档库和网络检索由LLM自行判断
@@ -5864,14 +6102,25 @@ Strictly follow the following format for output:
     def _read_doc_text(self, path: Path) -> str:
         """
         读取旧版Word文档文本内容（支持.doc格式）
-        多方案回退机制（跨平台优先）：
-        - Linux/Mac: antiword (推荐) > textract
-        - Windows: win32com (如果有MS Word) > antiword > textract
+        多方案回退机制（纯Python优先，适配openEuler等环境）：
+        1. olefile (纯Python) - 无需系统依赖，推荐
+        2. win32com (Windows) - 需要MS Word
+        3. antiword (系统工具) - 如果已安装
+        4. textract (Python库) - 依赖较多
         """
         import sys
         import subprocess
 
-        # Windows优先尝试win32com（如果安装了MS Word，效果最好）
+        # 方案1: 使用olefile纯Python解析（推荐，无需系统依赖）
+        try:
+            text = self._extract_doc_with_olefile(path)
+            if text and text.strip():
+                logger.info(f"Successfully extracted text from DOC using olefile: {path} ({len(text)} chars)")
+                return text.strip()
+        except Exception as e:
+            logger.debug(f"olefile extraction failed for {path}: {e}")
+
+        # 方案2: Windows优先尝试win32com（如果安装了MS Word，效果最好）
         if sys.platform == 'win32':
             try:
                 import win32com.client
@@ -5890,14 +6139,14 @@ Strictly follow the following format for output:
             except Exception as e:
                 logger.debug(f"win32com failed for {path}: {e}")
 
-        # 方案1: 使用antiword（跨平台，Linux服务器推荐）
+        # 方案3: 使用antiword（如果系统已安装）
         try:
             result = subprocess.run(
                 ['antiword', str(path)],
                 capture_output=True,
                 text=True,
                 timeout=30,
-                check=False  # 不抛出异常，通过returncode判断
+                check=False
             )
             if result.returncode == 0 and result.stdout.strip():
                 text = result.stdout.strip()
@@ -5906,8 +6155,7 @@ Strictly follow the following format for output:
             else:
                 logger.debug(f"antiword returned code {result.returncode}, stderr: {result.stderr}")
         except FileNotFoundError:
-            logger.debug(
-                f"antiword not found. Install: apt-get install antiword (Linux) or choco install antiword (Windows)")
+            logger.debug(f"antiword not found")
         except Exception as e:
             logger.debug(f"antiword failed for {path}: {e}")
 
@@ -5925,11 +6173,108 @@ Strictly follow the following format for output:
 
         # 所有方法都失败
         logger.warning(f"All DOC extraction methods failed for {path}. Recommendations:")
-        logger.warning(f"  1. Install antiword: apt-get install antiword (Linux) or choco install antiword (Windows)")
-        logger.warning(f"  2. Install pywin32: pip install pywin32 (Windows with MS Word)")
-        logger.warning(f"  3. Install textract: pip install textract (requires system dependencies)")
-        logger.warning(f"  4. Or convert the file to .docx/.pdf format manually")
-        return ''  # 返回空字符串，让调用方处理
+        logger.warning(f"  1. Install olefile: pip install olefile (Pure Python, recommended)")
+        logger.warning(f"  2. Or convert the file to .docx/.pdf format manually")
+        return ''
+
+    def _extract_doc_with_olefile(self, path: Path) -> str:
+        """
+        使用olefile纯Python库解析.doc文件提取文本
+        .doc文件是OLE Compound Document格式
+        """
+        import re
+        
+        try:
+            import olefile
+        except ImportError:
+            logger.debug("olefile not installed. Install with: pip install olefile")
+            raise ImportError("olefile not installed")
+
+        ole = olefile.OleFileIO(str(path))
+        
+        try:
+            # 检查是否是Word文档
+            if not ole.exists('WordDocument'):
+                raise ValueError("Not a valid Word document")
+
+            # 读取WordDocument流
+            word_stream = ole.openstream('WordDocument').read()
+            
+            # 提取文本
+            text = self._extract_text_from_word_stream(word_stream)
+            
+            if text:
+                return text
+            
+            # 备选：尝试从Data流提取
+            if ole.exists('Data'):
+                data_stream = ole.openstream('Data').read()
+                text = self._decode_ole_stream(data_stream)
+                if text:
+                    return text
+            
+            return ''
+        finally:
+            ole.close()
+
+    def _extract_text_from_word_stream(self, stream: bytes) -> str:
+        """从WordDocument流中提取文本"""
+        import re
+        
+        text_parts = []
+        
+        # 尝试UTF-16LE解码（Windows Word默认编码）
+        try:
+            raw_text = stream.decode('utf-16-le', errors='ignore')
+            # 过滤出可打印字符
+            decoded = ''.join(c for c in raw_text if c.isprintable() or c in '\n\r\t')
+            if len(decoded) > 50:
+                text_parts.append(decoded)
+        except Exception:
+            pass
+        
+        # 尝试提取ASCII/GBK文本（中文文档）
+        try:
+            # 匹配连续的可打印字符序列
+            ascii_pattern = re.compile(b'[\x20-\x7e\x0a\x0d\t]{4,}')
+            matches = ascii_pattern.findall(stream)
+            if matches:
+                ascii_text = b' '.join(matches).decode('gbk', errors='ignore')
+                if len(ascii_text) > len(''.join(text_parts)):
+                    text_parts = [ascii_text]
+        except Exception:
+            pass
+        
+        # 合并并清理文本
+        full_text = '\n'.join(text_parts)
+        return self._clean_doc_text(full_text)
+
+    def _decode_ole_stream(self, stream: bytes) -> str:
+        """解码OLE流数据"""
+        try:
+            text = stream.decode('utf-16-le', errors='ignore')
+            text = ''.join(c for c in text if c.isprintable() or c in '\n\r\t')
+            return self._clean_doc_text(text)
+        except Exception:
+            return ''
+
+    def _clean_doc_text(self, text: str) -> str:
+        """清理提取的文本"""
+        import re
+        
+        if not text:
+            return ''
+        
+        # 移除控制字符
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+        # 移除Word内部标记
+        text = re.sub(r'(Times New Roman|Arial|Calibri|宋体|黑体|微软雅黑)\s*', '', text)
+        text = re.sub(r'HYPERLINK\s*"[^"]*"', '', text)
+        # 合并多个空格和换行
+        text = re.sub(r' +', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
 
     def _normalize_report_part_path(self, file_path: str) -> str:
         """Normalize misformatted report chapter filenames.
@@ -7518,6 +7863,176 @@ Strictly follow the following format for output:
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取arxiv论文内容失败!{e}")
 
+    def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
+                       start_year: int = None, end_year: int = None) -> MCPToolResult:
+        """
+        Search for papers on Springer Nature using their Open Access API.
+        
+        Args:
+            query: Search query string (keywords, title, etc.)
+            max_results: Maximum number of papers to return (default: 10)
+            subject: Filter by subject area (optional)
+            start_year: Filter by start year (optional)
+            end_year: Filter by end year (optional)
+            
+        Returns:
+            MCPToolResult with list of Paper objects
+        """
+        try:
+            BASE_URL = "https://api.springernature.com/openaccess/json"
+            
+            params = {
+                'q': query,
+                'p': max_results,
+                's': 1
+            }
+            
+            if subject:
+                params['q'] = f"{params['q']} subject:{subject}"
+            
+            if start_year and end_year:
+                params['q'] = f"{params['q']} year:{start_year}-{end_year}"
+            elif start_year:
+                params['q'] = f"{params['q']} year:{start_year}-{datetime.now().year}"
+            
+            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
+            
+            if response.status_code != 200:
+                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
+            
+            data = response.json()
+            records = data.get('records', [])
+            
+            papers = []
+            for record in records:
+                try:
+                    pub_date_str = record.get('publicationDate', '')
+                    try:
+                        pub_date = datetime.strptime(pub_date_str, '%Y-%m-%d')
+                    except:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str, '%Y-%m')
+                        except:
+                            pub_date = datetime.now()
+                    
+                    creators = record.get('creators', [])
+                    authors = [creator.get('creator', '') for creator in creators if isinstance(creator, dict)]
+                    
+                    doi = record.get('doi', '')
+                    paper_id = doi if doi else record.get('identifier', '')
+                    
+                    url = record.get('url', [])
+                    paper_url = url[0].get('value', '') if url and isinstance(url, list) and len(url) > 0 else f"https://doi.org/{doi}"
+                    
+                    pdf_url = ''
+                    for url_item in url:
+                        if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
+                            pdf_url = url_item.get('value', '')
+                            break
+                    
+                    abstract = record.get('abstract', '')
+                    
+                    subjects = record.get('subjects', [])
+                    categories = [subj.get('subject', '') for subj in subjects if isinstance(subj, dict)]
+                    
+                    paper = Paper(
+                        paper_id=paper_id,
+                        title=record.get('title', ''),
+                        authors=authors,
+                        abstract=abstract,
+                        doi=doi,
+                        published_date=pub_date,
+                        pdf_url=pdf_url,
+                        url=paper_url,
+                        source='springer',
+                        categories=categories,
+                        keywords=[],
+                        extra={
+                            'publisher': record.get('publisher', ''),
+                            'publicationType': record.get('publicationType', ''),
+                            'issn': record.get('issn', ''),
+                            'isbn': record.get('isbn', ''),
+                            'volume': record.get('volume', ''),
+                            'number': record.get('number', ''),
+                            'startingPage': record.get('startingPage', ''),
+                            'endingPage': record.get('endingPage', '')
+                        }
+                    )
+                    papers.append(paper.to_dict())
+                    
+                except Exception as e:
+                    logger.warning(f"解析Springer论文记录失败: {e}")
+                    continue
+            
+            return MCPToolResult(success=True, data={"papers": papers, "total": len(papers)})
+            
+        except Exception as e:
+            logger.error(f"Springer搜索失败: {e}")
+            return MCPToolResult(success=False, error=f"Springer搜索失败: {e}")
+
+    def springer_get_article(self, doi: str) -> MCPToolResult:
+        """
+        Get full article details from Springer Nature by DOI.
+        
+        Args:
+            doi: Digital Object Identifier of the paper
+            
+        Returns:
+            MCPToolResult with article content and metadata
+        """
+        try:
+            BASE_URL = "https://api.springernature.com/openaccess/json"
+            
+            params = {
+                'q': f'doi:{doi}',
+                'p': 1
+            }
+            
+            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
+            
+            if response.status_code != 200:
+                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
+            
+            data = response.json()
+            records = data.get('records', [])
+            
+            if not records:
+                return MCPToolResult(success=False, error=f"未找到DOI为 {doi} 的文章")
+            
+            record = records[0]
+            
+            article_content = {
+                'title': record.get('title', ''),
+                'abstract': record.get('abstract', ''),
+                'doi': record.get('doi', ''),
+                'url': record.get('url', [{}])[0].get('value', '') if record.get('url') else '',
+                'publicationDate': record.get('publicationDate', ''),
+                'publisher': record.get('publisher', ''),
+                'publicationType': record.get('publicationType', ''),
+                'creators': record.get('creators', []),
+                'subjects': record.get('subjects', []),
+                'fullText': ''
+            }
+            
+            pdf_url = ''
+            for url_item in record.get('url', []):
+                if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
+                    pdf_url = url_item.get('value', '')
+                    article_content['pdf_url'] = pdf_url
+                    break
+            
+            if pdf_url:
+                logger.info(f"Springer开放获取文章PDF链接: {pdf_url}")
+                article_content['fullText'] = f"PDF可通过以下链接下载: {pdf_url}"
+            else:
+                article_content['fullText'] = "该文章可能不是开放获取,无法获取全文"
+            
+            return MCPToolResult(success=True, data=article_content)
+            
+        except Exception as e:
+            logger.error(f"获取Springer文章失败: {e}")
+            return MCPToolResult(success=False, error=f"获取Springer文章失败: {e}")
+
     def medrxiv_search(self, query: str, max_results: int = 10, days: int = 30) -> List[Paper]:
         """
         Search for papers on medRxiv by category within the last N days.
@@ -7659,35 +8174,6 @@ Strictly follow the following format for output:
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取medrxiv论文内容失败!{e}")
 
-
-def normalize_company(param_name: str):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            response = await func(*args, **kwargs)
-            if response.get('statusCode') == 2:
-                sig = inspect.signature(func)
-                params = list(sig.parameters.keys())
-                if param_name in params:
-                    param_index = params.index(param_name)
-                    if kwargs.get(param_name):
-                        company_name = kwargs.get(param_name)
-                    else:
-                        args = list(args)
-                        company_name = args[param_index]
-                    n_company_name = await normalize_company_name(company_name)
-                    if n_company_name and company_name != n_company_name:
-                        if kwargs.get(param_name):
-                            kwargs[param_name] = n_company_name
-                        else:
-                            args[param_index] = n_company_name
-                            args = tuple(args)
-                        return await func(*args, **kwargs)
-            return response
-
-        return wrapper
-
-    return decorator
 
 
 def generate_pubmed_search_url(term=None, title=None, author=None, journal=None,
@@ -8736,6 +9222,50 @@ MCP_TOOL_SCHEMAS = {
 
             },
             "required": ["paper_id"]
+        }
+    },
+    "springer_search": {
+        "name": "springer_search",
+        "description": "Search for open access papers on Springer Nature across multiple disciplines. Returns metadata of papers including DOI, PDF links, and abstracts. Only searches open access content. Supports English queries only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, title, etc.), only supports English"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of papers to return (default: 10)"
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Filter by subject area (e.g., 'Computer Science', 'Earth Sciences', 'Life Sciences', 'Medicine', 'Physics', 'Chemistry', 'Mathematics', 'Engineering')"
+                },
+                "start_year": {
+                    "type": "integer",
+                    "description": "Filter by start year (e.g., 2020)"
+                },
+                "end_year": {
+                    "type": "integer",
+                    "description": "Filter by end year (e.g., 2024)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "springer_get_article": {
+        "name": "springer_get_article",
+        "description": "Get full article details from Springer Nature by DOI. Returns article content, metadata, and PDF link if available. Before calling this function, first use springer_search to obtain the article's DOI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "doi": {
+                    "type": "string",
+                    "description": "Digital Object Identifier (DOI) of the paper"
+                }
+            },
+            "required": ["doi"]
         }
     },
     "file_stats": {

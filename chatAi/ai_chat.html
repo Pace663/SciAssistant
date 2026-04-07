@@ -70,8 +70,19 @@
         // 匹配看起来像无效HTML标签的内容（以 < 开头，后跟非字母的内容）
         html = html.replace(/<([^a-zA-Z\/!][^>]*?)>/g, '&lt;$1&gt;');
         
-        // 移除回形针emoji（用于前端显示，后端PDF保留）
-        html = html.replace(/📎\s*/g, '');
+        // 预处理：移除后端已添加的所有图标格式（避免重复）
+        // 1. 移除所有包含📎或🌐的<font>标签（更宽松的匹配）
+        html = html.replace(/<font[^>]*>📎<\/font>\s*/gi, '');
+        html = html.replace(/<font[^>]*>🌐<\/font>\s*/gi, '');
+        // 2. 移除所有包含📎或🌐的<span>标签
+        html = html.replace(/<span[^>]*>📎<\/span>\s*/gi, '');
+        html = html.replace(/<span[^>]*>🌐<\/span>\s*/gi, '');
+        // 3. 移除引用格式 [数字] 之后的纯 emoji 图标（可能有多个连续的）
+        html = html.replace(/(\[\d+\])\s*(?:📎\s*)+/g, '$1 ');
+        html = html.replace(/(\[\d+\])\s*(?:🌐\s*)+/g, '$1 ');
+        // 4. 移除任何位置的连续重复图标
+        html = html.replace(/📎\s*📎/g, '📎');
+        html = html.replace(/🌐\s*🌐/g, '🌐');
         
         // 用于存储需要保护的内容的临时数组，防止内容被后续正则处理
         const codeBlocks = [];
@@ -121,27 +132,59 @@
             return IMAGE_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
 
+        // 辅助函数：检测并处理标题中的图标（📎回形针或🌐地球仪）
+        // 使用 Font Awesome 图标替代 emoji，更美观
+        const ICON_PAPERCLIP = '<span class="inline-flex items-center justify-center w-6 h-6 rounded bg-red-50 mr-1.5"><i class="fa fa-paperclip text-red-500" style="font-size: 14px;"></i></span>';
+        const ICON_GLOBE = '<span class="inline-flex items-center justify-center w-6 h-6 rounded bg-blue-50 mr-1.5"><i class="fa fa-globe text-blue-500" style="font-size: 14px;"></i></span>';
+        
+        function processReferenceIcon(title, defaultIcon) {
+            let cleanTitle = title.trim();
+            let icon = '';
+            // 检查开头是否包含回形针或地球仪图标（emoji 格式）
+            if (cleanTitle.startsWith('📎')) {
+                cleanTitle = cleanTitle.replace(/^📎\s*/, '');
+                icon = ICON_PAPERCLIP;
+            } else if (cleanTitle.startsWith('🌐')) {
+                cleanTitle = cleanTitle.replace(/^🌐\s*/, '');
+                icon = ICON_GLOBE;
+            } else if (defaultIcon) {
+                // 没有图标时使用默认图标
+                icon = defaultIcon;
+            }
+            return { cleanTitle, icon };
+        }
+        
         // 6. 引用格式处理 [数字] 标题，URL，日期
+        // 根据URL类型添加图标：PDF文件用回形针，网页链接用地球仪
         html = html.replace(/\[(\d+)\]\s+([^\n]+?)，\s*(https?:\/\/[^\s,，]+)(?:，\s*([^\n]+))?/gi, function(match, num, title, url, date) {
             const dateStr = date ? `，${date.trim()}` : '';
-            const rendered = `[${num}] ${title.trim()}，<a href="${url}" class="text-blue-600 hover:underline" target="_blank">${url}</a>${dateStr}`;
+            // 根据URL判断默认图标类型：PDF用回形针，网页用地球仪
+            // 识别PDF链接：以.pdf结尾，或者是arxiv/medrxiv/biorxiv的PDF链接格式
+            const isPdfUrl = /\.pdf$/i.test(url) || /arxiv\.org\/pdf\//i.test(url) || /medrxiv\.org\/content\/.*\.full\.pdf/i.test(url) || /biorxiv\.org\/content\/.*\.full\.pdf/i.test(url);
+            const defaultIcon = isPdfUrl ? ICON_PAPERCLIP : ICON_GLOBE;
+            const { cleanTitle, icon } = processReferenceIcon(title, defaultIcon);
+            const rendered = `[${num}] ${icon}${cleanTitle}，<a href="${url}" class="text-blue-600 hover:underline" target="_blank">${url}</a>${dateStr}`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
-        // 6.1 引用格式（只有标题和日期，没有URL）
+        // 6.1 引用格式（只有标题和日期，没有URL）- 使用回形针图标表示文档引用
         html = html.replace(/\[(\d+)\]\s+([^\n]+?)(?:，|\s+)((?:19|20)\d{2}[年\-]\d{1,2}[月\-]?\d{0,2}日?)/gi, function(match, num, title, date) {
-            const rendered = `[${num}] ${title.trim()}，${date.trim()}`;
+            // 没有URL的引用默认使用回形针图标（表示本地文档）
+            const { cleanTitle, icon } = processReferenceIcon(title, ICON_PAPERCLIP);
+            const rendered = `[${num}] ${icon}${cleanTitle}，${date.trim()}`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
-        // 6.2 引用格式（只有标题）
+        // 6.2 引用格式（只有标题）- 使用回形针图标表示文档引用
         html = html.replace(/\[(\d+)\]\s+([^\n\[\],，]+?)(?=\s*\n|\s*$|\s*\[)/gi, function(match, num, title) {
             if (title.includes('http') || title.includes('](')) {
                 return match;
             }
-            const rendered = `[${num}] ${title.trim()}`;
+            // 没有URL的引用默认使用回形针图标（表示本地文档）
+            const { cleanTitle, icon } = processReferenceIcon(title, ICON_PAPERCLIP);
+            const rendered = `[${num}] ${icon}${cleanTitle}`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
@@ -820,13 +863,49 @@
             <!-- 附件展示区（显示已上传的文件预览卡片） -->
              <div id="attachments-bar" class="mb-3 flex flex-wrap gap-2 max-h-32 overflow-y-auto scrollbar-thumb-rounded hidden"></div>
              
-             <form id="chat-form" class="flex">
+             <form id="chat-form" class="flex items-center">
                 <textarea 
                     id="user-input" 
                     placeholder="输入研究问题 · 已适配PubMed/arXiv/medRxiv文献检索" 
                     class="flex-1 rounded-lg p-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none transition-all duration-200" 
                     rows="1"
                 ></textarea>
+                <!-- 搜索源选择（仅DeepDiver模式显示） -->
+                <div id="search-sources-container" class="ml-3 relative hidden">
+                    <button type="button" id="search-source-btn" class="px-3 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors flex items-center space-x-2 text-sm" title="选择搜索源">
+                        <i class="fa fa-globe text-blue-500"></i>
+                        <span id="search-source-label" class="text-gray-700">全网...</span>
+                        <i class="fa fa-chevron-down text-gray-400 text-xs"></i>
+                    </button>
+                    <!-- 下拉菜单 - 使用bottom定位避免被遮挡 -->
+                    <div id="search-source-dropdown" class="absolute left-0 bottom-full mb-2 w-48 bg-white border border-gray-200 rounded-lg shadow-xl hidden" style="z-index: 9999;">
+                        <div class="py-1">
+                            <!-- 全选所有源选项 -->
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50 border-b border-gray-200" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="all" id="search-source-all" class="search-source-checkbox" style="width: 16px; height: 16px; margin: 0;" checked>
+                                <i class="fa fa-check-square text-green-500" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700 font-semibold">全选所有源</span>
+                            </label>
+                            <hr class="my-2 border-gray-200">
+                            <!-- 具体搜索源选项 -->
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="websearch" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
+                                <i class="fa fa-globe text-blue-500" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700">全网搜索</span>
+                            </label>
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="arxiv" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
+                                <i class="fa fa-book text-orange-500" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700">Arxiv</span>
+                            </label>
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="pubmed" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
+                                <i class="fa fa-heartbeat text-red-500" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700">Pubmed</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
                 <!-- 上文文件上传（隐藏的原生 input，通过 label 触发） -->
                 <input type="file" id="context-file" class="hidden" multiple accept=".txt,.md,.csv,.json,.log,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.xml,.html,.htm,.rtf,.odt,.epub,.yaml,.yml" />
                 <label for="context-file" id="context-file-label" class="ml-3 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg p-3 transition-all duration-200 cursor-pointer flex items-center" title="上传文件">
@@ -939,7 +1018,7 @@
                     <i class="fa fa-upload mr-2"></i>上传文件
                 </button>
                 <button id="library-tab-btn" class="flex-1 px-6 py-3 font-medium transition-colors border-b-2 border-transparent text-gray-600 hover:text-gray-800">
-                    <i class="fa fa-folder-open mr-2"></i>从文档库选择
+                    <i class="fa fa-folder-open mr-2"></i>从文件库选择
                 </button>
             </div>
             
@@ -951,7 +1030,7 @@
                         <i class="fa fa-cloud-upload text-5xl text-gray-400 mb-4"></i>
                         <p class="text-lg text-gray-600 mb-2">拖拽文件到此处或点击上传</p>
                         <p class="text-sm text-gray-500 mb-2">支持 PDF、Word（.doc/.docx）、TXT 格式</p>
-                        <p class="text-sm text-gray-500">最多10个文件，每个≤10MB，总大小≤60MB</p>
+                        <p class="text-sm text-gray-500">最多10个文件，单个≤15MB，总大小≤75MB</p>
                         <input type="file" id="deepdiver-file-input" multiple accept=".pdf,.doc,.docx,.txt" class="hidden">
                     </div>
                     
@@ -1044,9 +1123,9 @@
                 <div id="upload-area" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-primary transition-colors cursor-pointer bg-gray-50">
                     <i class="fa fa-cloud-upload text-5xl text-gray-400 mb-4"></i>
                     <p class="text-lg text-gray-600 mb-2">拖拽文件到此处或点击上传</p>
-                    <p class="text-sm text-gray-500 mb-4">支持 PDF, DOC, DOCX, PNG, JPG, JPEG, PPT, PPTX, TXT, XLSX, XLS</p>
-                    <p class="text-sm text-gray-500">最多10个文件，总大小不超过50MB</p>
-                    <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.ppt,.pptx,.txt,.xlsx,.xls" class="hidden">
+                    <p class="text-sm text-gray-500 mb-4">支持 PDF、Word（.doc/.docx）、TXT 格式</p>
+                    <p class="text-sm text-gray-500">最多10个文件，单个≤15MB，总大小不超过75MB</p>
+                    <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.txt" class="hidden">
                 </div>
                 
                 <!-- 待上传文件列表 -->
@@ -1110,6 +1189,9 @@
             
             // 初始化功能标签按钮
             initFeatureTabs();
+            
+            // 初始化搜索源下拉菜单
+            initSearchSourceDropdown();
 
             // 1. 读取登录状态
             const rememberMe = localStorage.getItem('rememberMe') === 'true';
@@ -1387,7 +1469,7 @@ function copyToClipboard(text, button) {
         const userProfile = document.getElementById('user-profile');
         const sidebar = document.getElementById('sidebar');
         const chatHistory = document.getElementById('chat-history');
-        const submitButton = chatForm.querySelector('button');
+        const submitButton = chatForm.querySelector('button[type="submit"]');
         const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
         const sidebarTexts = document.querySelectorAll('.sidebar-text');
         const mainContent = document.getElementById('main-content');
@@ -1568,6 +1650,8 @@ function copyToClipboard(text, button) {
             // 设置初始选中状态
             const ragFullToggleLabel = document.getElementById('rag-full-toggle-label');
             const contextFileLabel = document.getElementById('context-file-label');
+            const searchSourcesContainer = document.getElementById('search-sources-container');
+            
             if (window.selectedTab === 'deepdiver') {
                 deepdiverBtn.classList.add('bg-primary', 'text-white');
                 deepdiverBtn.classList.remove('hover:bg-gray-100');
@@ -1583,6 +1667,10 @@ function copyToClipboard(text, button) {
                 if (contextFileLabel) {
                     contextFileLabel.classList.remove('hidden');
                     contextFileLabel.title = '上传文件（支持PDF、Word、TXT，最多10个，每个≤10MB，总大小≤60MB）。文件将用于生成报告。';
+                }
+                // DeepDiver模式：显示搜索源选择
+                if (searchSourcesContainer) {
+                    searchSourcesContainer.classList.remove('hidden');
                 }
             } else if (window.selectedTab === 'chat') {
                 chatBtn.classList.add('bg-primary', 'text-white');
@@ -1633,6 +1721,86 @@ function copyToClipboard(text, button) {
             });
         }
         
+        // 初始化搜索源下拉菜单
+        function initSearchSourceDropdown() {
+            const searchSourceBtn = document.getElementById('search-source-btn');
+            const searchSourceDropdown = document.getElementById('search-source-dropdown');
+            const searchSourceLabel = document.getElementById('search-source-label');
+            const allCheckbox = document.getElementById('search-source-all');
+            const itemCheckboxes = document.querySelectorAll('.search-source-item');
+            const allCheckboxes = document.querySelectorAll('.search-source-checkbox');
+            
+            if (!searchSourceBtn || !searchSourceDropdown) return;
+            
+            // 更新按钮标签和图标
+            function updateLabel() {
+                const checkedItems = Array.from(itemCheckboxes).filter(cb => cb.checked);
+                const checkedValues = checkedItems.map(cb => cb.value);
+                const buttonIcon = searchSourceBtn.querySelector('i.fa:first-child');
+                
+                if (checkedValues.length === 0) {
+                    searchSourceLabel.textContent = '选择源';
+                    buttonIcon.className = 'fa fa-globe text-blue-500';
+                } else if (checkedValues.length === itemCheckboxes.length) {
+                    searchSourceLabel.textContent = '全部源';
+                    buttonIcon.className = 'fa fa-check-square text-green-500';
+                } else if (checkedValues.length === 1) {
+                    const config = {
+                        'websearch': { label: '全网...', icon: 'fa fa-globe text-blue-500' },
+                        'arxiv': { label: 'Arxiv', icon: 'fa fa-book text-orange-500' },
+                        'pubmed': { label: 'Pubmed', icon: 'fa fa-heartbeat text-red-500' }
+                    };
+                    const selected = config[checkedValues[0]] || config['websearch'];
+                    searchSourceLabel.textContent = selected.label;
+                    buttonIcon.className = selected.icon;
+                } else {
+                    searchSourceLabel.textContent = `${checkedValues.length}个源`;
+                    buttonIcon.className = 'fa fa-globe text-blue-500';
+                }
+            }
+            
+            // 更新"全选"复选框状态
+            function updateAllCheckbox() {
+                const checkedCount = Array.from(itemCheckboxes).filter(cb => cb.checked).length;
+                allCheckbox.checked = checkedCount === itemCheckboxes.length;
+                allCheckbox.indeterminate = checkedCount > 0 && checkedCount < itemCheckboxes.length;
+            }
+            
+            // 点击按钮切换下拉菜单显示/隐藏
+            searchSourceBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                searchSourceDropdown.classList.toggle('hidden');
+            });
+            
+            // 点击页面其他地方关闭下拉菜单
+            document.addEventListener('click', function(e) {
+                if (!searchSourceBtn.contains(e.target) && !searchSourceDropdown.contains(e.target)) {
+                    searchSourceDropdown.classList.add('hidden');
+                }
+            });
+            
+            // 处理"全选所有源"复选框变化
+            allCheckbox.addEventListener('change', function() {
+                const isChecked = this.checked;
+                itemCheckboxes.forEach(cb => {
+                    cb.checked = isChecked;
+                });
+                updateLabel();
+            });
+            
+            // 处理具体源复选框变化
+            itemCheckboxes.forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    updateAllCheckbox();
+                    updateLabel();
+                });
+            });
+            
+            // 初始化状态
+            updateAllCheckbox();
+            updateLabel();
+        }
+        
         // 切换标签功能
         function switchTab(tabName) {
             const deepdiverBtn = document.getElementById('deepdiver-btn');
@@ -1665,6 +1833,8 @@ function copyToClipboard(text, button) {
             // 根据标签切换不同功能的逻辑
             const ragFullToggleLabel = document.getElementById('rag-full-toggle-label');
             const contextFileLabel = document.getElementById('context-file-label');
+            const searchSourcesContainer = document.getElementById('search-sources-container');
+            
             if (tabName === 'deepdiver') {
                 userInput.placeholder = '输入研究问题 · 已适配PubMed/arXiv/medRxiv文献检索';
                 // DeepDiver模式：隐藏"全文提示"开关
@@ -1675,6 +1845,10 @@ function copyToClipboard(text, button) {
                 if (contextFileLabel) {
                     contextFileLabel.classList.remove('hidden');
                     contextFileLabel.title = '上传文件（支持PDF、Word、TXT，最多10个，每个≤10MB，总大小≤60MB）。文件将用于生成报告。';
+                }
+                // DeepDiver模式：显示搜索源选择
+                if (searchSourcesContainer) {
+                    searchSourcesContainer.classList.remove('hidden');
                 }
             } else if (tabName === 'chat') {
                 userInput.placeholder = '输入问题 · 快速对话和文件辅助';
@@ -1687,6 +1861,10 @@ function copyToClipboard(text, button) {
                     contextFileLabel.classList.remove('hidden');
                     contextFileLabel.title = '上传文件（最多5个，每个≤3MB，总大小≤20MB）。文件将用于RAG检索增强回答。';
                 }
+                // Chat模式：隐藏搜索源选择
+                if (searchSourcesContainer) {
+                    searchSourcesContainer.classList.add('hidden');
+                }
             } else if (tabName === 'reasoner') {
                 userInput.placeholder = '输入推理问题 · 展示完整思考过程';
                 // Reasoner模式：隐藏"全文提示"开关
@@ -1696,6 +1874,10 @@ function copyToClipboard(text, button) {
                 // Reasoner模式：隐藏上传文件按钮
                 if (contextFileLabel) {
                     contextFileLabel.classList.add('hidden');
+                }
+                // Reasoner模式：隐藏搜索源选择
+                if (searchSourcesContainer) {
+                    searchSourcesContainer.classList.add('hidden');
                 }
             }
         }
@@ -1726,8 +1908,8 @@ function copyToClipboard(text, button) {
             // 根据模式设置不同的限制
             const isDeepDiverMode = (window.selectedTab || '').trim() === 'deepdiver';
             const maxFileCount = isDeepDiverMode ? 10 : 5; // DeepDiver: 10个, Chat: 5个
-            const maxSingleSize = isDeepDiverMode ? 10 * 1024 * 1024 : 3 * 1024 * 1024; // DeepDiver: 10MB, Chat: 3MB
-            const sizeLimit = isDeepDiverMode ? '10MB' : '3MB';
+            const maxSingleSize = isDeepDiverMode ? 15 * 1024 * 1024 : 3 * 1024 * 1024; // DeepDiver: 15MB, Chat: 3MB
+            const sizeLimit = isDeepDiverMode ? '15MB' : '3MB';
             
             // 检查文件数量限制
             const existingCount = (window.attachedContexts || []).length;
@@ -1735,6 +1917,25 @@ function copyToClipboard(text, button) {
                 showToast(`最多上传${maxFileCount}个文件`, 'warning');
                 this.value = ''; // 清空选择
                 return;
+            }
+            
+            // 检查文件类型
+            const invalidTypeFiles = files.filter(f => {
+                const fileExtension = '.' + f.name.toLowerCase().split('.').pop();
+                return !ALLOWED_EXTENSIONS_CONTEXT.includes(fileExtension);
+            });
+            if (invalidTypeFiles.length > 0) {
+                const fileList = invalidTypeFiles.map(f => f.name).join('、');
+                showToast(`以下文件类型不支持：${fileList}。仅支持 ${ALLOWED_EXTENSIONS_CONTEXT.join(', ')} 格式。`, 'warning', 5000);
+                // 过滤掉不支持的文件类型
+                files.splice(0, files.length, ...files.filter(f => {
+                    const fileExtension = '.' + f.name.toLowerCase().split('.').pop();
+                    return ALLOWED_EXTENSIONS_CONTEXT.includes(fileExtension);
+                }));
+                if (files.length === 0) {
+                    this.value = ''; // 清空选择
+                    return;
+                }
             }
             
             const oversizedFiles = files.filter(f => f.size > maxSingleSize);
@@ -1757,8 +1958,8 @@ function copyToClipboard(text, button) {
             // 根据模式设置不同的总大小限制
             const existingSize = (window.attachedContexts || []).reduce((sum, ctx) => sum + (ctx.size || 0), 0);
             const newFilesSize = files.reduce((sum, f) => sum + f.size, 0);
-            const maxTotalSize = isDeepDiverMode ? 60 * 1024 * 1024 : 20 * 1024 * 1024; // DeepDiver: 60MB, Chat: 20MB
-            const totalSizeLimit = isDeepDiverMode ? '60MB' : '20MB';
+            const maxTotalSize = isDeepDiverMode ? 75 * 1024 * 1024 : 20 * 1024 * 1024; // DeepDiver: 75MB, Chat: 20MB
+            const totalSizeLimit = isDeepDiverMode ? '75MB' : '20MB';
             if (existingSize + newFilesSize > maxTotalSize) {
                 const availableMB = ((maxTotalSize - existingSize) / 1024 / 1024).toFixed(2);
                 showToast(`文件总大小超过${totalSizeLimit}限制。当前已上传：${(existingSize / 1024 / 1024).toFixed(2)}MB，还可上传：${availableMB}MB。请减少文件数量或选择较小的文件。`, 'warning', 5000);
@@ -1778,21 +1979,55 @@ function copyToClipboard(text, button) {
             let successCount = 0;
             let failCount = 0;
             
-            for (const file of files) {
-                try {
-                    const formData = new FormData();
+            // 将所有文件一次性上传
+            try {
+                const formData = new FormData();
+                // 添加所有文件到FormData
+                for (const file of files) {
                     formData.append('file', file);
-                    const resp = await fetch('/5000/api/context/upload', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    if (!resp.ok) {
-                        throw new Error(`上传失败：HTTP ${resp.status}`);
+                }
+                // 添加模式参数以支持文件数量限制
+                const isDeepDiverMode = (window.selectedTab || '').trim() === 'deepdiver';
+                formData.append('mode', isDeepDiverMode ? 'deepdiver' : 'chat');
+                
+                const resp = await fetch('/5000/api/context/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (!resp.ok) {
+                    throw new Error(`上传失败：HTTP ${resp.status}`);
+                }
+                const data = await resp.json();
+                if (!data.success) {
+                    throw new Error(data.message || '上传接口返回失败');
+                }
+                
+                // 处理后端返回的所有文件
+                if (data.files && Array.isArray(data.files)) {
+                    for (let i = 0; i < data.files.length; i++) {
+                        const fileData = data.files[i];
+                        const file = files[i]; // 对应的原始文件
+                        
+                        const ctx = {
+                            name: file.name,
+                            serverFilename: fileData.filename || '',
+                            content: fileData.text_content || '',
+                            fileId: fileData.file_id,
+                            url: fileData.download_url ? ('/5000' + fileData.download_url) : '',
+                            size: file.size,
+                            type: file.type,
+                            fileType: fileData.file_type || ''  // 后端返回的文件类型（如 .pdf）
+                        };
+                        window.attachedContexts.push(ctx);
+                        updateAttachmentsBarVisibility();
+                        if (typeof renderAttachedContextBubble === 'function') {
+                            renderAttachedContextBubble(ctx);
+                        }
                     }
-                    const data = await resp.json();
-                    if (!data.success) {
-                        throw new Error(data.message || '上传接口返回失败');
-                    }
+                    successCount = data.files.length;
+                } else {
+                    // 兼容旧格式（单个文件响应）
+                    const file = files[0];
                     const ctx = {
                         name: file.name,
                         serverFilename: data.filename || '',
@@ -1808,12 +2043,12 @@ function copyToClipboard(text, button) {
                     if (typeof renderAttachedContextBubble === 'function') {
                         renderAttachedContextBubble(ctx);
                     }
-                    successCount++;
-                } catch (err) {
-                    console.error('文件上传失败：', err);
-                    failCount++;
-                    showToast(`文件 ${file.name} 上传失败，请稍后重试`, 'error');
+                    successCount = 1;
                 }
+            } catch (err) {
+                console.error('文件上传失败：', err);
+                failCount = files.length; // 所有文件都失败
+                showToast(`文件上传失败，请稍后重试`, 'error');
             }
             
             // 移除加载状态
@@ -2095,7 +2330,7 @@ function copyToClipboard(text, button) {
             // 显示加载状态
             const loadingDiv = document.createElement('div');
             loadingDiv.className = 'mb-6 flex justify-start message-animation';
-            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') ? '正在整理报告…' : '正在思考…';
+            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : '正在思考…';
             loadingDiv.innerHTML = `
                 <div class="flex items-start max-w-[80%]">
                     <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
@@ -2440,7 +2675,7 @@ ${contextText.trim()}
                     })
                     .catch(error => {
                         console.error('中断操作失败:', error);
-                        alert(error.message);
+                        showToast(`操作失败: ${error.message}`, 'error', 3000);
                     });
             };
             
@@ -2830,6 +3065,17 @@ ${contextText.trim()}
                 // 获取当前登录用户名(先尝试localStorage,再尝试sessionStorage)
                 const currentUsername = localStorage.getItem('username') || sessionStorage.getItem('username') || 'panguAI';
                 
+                // 获取选中的搜索源（从复选框）
+                const checkboxes = document.querySelectorAll('.search-source-checkbox');
+                const selectedValues = Array.from(checkboxes)
+                    .filter(cb => cb.checked && cb.value !== 'all')
+                    .map(cb => cb.value);
+                const selectedSources = {
+                    websearch: selectedValues.includes('websearch'),
+                    pubmed: selectedValues.includes('pubmed'),
+                    arxiv: selectedValues.includes('arxiv')
+                };
+                
                 const requestBody = {
                     query: message,
                     taskId: taskId,  // 添加taskId字段
@@ -2837,7 +3083,8 @@ ${contextText.trim()}
                     reference_files: referenceFiles,  // 可选参考的文件列表（从文档库选择）
                     use_web_search: true,  // 是否启用网络检索（可选）
                     prioritize_user_files: true,  // 优先使用用户文件
-                    username: currentUsername  // 添加用户名字段
+                    username: currentUsername,  // 添加用户名字段
+                    search_sources: selectedSources  // 添加搜索源选择
                 };
 
                 // 3. 发送到DeepDiver API
@@ -3844,7 +4091,7 @@ ${contextText.trim()}
                 
                 // 如果是有ID的会话，调用API删除
                 if (sessionId) {
-                    fetch(`http://10.1.11.177:5000/api/chat/sessions/${sessionId}`, {
+                    fetch(`/5000/api/chat/sessions/${sessionId}`, {
                         method: 'DELETE',
                         headers: {
                             'Authorization': `Bearer ${window.userToken}`
@@ -4029,18 +4276,16 @@ ${contextText.trim()}
         // 全局变量
         let pendingFiles = []; // 待上传文件列表
         const MAX_FILES = 10; // 最大文件数
-        const MAX_SIZE = 50 * 1024 * 1024; // 最大总大小 50MB
-        const ALLOWED_TYPES = [
-            'application/pdf',
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'image/png', 'image/jpeg', 'image/jpg',
-            'application/vnd.ms-powerpoint',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            'text/plain',
-            'application/vnd.ms-excel',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        ];
+        const MAX_SIZE = 75 * 1024 * 1024; // 最大总大小 75MB
+        
+        // 统一的允许文件扩展名（文档库上传使用）
+        const ALLOWED_EXTENSIONS_LIBRARY = ['.pdf', '.doc', '.docx', '.txt'];  // 仅支持可被分析的文档类型
+        
+        // 统一的允许文件扩展名（上下文上传使用）
+        const ALLOWED_EXTENSIONS_CONTEXT = ['.txt', '.md', '.csv', '.json', '.log', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.xml', '.html', '.htm', '.rtf', '.odt', '.epub', '.yaml', '.yml'];
+        
+        // 统一的允许文件扩展名（DeepDiver模式使用）
+        const ALLOWED_EXTENSIONS_DEEPDIVER = ['.pdf', '.doc', '.docx', '.txt'];
 
         // DOM元素
         const fileLibraryBtn = document.getElementById('file-library-btn');
@@ -4160,6 +4405,7 @@ ${contextText.trim()}
 
         // 处理文件
         function handleFiles(files) {
+            const MAX_SINGLE_SIZE = 15 * 1024 * 1024; // 15MB单文件限制
             let validFiles = [];
             let errorMessages = [];
 
@@ -4170,8 +4416,15 @@ ${contextText.trim()}
                     break;
                 }
 
-                // 检查文件类型
-                if (!ALLOWED_TYPES.includes(file.type)) {
+                // 检查单个文件大小
+                if (file.size > MAX_SINGLE_SIZE) {
+                    errorMessages.push(`文件 "${file.name}" 大小超过15MB限制，无法上传。请压缩文件或选择较小的文件。`);
+                    continue;
+                }
+
+                // 检查文件类型（通过扩展名验证）
+                const fileExtension = '.' + file.name.toLowerCase().split('.').pop();
+                if (!ALLOWED_EXTENSIONS_LIBRARY.includes(fileExtension)) {
                     errorMessages.push(`文件 "${file.name}" 格式不支持`);
                     continue;
                 }
@@ -4180,7 +4433,7 @@ ${contextText.trim()}
                 const currentTotalSize = pendingFiles.reduce((sum, f) => sum + f.size, 0);
                 const newTotalSize = currentTotalSize + validFiles.reduce((sum, f) => sum + f.size, 0) + file.size;
                 if (newTotalSize > MAX_SIZE) {
-                    errorMessages.push(`总文件大小超过50MB限制`);
+                    errorMessages.push(`总文件大小超过75MB限制，无法上传。请减少文件数量或选择较小的文件。`);
                     break;
                 }
 
@@ -4188,7 +4441,7 @@ ${contextText.trim()}
             }
 
             if (errorMessages.length > 0) {
-                alert(errorMessages.join('\n'));
+                showToast(errorMessages.join('<br>'), 'error', 5000);
             }
 
             if (validFiles.length > 0) {
@@ -4270,7 +4523,7 @@ ${contextText.trim()}
             // 添加用户ID
             const userId = getUserId();
             if (!userId) {
-                alert('请先登录');
+                showToast('请先登录', 'warning', 3000);
                 uploadProgressDiv.classList.add('hidden');
                 updatePendingFilesList();
                 return;
@@ -4321,7 +4574,7 @@ ${contextText.trim()}
 
             } catch (error) {
                 console.error('上传失败:', error);
-                alert(`文件上传失败: ${error.message}`);
+                showToast(`文件上传失败: ${error.message}`, 'error', 3000);
                 uploadProgressDiv.classList.add('hidden');
                 updatePendingFilesList();
             }
@@ -4715,7 +4968,7 @@ ${contextText.trim()}
                 console.log('正在下载文件:', fileId);
             } catch (error) {
                 console.error('下载失败:', error);
-                alert('文件下载失败，请重试');
+                showToast('文件下载失败，请重试', 'error', 3000);
             }
         }
 
@@ -4940,8 +5193,8 @@ ${contextText.trim()}
             e.preventDefault();
             this.classList.remove('border-primary', 'bg-blue-50');
             const files = Array.from(e.dataTransfer.files).filter(f => {
-                const name = f.name.toLowerCase();
-                return name.endsWith('.pdf') || name.endsWith('.doc') || name.endsWith('.docx') || name.endsWith('.txt');
+                const fileExtension = '.' + f.name.toLowerCase().split('.').pop();
+                return ALLOWED_EXTENSIONS_DEEPDIVER.includes(fileExtension);
             });
             handleDeepdiverFileSelection(files);
         });
@@ -4949,8 +5202,8 @@ ${contextText.trim()}
         // 处理文件选择
         function handleDeepdiverFileSelection(files) {
             const maxFiles = 10;
-            const maxFileSize = 10 * 1024 * 1024; // 10MB
-            const maxTotalSize = 60 * 1024 * 1024; // 60MB
+            const maxFileSize = 15 * 1024 * 1024; // 15MB
+            const maxTotalSize = 75 * 1024 * 1024; // 75MB
             
             // 检查文件数量
             if (deepdiverPendingFiles.length + files.length > maxFiles) {
@@ -4960,17 +5213,14 @@ ${contextText.trim()}
             
             // 检查文件类型和大小
             for (const file of files) {
-                const fileName = file.name.toLowerCase();
-                const validExtensions = ['.pdf', '.doc', '.docx', '.txt'];
-                const isValidType = validExtensions.some(ext => fileName.endsWith(ext));
-                
-                if (!isValidType) {
+                const fileExtension = '.' + file.name.toLowerCase().split('.').pop();
+                if (!ALLOWED_EXTENSIONS_DEEPDIVER.includes(fileExtension)) {
                     showToast(`文件 ${file.name} 格式不支持，仅支持 PDF、Word、TXT 格式`, 'warning', 3000);
                     continue;
                 }
                 
                 if (file.size > maxFileSize) {
-                    showToast(`文件 ${file.name} 超过10MB限制`, 'warning', 3000);
+                    showToast(`文件 "${file.name}" 大小超过15MB限制，无法上传。请压缩文件或选择较小的文件。`, 'warning', 3000);
                     continue;
                 }
                 
@@ -4980,7 +5230,7 @@ ${contextText.trim()}
             // 检查总大小
             const totalSize = deepdiverPendingFiles.reduce((sum, f) => sum + f.size, 0);
             if (totalSize > maxTotalSize) {
-                showToast('文件总大小超过60MB限制', 'warning', 3000);
+                showToast('所有文件总大小超过75MB限制，无法上传。请减少文件数量或选择较小的文件。', 'warning', 3000);
                 // 移除最后添加的文件
                 deepdiverPendingFiles = deepdiverPendingFiles.slice(0, deepdiverPendingFiles.length - files.length);
                 return;

@@ -1,17 +1,11 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
-import logging
-from turtle import end_fill
-from typing import Dict, Any, List, Optional, Union
-import litellm
-from pathlib import Path
+from typing import Dict, Any, List
 import time
 import requests
 import os
 from .base_agent import BaseAgent, AgentConfig, AgentResponse, TaskInput
-
-logger = logging.getLogger(__name__)
 
 
 
@@ -33,33 +27,69 @@ class InformationSeekerAgent(BaseAgent):
             
         super().__init__(config, shared_mcp_client)
     
-    def set_cancellation_token(self, cancellation_token):
-        """
-        Set the cancellation token for this agent
-        设置此代理的取消令牌
-        
-        Args:
-            cancellation_token: threading.Event object that will be set when task should be cancelled
-        """
-        self._cancellation_token = cancellation_token
-    
-    def _check_cancellation(self) -> bool:
-        """
-        Check if task has been cancelled
-        检查任务是否已被取消
-        
-        Returns:
-            True if task should be cancelled, False otherwise
-        """
-        if self._cancellation_token and self._cancellation_token.is_set():
-            self.logger.info("InformationSeekerAgent task cancellation detected")
-            return True
-        return False
-    
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the ReAct agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
-        system_prompt_template = """You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
+        
+        # Read search source preferences from environment variables
+        use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
+        use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
+        use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
+        
+        # Get all available tools from MCP
+        available_tools = [tool.get('name', '') for tool in self.tool_schemas if 'name' in tool]
+        
+        # Define tool category patterns (only need to maintain this mapping when adding new sources)
+        tool_category_patterns = {
+            'websearch': ['batch_web_search', 'web_search'],
+            'pubmed': ['pubmed', 'medrxiv'],
+            'arxiv': ['arxiv']
+        }
+        
+        # Dynamically filter tools based on environment variables
+        enabled_tools = []
+        disabled_tools = []
+        
+        for tool_name in available_tools:
+            tool_lower = tool_name.lower()
+            is_enabled = False
+            
+            # Check if tool belongs to any enabled category
+            if use_websearch and any(pattern in tool_lower for pattern in tool_category_patterns['websearch']):
+                is_enabled = True
+            elif use_pubmed and any(pattern in tool_lower for pattern in tool_category_patterns['pubmed']):
+                is_enabled = True
+            elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
+                is_enabled = True
+            
+            # Categorize tool
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv']):
+                if is_enabled:
+                    enabled_tools.append(tool_name)
+                else:
+                    disabled_tools.append(tool_name)
+        
+        # Build search source guidance message
+        search_source_guidance = ""
+        if enabled_tools:
+            search_source_guidance = f"\n\n**📚 AVAILABLE SEARCH TOOLS:**\n"
+            search_source_guidance += f"You have access to the following search tools: **{', '.join(enabled_tools)}**\n"
+            search_source_guidance += f"These tools are fully functional and ready to use. Focus on using these tools effectively to gather comprehensive information.\n"
+            if disabled_tools:
+                search_source_guidance += f"\nNote: Some search tools ({', '.join(disabled_tools)}) are not available in this session. If you attempt to use them, you will receive an error - simply use the available tools instead.\n"
+        else:
+            search_source_guidance = f"\n\n**⚠️ WARNING: ALL SEARCH TOOLS DISABLED**\n"
+            search_source_guidance += f"No external search tools are available in this session. You can only work with existing files in the workspace.\n"
+            search_source_guidance += f"Focus on analyzing existing documents using document_qa and file operations.\n"
+        
+        # Add current date for time awareness
+        from datetime import datetime
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
+        
+**IMPORTANT - Current Date: {current_date}**
+When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
         
         Your role is to:
         1. Take decomposed sub-questions or tasks from parent agents
@@ -72,45 +102,28 @@ class InformationSeekerAgent(BaseAgent):
         ### Optimized Workflow:
         Follow this optimized workflow for information gathering:
         
-		0. **MANDATORY FIRST STEP - Check Workspace for Existing Files:**
-		   - Check `./user_uploads/` directory for user-uploaded files (HIGH PRIORITY)
-		   - Check `./library_refs/` directory for user-selected library files (NORMAL PRIORITY)
-		   - **CRITICAL REQUIREMENT:** When calling `document_extract`, you MUST include ALL document files from BOTH directories:
-		     * Include ALL .pdf, .doc, .docx files (source documents)
-		     * Include ALL .txt files that are NOT converted from other documents (e.g., research/*.txt)
-		     * The system will automatically skip .pdf.txt, .doc.txt, .docx.txt if the source file exists
-		   - **DO NOT FILTER FILES:** Do NOT make assumptions about file relevance based on filenames
-		   - **DO NOT SELECT SUBSET:** Do NOT choose only "relevant-looking" files - analyze ALL files
-		   - **MANDATORY:** If library_refs has 12 files, you MUST pass all 12 files to document_extract
-		   - **CRITICAL:** Do NOT skip library_refs files even if user_uploads has files
-		   - Only proceed to web search after analyzing existing files
-
-		1. INITIAL RESEARCH:
-		   - Generate focused search queries (≤10): Limit to no more than 10 initial search queries to avoid increased failure rates from excessive decomposition.
-		   - Analyse and select the appropriate information retrieval tools to get relevant information for your queries, based on the tool description. You can split a query into multiple tool-invoked inputs based on the tool description. Use the professional search tools for biology-related articles("search_pubmed_key_words", "search_pubmed_advanced","medrxiv_search"), and professional computer-science-related article search tools for CS knowledge.("arxiv_search"). The web search engine is a general retrieval tool for any query ("batch_web_search"). When calling the web search engine, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese. But for other tools, pay attention to the requests in thier descriptions.
-		   - Analyze the search results (titles, snippets, URLs, article id, article abstract...) to identify promising sources
-
-		2. CONTENT EXTRACTION:  
-		   - For important URLs searched by "batch_web_search", use `jina_reader` to extract full content from the webpage. 
-		   - For important articles searched with pubmed, medrxiv, or arxiv, use "get_pubmed_article", "medrxiv_read_paper", "arxiv_read_paper" to extract full content.
-		   - Save the content to a file in the workspace **under the relative path `./research/`**  
-		   - Store results with meaningful file paths (e.g., "./research/ai_trends_2024.txt")
+        1. INITIAL RESEARCH:{search_source_guidance}
+           - Use your available search tools to find relevant information and sources. When formulating search queries, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese.
+           - Analyze the search results (titles, snippets, URLs, paper metadata) to identify promising sources
+        
+        2. CONTENT EXTRACTION:
+           - For important URLs, use `url_crawler` to:
+                a) Extract full content from the webpage
+                b) Save the content to a file in the workspace
+           - Store results with meaningful file paths (e.g., \"research/ai_trends_2024.txt\")
         
         3. CONTENT ANALYSIS:
            - Use `document_qa` to ask specific questions about the saved files:
                 a) Formulate focused questions to extract key insights
                 b) Use answers to deepen your understanding
            - You can ask multiple questions about the same file
-           - Use `document_extract` for multi-dimensional analysis of saved files:
-        		a) Provides structured analysis across five key dimensions: doc time, source, authority, core content and task relevance.
-
+        
         4. FILE MANAGEMENT:
            - Use `file_write` to save important findings or summaries
            - For reviewing saved content:
                 a) Prefer `document_qa` to ask specific questions about the content
-				b) Prefer `document_extract` to get comprehensive multi-dimensional analysis of saved files
-                c) Use `file_read` ONLY for small files (<1000 tokens) when you need the entire content
-                d) Avoid reading large files directly as it may exceed context limits
+                b) Use `file_read` ONLY for small files (<1000 tokens) when you need the entire content
+                c) Avoid reading large files directly as it may exceed context limits
         
         5. TASK COMPLETION:
            - When ready to report, call `info_seeker_objective_task_done` with:
@@ -128,7 +141,7 @@ Below, within the <tools></tools> tags, are the descriptions of each tool and th
 $tool_schemas
 </tools>
 For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]
+[unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
 """
         return system_prompt_template.replace("$tool_schemas", tool_schemas_str)
 

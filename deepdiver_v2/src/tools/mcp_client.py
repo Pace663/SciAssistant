@@ -9,6 +9,7 @@ to connect to and communicate with MCP servers through the Model Context Protoco
 
 import json
 import logging
+import os
 import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -414,6 +415,16 @@ class MCPClient:
                     error=f"Tool '{tool_name}' not available on server. Available tools: {list(self._tools.keys())}"
                 )
             
+            # Check if search tool is allowed based on user preferences
+            search_filter_result = self._check_search_tool_allowed(tool_name)
+            if not search_filter_result["allowed"]:
+                logger.info(f"Tool '{tool_name}' blocked by search source filter: {search_filter_result['reason']}")
+                return MCPClientResult(
+                    success=False,
+                    error=search_filter_result["reason"],
+                    data={"disabled_by_user": True, "tool_name": tool_name}
+                )
+            
             # Call the tool via JSON-RPC
             result = self._make_request("tools/call", {
                 "name": tool_name,
@@ -430,12 +441,20 @@ class MCPClient:
             )
     
     def get_available_tools(self) -> Dict[str, MCPTool]:
-        """Get dictionary of available tools from the server"""
-        return self._tools.copy()
+        """Get dictionary of available tools from the server (filtered by search source preferences)"""
+        all_tools = self._tools.copy()
+        # Filter out disabled search tools
+        filtered_tools = {}
+        for name, tool in all_tools.items():
+            if self._check_search_tool_allowed(name)["allowed"]:
+                filtered_tools[name] = tool
+        return filtered_tools
     
     def list_tools(self) -> List[str]:
-        """Get list of available tool names"""
-        return list(self._tools.keys())
+        """Get list of available tool names (filtered by search source preferences)"""
+        all_tools = list(self._tools.keys())
+        # Filter out disabled search tools
+        return [name for name in all_tools if self._check_search_tool_allowed(name)["allowed"]]
     
     def get_tool_info(self, tool_name: str) -> Optional[MCPTool]:
         """Get detailed information about a specific tool"""
@@ -444,6 +463,61 @@ class MCPClient:
     def is_connected(self) -> bool:
         """Check if client is connected to MCP server"""
         return self._connected and MCP_AVAILABLE
+    
+    def _check_search_tool_allowed(self, tool_name: str) -> Dict[str, Any]:
+        """
+        Check if a search tool is allowed based on user's search source preferences.
+        Returns dict with 'allowed' (bool) and 'reason' (str) keys.
+        
+        Configuration-driven approach: Add new search sources by:
+        1. Adding to SEARCH_SOURCE_CONFIG below
+        2. Setting corresponding environment variable in backend
+        3. Adding UI checkbox in frontend
+        """
+        # Configuration: Define search sources and their associated tools
+        SEARCH_SOURCE_CONFIG = {
+            'WEBSEARCH': {
+                'name': '全网搜索',
+                'env_var': 'SEARCH_SOURCE_WEBSEARCH',
+                'tools': ['batch_web_search', 'url_crawler']
+            },
+            'PUBMED': {
+                'name': 'PubMed',
+                'env_var': 'SEARCH_SOURCE_PUBMED',
+                'tools': ['search_pubmed_key_words', 'search_pubmed_advanced', 
+                         'medrxiv_search', 'get_pubmed_article', 'medrxiv_read_paper']
+            },
+            'ARXIV': {
+                'name': 'arXiv',
+                'env_var': 'SEARCH_SOURCE_ARXIV',
+                'tools': ['arxiv_search', 'arxiv_read_paper']
+            },
+            # 未来添加新搜索源只需在这里添加配置即可，例如：
+            # 'GOOGLE_SCHOLAR': {
+            #     'name': 'Google Scholar',
+            #     'env_var': 'SEARCH_SOURCE_SCHOLAR',
+            #     'tools': ['scholar_search', 'scholar_read_paper']
+            # },
+        }
+        
+        # Build tool to source mapping from configuration
+        tool_to_source = {}
+        for source_key, config in SEARCH_SOURCE_CONFIG.items():
+            is_enabled = os.environ.get(config['env_var'], 'True').lower() == 'true'
+            for tool in config['tools']:
+                tool_to_source[tool] = (config['name'], is_enabled)
+        
+        # Check if tool is a search tool and if it's disabled
+        if tool_name in tool_to_source:
+            source_name, is_enabled = tool_to_source[tool_name]
+            if not is_enabled:
+                return {
+                    "allowed": False,
+                    "reason": f"搜索源 '{source_name}' 未被用户启用。请使用已启用的搜索源，或要求用户在前端界面勾选该搜索源。当前工具 '{tool_name}' 已被禁用。"
+                }
+        
+        # Tool is allowed (either not a search tool, or is enabled)
+        return {"allowed": True, "reason": ""}
     
     def refresh_tools(self):
         """Refresh the list of available tools from the server"""
@@ -705,6 +779,23 @@ INFORMATION_SEEKER_TOOLS = [
     "str_replace_based_edit_tool",
     "list_workspace",
     "file_find_by_name",
+    
+    # Academic search tools - PubMed
+    "search_pubmed_key_words",
+    "search_pubmed_advanced",
+    "get_pubmed_article",
+    
+    # Academic search tools - arXiv
+    "arxiv_search",
+    "arxiv_read_paper",
+    
+    # Academic search tools - medRxiv
+    "medrxiv_search",
+    "medrxiv_read_paper",
+    
+    # Academic search tools - Springer Nature
+    "springer_search",
+    "springer_get_article",
 ]
 
 WRITER_AGENT_TOOLS = [

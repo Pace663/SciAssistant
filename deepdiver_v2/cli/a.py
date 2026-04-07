@@ -86,6 +86,13 @@ class UserFile(BaseModel):
     filename: str  # 文件名，用于显示和保存
 
 
+class SearchSources(BaseModel):
+    """搜索源选择"""
+    websearch: bool = True
+    pubmed: bool = True
+    arxiv: bool = True
+
+
 class SingleQueryRequest(BaseModel):
     query: str  # 查询文本
     taskId: str  # 任务ID
@@ -94,6 +101,7 @@ class SingleQueryRequest(BaseModel):
     use_web_search: bool = True  # 是否启用网络检索
     prioritize_user_files: bool = True  # 是否优先使用用户文件
     username: Optional[str] = "用户"  # 用户名，用于生成报告署名
+    search_sources: Optional[SearchSources] = None  # 搜索源选择
 
 
 class BatchQueryRequest(BaseModel):
@@ -289,7 +297,7 @@ def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]]
 def process_single_query(query_data, task_id: Optional[str] = None, username: str = "用户",
                          skip_task_creation: bool = False):
     """处理单个查询（独立进程，使用持久化工作区）"""
-    query_text, query_index, user_files_data = query_data
+    query_text, query_index, user_files_data, search_sources_dict = query_data
     process_id = os.getpid()
     if not task_id:
         task_id = f"req_{int(time.time() * 1000)}_{query_index}"  # 生成唯一请求ID
@@ -336,6 +344,15 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         # 设置环境变量，让 Agent 使用已创建的 workspace
         os.environ['AGENT_SESSION_ID'] = session_id
         os.environ['AGENT_WORKSPACE_PATH'] = str(workspace_path)
+        
+        # 设置搜索源偏好
+        if search_sources_dict:
+            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', True))
+            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', True))
+            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', True))
+            logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', True)}, "
+                       f"PubMed: {search_sources_dict.get('pubmed', True)}, "
+                       f"arXiv: {search_sources_dict.get('arxiv', True)}")
 
         agent = create_planner_agent(
             agent_name=f"PlannerAgent",
@@ -523,6 +540,15 @@ async def handle_single_query(request: SingleQueryRequest):
 
     # 合并所有文件数据，传递给处理函数
     all_files_data = user_files_data + reference_files_data
+    
+    # 准备搜索源数据
+    search_sources_dict = None
+    if request.search_sources:
+        search_sources_dict = {
+            'websearch': request.search_sources.websearch,
+            'pubmed': request.search_sources.pubmed,
+            'arxiv': request.search_sources.arxiv
+        }
 
     # 使用线程池执行，避免阻塞事件循环
     if executor is None:
@@ -530,8 +556,8 @@ async def handle_single_query(request: SingleQueryRequest):
 
     result = await loop.run_in_executor(
         executor,
-        lambda: process_single_query((request.query, 0, all_files_data), task_id=task_id, username=request.username,
-                                     skip_task_creation=True)  # 传递用户文件数据和用户名，跳过任务创建（已在上面创建）
+        lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
+                                     skip_task_creation=True)  # 传递用户文件数据、搜索源和用户名，跳过任务创建（已在上面创建）
     )
     # 记录历史（可选）
     query_history.append({

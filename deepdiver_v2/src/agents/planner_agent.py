@@ -379,6 +379,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                         max_iterations=info_seeker_config.get('max_iterations', 30),
                         shared_mcp_client=self.mcp_tools.client if hasattr(self.mcp_tools, 'client') else self.mcp_tools
                     )
+                    # 【关键修复】传递取消令牌给子 Agent
+                    if self._cancellation_token:
+                        info_seeker.set_cancellation_token(self._cancellation_token)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 
@@ -512,6 +515,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                         max_iterations=info_seeker_config.get('max_iterations', 30),
                         shared_mcp_client=self.mcp_tools.client if hasattr(self.mcp_tools, 'client') else self.mcp_tools
                     )
+                    # 【关键修复】传递取消令牌给子 Agent
+                    if self._cancellation_token:
+                        info_seeker.set_cancellation_token(self._cancellation_token)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 
@@ -620,6 +626,9 @@ For each function call, return a JSON object placed within the [unused11][unused
                 temperature=writer_config.get('temperature', 0.3),
                 max_tokens=writer_config.get('max_tokens', 16384)
             )
+            # 【关键修复】传递取消令牌给子 Agent
+            if self._cancellation_token:
+                writer.set_cancellation_token(self._cancellation_token)
 
             self.logger.info(f"Assigning task to WriterAgent: {task_content[:800]}...")
 
@@ -985,8 +994,9 @@ For each function call, return a JSON object placed within the [unused11][unused
 
             # Build system prompt for planning
             system_prompt = self._build_system_prompt()
+            localtime = time.localtime()
             # Add to conversation
-            conversation_history.append({"role": "system", "content": system_prompt})
+            conversation_history.append({"role": "system", "content":f"当前时间为：{localtime}"+ system_prompt})
             conversation_history.append({"role": "user", "content": initial_message + " /no_think"})
 
             iteration = 0
@@ -1002,6 +1012,17 @@ For each function call, return a JSON object placed within the [unused11][unused
             headers = {'Content-Type': 'application/json', 'csb-token': model_token}
             # ReAct Loop: Reasoning -> Acting -> Reasoning -> Acting...
             while iteration < self.config.max_iterations and not task_completed:
+                # 【关键修复】检查任务是否被取消
+                if self._check_cancellation():
+                    self.logger.warning(f"Task {self.task_id} was cancelled at iteration {iteration}")
+                    return {
+                        "success": False,
+                        "error": "Task was cancelled by user",
+                        "reasoning_trace": self.reasoning_trace,
+                        "iterations": iteration,
+                        "execution_time": time.time() - start_time
+                    }
+                
                 iteration += 1
                 self.logger.info(f"Planning iteration {iteration}")
 

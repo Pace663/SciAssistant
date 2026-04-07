@@ -650,8 +650,8 @@ PDF_DIR = BASE_DIR / "workspaces"  # 统一路径
 # 上传文件目录与配置
 UPLOAD_DIR = BASE_DIR / "uploads"
 ALLOWED_EXTENSIONS = {'.txt', '.md', '.csv', '.json', '.log', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.xml', '.html', '.htm', '.rtf', '.odt', '.epub', '.yaml', '.yml'}
-MAX_UPLOAD_SIZE = 30 * 1024 * 1024  # 30MB（单个文件限制，支持Chat模式；DeepDiver模式在前端限制为20MB）
-MAX_TOTAL_UPLOAD_SIZE = 60 * 1024 * 1024  # 60MB（总大小限制，前端控制）
+MAX_UPLOAD_SIZE = 15 * 1024 * 1024  # 15MB（单个文件限制，DeepDiver和文档库统一）
+MAX_TOTAL_UPLOAD_SIZE = 75 * 1024 * 1024  # 75MB（总大小限制）
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 def _find_workspace_file(session_id: str, filename: str) -> Optional[Path]:
@@ -677,10 +677,22 @@ def upload_context_file():
     支持两种模式：
     1. 临时上传：保存到uploads目录，用于当前会话
     2. 同步到文档库：如果提供user_id和save_to_library=true，同时保存到文档库
+    
+    注意：此接口设计为单文件上传，如果前端传入多个文件，只处理第一个
     """
     if 'file' not in request.files:
         return jsonify({'success': False, 'message': '未找到文件字段: file'}), 400
-    file = request.files['file']
+    
+    # 获取文件（如果是多文件，只取第一个）
+    files = request.files.getlist('file')
+    if not files or len(files) == 0:
+        return jsonify({'success': False, 'message': '未选择文件'}), 400
+    
+    # 防御性检查：如果前端误传多个文件，只处理第一个并给出提示
+    if len(files) > 1:
+        logger.warning(f"上下文上传接收到{len(files)}个文件，只处理第一个")
+    
+    file = files[0]
     if not file or file.filename == '':
         return jsonify({'success': False, 'message': '未选择文件'}), 400
 
@@ -1245,8 +1257,9 @@ def rag_search():
 
 # 文件上传配置
 UPLOAD_BASE_DIR = BASE_DIR / "user_files"  # 基础文件存储目录
-ALLOWED_EXTENSIONS_LIBRARY = {'pdf', 'doc', 'docx', 'png', 'jpg', 'jpeg', 'ppt', 'pptx', 'txt', 'xlsx', 'xls'}  # 文档库允许的扩展名（不带点号）
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS_LIBRARY = {'pdf', 'doc', 'docx', 'txt'}  # 文档库允许的扩展名（仅支持可被分析的文档类型）
+MAX_FILE_SIZE = 75 * 1024 * 1024  # 75MB（总大小限制）
+MAX_SINGLE_FILE_SIZE = 15 * 1024 * 1024  # 15MB（单个文件大小限制，与DeepDiver统一）
 
 # 确保基础上传目录存在
 UPLOAD_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1336,6 +1349,16 @@ def upload_files():
 
                     # 获取文件大小
                     file_size = os.path.getsize(file_path)
+                    
+                    # 检查单个文件大小是否超限
+                    if file_size > MAX_SINGLE_FILE_SIZE:
+                        # 删除已上传的文件
+                        os.remove(file_path)
+                        return jsonify({
+                            'success': False,
+                            'message': f'文件 {original_filename} 大小超过{MAX_SINGLE_FILE_SIZE / 1024 / 1024:.0f}MB限制'
+                        }), 400
+                    
                     total_size += file_size
 
                     # 检查总大小是否超限

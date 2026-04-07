@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 import yaml
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -324,6 +325,22 @@ def get_tool_function(tool_name: str):
         
         # Internal tools - available to server but NOT exposed to agents via tool schemas
         "internal_file_read_unlimited": lambda tools, **kwargs: tools.internal_file_read_unlimited(**kwargs),
+        # Resource Library - PubMed tools
+        "search_pubmed_key_words": lambda tools, **kwargs: tools.search_pubmed_key_words(**kwargs),
+        "search_pubmed_advanced": lambda tools, **kwargs: tools.search_pubmed_advanced(**kwargs),
+        "get_pubmed_article": lambda tools, **kwargs: tools.get_pubmed_article(**kwargs),
+        
+        # Resource Library - arXiv tools
+        "arxiv_search": lambda tools, **kwargs: tools.arxiv_search(**kwargs),
+        "arxiv_read_paper": lambda tools, **kwargs: tools.arxiv_read_paper(**kwargs),
+        
+        # Resource Library - medRxiv tools
+        "medrxiv_search": lambda tools, **kwargs: tools.medrxiv_search(**kwargs),
+        "medrxiv_read_paper": lambda tools, **kwargs: tools.medrxiv_read_paper(**kwargs),
+        
+        # Resource Library - Springer Nature tools
+        "springer_search": lambda tools, **kwargs: tools.springer_search(**kwargs),
+        "springer_get_article": lambda tools, **kwargs: tools.springer_get_article(**kwargs),
     }
     return tool_map.get(tool_name)
 
@@ -695,11 +712,14 @@ class ThreadSafeSessionManager:
         
         # 如果找不到，使用当前工作目录
         if project_root is None:
-            project_root = Path.cwd()
+            project_root = current_file.parent.parent.parent.parent
+            logger.warning(f"Could not find app.py, using fallback project root: {project_root}")
         
         # 将 base_workspace_dir 设置为项目根目录下的路径
         self.base_workspace_dir = project_root / base_workspace_dir
         self.base_workspace_dir.mkdir(exist_ok=True, parents=True)
+        
+        logger.info(f"Workspace base directory initialized at: {self.base_workspace_dir}")
         
         # Thread-safe session storage
         self.sessions: Dict[str, Session] = {}
