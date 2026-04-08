@@ -35,15 +35,24 @@ class InformationSeekerAgent(BaseAgent):
         use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
+        use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'
         
         # Get all available tools from MCP
-        available_tools = [tool.get('name', '') for tool in self.tool_schemas if 'name' in tool]
+        # Tool schemas have structure: {'type': 'function', 'function': {'name': '...', ...}}
+        available_tools = []
+        for tool in self.tool_schemas:
+            if isinstance(tool, dict):
+                if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
+                    available_tools.append(tool['function']['name'])
+                elif 'name' in tool:
+                    available_tools.append(tool['name'])
         
         # Define tool category patterns (only need to maintain this mapping when adding new sources)
         tool_category_patterns = {
             'websearch': ['batch_web_search', 'web_search'],
             'pubmed': ['pubmed', 'medrxiv'],
-            'arxiv': ['arxiv']
+            'arxiv': ['arxiv'],
+            'springer': ['springer']
         }
         
         # Dynamically filter tools based on environment variables
@@ -61,9 +70,11 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
                 is_enabled = True
+            elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
+                is_enabled = True
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['springer']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:

@@ -21,6 +21,7 @@ import multiprocessing as mp
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
+import requests
 
 # 【重要】先调整Python路径，再导入项目模块
 sys.path.insert(0, str(Path(__file__).parent.parent))  # 添加 new_deepdiver 到路径
@@ -96,6 +97,7 @@ class SearchSources(BaseModel):
 class SingleQueryRequest(BaseModel):
     query: str  # 查询文本
     taskId: str  # 任务ID
+    frontend_session_id: Optional[str] = None  # 前端会话ID，用于存储消息到数据库
     user_files: Optional[List[UserFile]] = []  # 强制使用的文件列表（直接上传）
     reference_files: Optional[List[UserFile]] = []  # 可选参考的文件列表（从文档库选择）
     use_web_search: bool = True  # 是否启用网络检索
@@ -295,7 +297,7 @@ def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]]
 
 
 def process_single_query(query_data, task_id: Optional[str] = None, username: str = "用户",
-                         skip_task_creation: bool = False):
+                         skip_task_creation: bool = False, frontend_session_id: Optional[str] = None):
     """处理单个查询（独立进程，使用持久化工作区）"""
     query_text, query_index, user_files_data, search_sources_dict = query_data
     process_id = os.getpid()
@@ -347,12 +349,14 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         
         # 设置搜索源偏好
         if search_sources_dict:
-            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', True))
-            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', True))
-            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', True))
-            logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', True)}, "
-                       f"PubMed: {search_sources_dict.get('pubmed', True)}, "
-                       f"arXiv: {search_sources_dict.get('arxiv', True)}")
+            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', False))
+            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', False))
+            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
+            os.environ['SEARCH_SOURCE_SPRINGER'] = str(search_sources_dict.get('springer', False))
+            logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', False)}, "
+                       f"PubMed: {search_sources_dict.get('pubmed', False)}, "
+                       f"arXiv: {search_sources_dict.get('arxiv', False)}, "
+                       f"Springer: {search_sources_dict.get('springer', False)}")
 
         agent = create_planner_agent(
             agent_name=f"PlannerAgent",
@@ -400,8 +404,81 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     final_report_content = f.read()
                 report_relative_path = "report/final_report.md"
                 logger.info(f"成功读取最终报告: {final_report_path} (大小: {len(final_report_content)} 字符)")
+                
+                # 自动存储报告到数据库
+                try:
+                    if frontend_session_id:
+                        # 从报告内容中提取标题
+                        report_title = "研究报告"  # 默认值
+                        try:
+                            import re
+                            # 方法1: 查找第一个 # 标题
+                            title_match = re.search(r'^#\s+(.+?)$', final_report_content, re.MULTILINE)
+                            if title_match:
+                                report_title = title_match.group(1).strip()
+                            else:
+                                # 方法2: 查找第一行非空内容作为标题
+                                lines = [line.strip() for line in final_report_content.split('\n') if line.strip()]
+                                if lines:
+                                    report_title = re.sub(r'^#+\s*', '', lines[0]).strip()
+                            
+                            # 限制标题长度（最多50个字符）
+                            if len(report_title) > 50:
+                                report_title = report_title[:50] + '...'
+                        except Exception as e:
+                            logger.warning(f"提取报告标题失败: {e}")
+                        
+                        store_url = "http://localhost:5000/api/chat/messages"
+                        store_data = {
+                            "session_id": frontend_session_id,
+                            "from_who": "ai",
+                            "content": final_report_content,
+                            "round": 1,
+                            "uuid": session_id,  # 使用workspace session_id作为uuid
+                            "has_report": 1,
+                            "report_title": report_title
+                        }
+                        
+                        http_response = requests.post(store_url, json=store_data, timeout=30)
+                        if http_response.status_code == 201:
+                            logger.info(f"成功存储报告到数据库: session_id={frontend_session_id}, uuid={session_id}")
+                        else:
+                            logger.error(f"存储报告失败: {http_response.status_code}, {http_response.text}")
+                    else:
+                        logger.warning("未提供frontend_session_id，跳过自动存储")
+                except Exception as store_error:
+                    logger.error(f"自动存储报告到数据库失败: {store_error}")
             else:
                 logger.warning(f"最终报告文件不存在: {final_report_path}")
+                # 没有完整报告时，尝试保存 task_summary（简单问题的回复）
+                try:
+                    if frontend_session_id and response.success and response.result:
+                        task_summary = response.result.get('task_summary', '')
+                        if task_summary:
+                            import re
+                            # 提取"完整答案"部分
+                            answer_match = re.search(r'## 完整答案[\s\S]*?(?=任务已圆满完成)', task_summary)
+                            if answer_match:
+                                content = answer_match.group(0).replace('## 完整答案\n', '').strip() + '\n\n任务已圆满完成'
+                            else:
+                                content = task_summary
+                            
+                            store_url = "http://localhost:5000/api/chat/messages"
+                            store_data = {
+                                "session_id": frontend_session_id,
+                                "from_who": "ai",
+                                "content": content,
+                                "round": 1,
+                                "uuid": session_id,
+                                "has_report": 0,
+                                "report_title": ""
+                            }
+                            
+                            http_response = requests.post(store_url, json=store_data, timeout=30)
+                            if http_response.status_code != 201:
+                                logger.error(f"存储简单回复失败: {http_response.status_code}")
+                except Exception as e:
+                    logger.error(f"存储简单回复异常: {e}")
         except Exception as e:
             logger.error(f"读取最终报告失败: {e}")
 
@@ -557,7 +634,7 @@ async def handle_single_query(request: SingleQueryRequest):
     result = await loop.run_in_executor(
         executor,
         lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
-                                     skip_task_creation=True)  # 传递用户文件数据、搜索源和用户名，跳过任务创建（已在上面创建）
+                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id)  # 传递用户文件数据、搜索源和用户名，跳过任务创建（已在上面创建）
     )
     # 记录历史（可选）
     query_history.append({

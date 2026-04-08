@@ -496,7 +496,7 @@ def update_chat_session_time(connection, session_id):
     """更新聊天会话的最后更新时间"""
     with connection.cursor() as cursor:
         sql = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
-        cursor.execute(sql, (session_id,))
+        cursor.execute(sql, (session_id))
         connection.commit()
 
         if cursor.rowcount == 0:
@@ -555,8 +555,7 @@ def add_chat_message():
         timestamp = data.get('timestamp', datetime.datetime.now())
         message_uuid = data.get('uuid', data.get('backend_session_id'))
         has_report = data.get('has_report',0)
-        report_title = data.get('report_title', '')  # 新增：获取报告标题
-
+        report_title = data.get('report_title', '')
 
         # 验证from_who值
         if from_who not in ['user', 'ai']:
@@ -568,6 +567,7 @@ def add_chat_message():
 
         try:
             with connection.cursor() as cursor:
+                # 统一存储逻辑：所有消息直接存储为单条记录
                 sql = """
                     INSERT INTO conversation_detail 
                     (session_id, from_who, round, timestamp, uuid, content, think_msg, create_time, has_report, report_title)
@@ -577,9 +577,16 @@ def add_chat_message():
                     session_id, from_who, round_num, timestamp,
                     message_uuid, content, think_msg, has_report, report_title
                 ))
+                sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
+                cursor.execute(sql1, (session_id))
+                
+                if has_report == 1:
+                    logger.info(f"成功插入DeepDiver报告: session_id={session_id}, report_title={report_title}, size={len(content)}")
+                else:
+                    logger.info(f"成功插入消息: session_id={session_id}, from={from_who}")
+                    
             connection.commit()
 
-            logger.info(f"成功插入消息: session_id={session_id}, from={from_who}, report_title={report_title}")
             return jsonify({
                 'success': True,
                 'message': '消息添加成功',
@@ -612,24 +619,61 @@ def get_chat_messages_by_session_id(session_id):
                     FROM conversation_detail
                     WHERE session_id = %s
                     ORDER BY round ASC, 
-                     timestamp ASC, from_who DESC;
+                     timestamp ASC, 
+                     CASE 
+                         WHEN think_msg IN ('1','2','3') THEN CAST(think_msg AS UNSIGNED)
+                         ELSE 999
+                     END ASC,
+                     from_who DESC;
                 """
                 cursor.execute(sql, (session_id,))
                 messages = cursor.fetchall()
 
-                # 转换datetime对象为字符串
+                # 转换为前端需要的格式
                 converted_messages = []
+                
                 for message in messages:
-                    converted_message = {}
-                    for key, value in message.items():
-                        converted_message[key] = convert_datetime_to_string(value)
+                    converted_message = {
+                        'id': message.get('id'),
+                        'session_id': message.get('session_id'),
+                        'from_who': message.get('from_who'),
+                        'content': message.get('content', ''),
+                        'round': message.get('round'),
+                        'timestamp': message.get('timestamp').isoformat() if message.get('timestamp') else None,
+                        'uuid': message.get('uuid'),
+                        'think_msg': message.get('think_msg', ''),
+                        'has_report': message.get('has_report', 0),
+                        'report_title': message.get('report_title', '')
+                    }
                     converted_messages.append(converted_message)
+
+                # 判断是否有正在运行的任务
+                # 策略：只要最后一条消息是用户消息，就认为有任务正在运行（等待AI回复）
+                has_pending_task = False
+                pending_mode = None
+                
+                if converted_messages:
+                    last_message = converted_messages[-1]
+                    
+                    # 如果最后一条是用户消息，说明正在等待AI回复
+                    if last_message['from_who'] == 'user':
+                        has_pending_task = True
+                        # 从 think_msg 字段中读取模式信息（前端保存时写入的）
+                        # think_msg 可能是 'deepdiver', 'chat', 'reasoner' 等
+                        user_mode = last_message.get('think_msg', '').strip()
+                        if user_mode in ['deepdiver', 'chat', 'reasoner']:
+                            pending_mode = user_mode
+                        else:
+                            # 兜底：如果没有模式信息，默认为 chat
+                            pending_mode = 'chat'
 
                 return jsonify({
                     'success': True,
                     'session_id': session_id,
                     'messages': converted_messages,
-                    'count': len(converted_messages)
+                    'count': len(converted_messages),
+                    'has_pending_task': has_pending_task,
+                    'pending_mode': pending_mode
                 }), 200
 
         except Exception as e:
@@ -1683,5 +1727,10 @@ def health_check():
 
 
 if __name__ == '__main__':
+    # 禁用 Werkzeug 的 HTTP 访问日志
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)  # 只显示错误，不显示 INFO 级别的访问日志
+    
     # 生产环境请修改debug=False，并配置合适的host和port
     app.run(debug=False, host='0.0.0.0', port=5000)

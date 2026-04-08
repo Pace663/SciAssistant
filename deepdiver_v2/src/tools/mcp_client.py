@@ -492,12 +492,11 @@ class MCPClient:
                 'env_var': 'SEARCH_SOURCE_ARXIV',
                 'tools': ['arxiv_search', 'arxiv_read_paper']
             },
-            # 未来添加新搜索源只需在这里添加配置即可，例如：
-            # 'GOOGLE_SCHOLAR': {
-            #     'name': 'Google Scholar',
-            #     'env_var': 'SEARCH_SOURCE_SCHOLAR',
-            #     'tools': ['scholar_search', 'scholar_read_paper']
-            # },
+            'SPRINGER': {
+                'name': 'Springer Nature',
+                'env_var': 'SEARCH_SOURCE_SPRINGER',
+                'tools': ['springer_search', 'springer_get_article']
+            },
         }
         
         # Build tool to source mapping from configuration

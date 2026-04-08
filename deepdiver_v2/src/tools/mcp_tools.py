@@ -207,6 +207,15 @@ def _wrap_special_symbol(symbol: str, fallback: str = None) -> str:
     return symbol
 
 
+def _strip_font_tags(text: str) -> str:
+    text = re.sub(r'</?\s*font\b[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&lt;\s*/?\s*font\b[^&]*?&gt;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&amp;lt;\s*/?\s*font\b[^&]*?&amp;gt;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&#60;\s*/?\s*font\b[^#]*?&#62;', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'&#x3c;\s*/?\s*font\b[^#]*?&#x3e;', '', text, flags=re.IGNORECASE)
+    return text
+
+
 def _simplify_latex(latex_text: str) -> str:
     """
     简化LaTeX数学公式为可读文本
@@ -218,6 +227,9 @@ def _simplify_latex(latex_text: str) -> str:
     Returns:
         简化后的文本
     """
+ 
+    latex_text = _strip_font_tags(latex_text)
+ 
     # 常见LaTeX命令映射 - 使用有序字典确保处理顺序
     # 重要：必须先处理长命令，再处理短命令，避免部分匹配
     replacements = [
@@ -475,30 +487,7 @@ def _process_inline_formatting(text: str) -> str:
         if unicode_char in text:
             text = text.replace(unicode_char, f'<sub>{normal_char}</sub>')
 
-    # 特殊字符处理
-    text = text.replace('μ', 'µ').replace('µ', '<font name="Arial">µ</font>')
-    text = text.replace('ŷ', '<font name="Arial">ŷ</font>')
-
-    # 处理宋体不支持的数学符号，使用 Arial 字体显示（Windows 系统自带）
-    math_symbols = [
-        # 希腊字母
-        'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'ν', 'ξ', 'ο', 'π',
-        'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω',
-        'Α', 'Β', 'Γ', 'Δ', 'Ε', 'Ζ', 'Η', 'Θ', 'Ι', 'Κ', 'Λ', 'Μ', 'Ν', 'Ξ', 'Ο',
-        'Π', 'Ρ', 'Σ', 'Τ', 'Υ', 'Φ', 'Χ', 'Ψ', 'Ω',
-        # 数学运算符
-        '∇', '∂', '∞', '∑', '∏', '∫', '∬', '∭', '∮', '√',
-        '≤', '≥', '≠', '≈', '≡', '∼', '∝', '±', '∓', '×', '÷',
-        '∈', '∉', '⊂', '⊃', '⊆', '⊇', '∪', '∩', '∅',
-        '∀', '∃', '¬', '∧', '∨',
-        '→', '←', '↔', '⇒', '⇐', '⇔', '↑', '↓',
-        '∠', '⊥', '∥', '▽',
-    ]
-    for sym in math_symbols:
-        if sym in text:
-            text = text.replace(sym, f'<font name="Arial">{sym}</font>')
-
-    # 先保护数学公式 $$ ... $$ (避免被后续处理破坏)
+    # 先保护数学公式 $...$ (必须在数学符号处理之前，避免公式内的希腊字母被错误地包裹font标签)
     math_formulas = []
 
     def protect_math(match):
@@ -518,12 +507,36 @@ def _process_inline_formatting(text: str) -> str:
         # 移除所有剩余的孤立$符号
         text = text.replace('$', '')
 
+    # 特殊字符处理（必须在公式保护之后，避免污染公式内容）
+    text = text.replace('μ', 'µ').replace('µ', '<font name="Arial">µ</font>')
+    text = text.replace('ŷ', '<font name="Arial">ŷ</font>')
+
+    # 处理宋体不支持的数学符号，使用 Arial 字体显示（Windows 系统自带）
+    # 注意：这里只处理公式外的数学符号，公式内的符号由 _simplify_latex 处理
+    math_symbols = [
+        # 希腊字母
+        'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'ν', 'ξ', 'ο', 'π',
+        'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω',
+        'Α', 'Β', 'Γ', 'Δ', 'Ε', 'Ζ', 'Η', 'Θ', 'Ι', 'Κ', 'Λ', 'Μ', 'Ν', 'Ξ', 'Ο',
+        'Π', 'Ρ', 'Σ', 'Τ', 'Υ', 'Φ', 'Χ', 'Ψ', 'Ω',
+        # 数学运算符
+        '∇', '∂', '∞', '∑', '∏', '∫', '∬', '∭', '∮', '√',
+        '≤', '≥', '≠', '≈', '≡', '∼', '∝', '±', '∓', '×', '÷',
+        '∈', '∉', '⊂', '⊃', '⊆', '⊇', '∪', '∩', '∅',
+        '∀', '∃', '¬', '∧', '∨',
+        '→', '←', '↔', '⇒', '⇐', '⇔', '↑', '↓',
+        '∠', '⊥', '∥', '▽',
+    ]
+    for sym in math_symbols:
+        if sym in text:
+            text = text.replace(sym, f'<font name="Arial">{sym}</font>')
+
     # 处理文献引用格式（必须在普通Markdown链接之前处理）
     # 格式1: [数字] 标题/文件名，URL.pdf，日期 - PDF文件引用（根据URL是否以.pdf结尾判断）
     def replace_pdf_reference(match):
         num = match.group(1)
         title = match.group(2)  # 标题或文件名（可以不含.pdf）
-        url = match.group(3)  # URL必须以.pdf结尾
+        url = match.group(3)  # PDF URL
         date = match.group(4) if len(match.groups()) >= 4 and match.group(4) else ''
         # 使用回形针图标📎 (U+1F4CE) 表示可下载的PDF文档
         # 处理无法确定月份的情况，只显示年份
@@ -638,6 +651,8 @@ def _process_inline_formatting(text: str) -> str:
         display = _simplify_latex(formula)
         text = text.replace(f"__MATH_FORMULA_{i}__", f'<font size="9.5"><i>{display}</i></font>')
 
+    text = _strip_font_tags(text)
+
     # 移除不支持或无意义的标签
     text = re.sub(r'</?\s*nobr\b[^>]*>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<hr\s*/?>', '\n', text, flags=re.IGNORECASE)
@@ -656,6 +671,21 @@ def _process_inline_formatting(text: str) -> str:
 
     for attr in ['color', 'size', 'name', 'href', 'face', 'backColor']:
         text = re.sub(rf'\b{attr}=([^"\s>]+)', rf'{attr}="\1"', text)
+
+    def _sanitize_reportlab_links(value: str) -> str:
+        def repl(m: re.Match) -> str:
+            href = (m.group(1) or '').strip()
+            body = m.group(2) or ''
+            if re.match(r'^(https?://|mailto:|#)', href, flags=re.IGNORECASE):
+                return m.group(0)
+            if re.match(r'^www\.', href, flags=re.IGNORECASE) or re.match(r'^[\w.-]+\.[a-z]{2,}([/?#]|$)', href, flags=re.IGNORECASE):
+                safe_href = f'https://{href}'
+                return f'<a href="{safe_href}" color="#04B5BB">{body}</a>'
+            return body
+
+        return re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', repl, value, flags=re.IGNORECASE | re.DOTALL)
+
+    text = _sanitize_reportlab_links(text)
 
     text = re.sub(r'<(font|b|i|sub|sup)\b[^>]*>\s*</\1>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<a(?![^>]*\bname=)[^>]*>\s*</a>', '', text, flags=re.IGNORECASE)
@@ -768,8 +798,12 @@ def _find_font_with_priority(font_name: str, system_paths: List[str]) -> Optiona
     Returns:
         找到的字体文件路径，如果都找不到则返回 None
     """
-    # 1. 优先从相对路径 ./Font/ 中查找
-    font_dir = Path("./../../../Font")
+    # 1. 优先从项目根目录的 Font/ 目录中查找
+    # 获取当前文件所在目录，然后向上查找项目根目录
+    current_file = Path(__file__).resolve()
+    # 从 deepdiver_v2/src/tools/mcp_tools.py 向上3级到项目根目录
+    project_root = current_file.parent.parent.parent.parent
+    font_dir = project_root / "Font"
 
     if font_dir.exists() and font_dir.is_dir():
         # 支持的字体文件扩展名
@@ -779,20 +813,24 @@ def _find_font_with_priority(font_name: str, system_paths: List[str]) -> Optiona
             # 尝试不同的文件名格式
             font_file = font_dir / f"{font_name}{ext}"
             if font_file.exists():
+                logger.info(f"找到字体文件: {font_file}")
                 return str(font_file.absolute())
             
             # 尝试大写文件名
             font_file_upper = font_dir / f"{font_name.upper()}{ext}"
             if font_file_upper.exists():
+                logger.info(f"找到字体文件: {font_file_upper}")
                 return str(font_file_upper.absolute())
-    
+    else:
+        logger.warning(f"Font目录不存在: {font_dir}")
     # 2. 回退到系统路径查找
     for system_path in system_paths:
         if system_path and os.path.exists(system_path):
+            logger.info(f"使用系统字体: {system_path}")
             return system_path
     
     # 3. 都找不到
-    logger.warning(f"字体 '{font_name}' 在 ./Font/ 和系统路径中均未找到")
+    logger.warning(f"字体 '{font_name}' 在 {font_dir} 和系统路径中均未找到")
     return None
 
 
@@ -1365,9 +1403,15 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                 raw_text = line[prefix_len:].strip()
                 text = _process_inline_formatting(raw_text)
                 
-                # 计算安全的大纲层级：不能跳级（例如从1跳到3），但可以跳回（例如从3跳到1）
-                # 规则：新层级最多只能比上一个层级大1
-                safe_level = min(target_level, last_outline_level + 1)
+                # 计算安全的大纲层级：
+                # 1. 如果目标层级 <= 上一个层级（回退或同级），直接使用目标层级
+                # 2. 如果目标层级 > 上一个层级（深入），最多只能比上一级大1（防止跳级）
+                if target_level <= last_outline_level:
+                    # 回退或同级：直接使用目标层级，确保同级标题保持同一书签层级
+                    safe_level = target_level
+                else:
+                    # 深入：最多只能比上一个层级大1
+                    safe_level = min(target_level, last_outline_level + 1)
                 last_outline_level = safe_level
                 
                 # 创建书签（目录项），使用纯文本作为书签标题
@@ -2767,24 +2811,30 @@ class MCPTools:
                 heading_text = heading_match.group(2)
                 current_level = len(hash_symbols)
 
+                heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
+                numbered_heading_match = re.match(r'^(\d+(?:\.\d+)+)\s+', heading_text_clean)
+
                 # 如果是第一个标题，将其设为二级标题（章节标题）
                 if not first_heading_found:
                     first_heading_found = True
                     first_content_line = False
                     current_chapter_level = current_level
-                    # 确保章节标题为二级标题，去除可能的粗体标记
-                    heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
-                    normalized_lines.append(f"## {heading_text_clean}")
+                    if numbered_heading_match:
+                        number_depth = numbered_heading_match.group(1).count('.') + 1
+                        new_level = min(number_depth + 1, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    else:
+                        normalized_lines.append(f"## {heading_text_clean}")
                 else:
-                    # 计算相对于章节标题的层级差
-                    level_diff = current_level - current_chapter_level
-                    # 新的标题层级 = 3（因为章节是2级）+ 层级差
-                    new_level = max(3, 3 + level_diff)
-                    # 限制最大标题层级为6
-                    new_level = min(new_level, 6)
-                    # 去除标题中的粗体标记
-                    heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
-                    normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    if numbered_heading_match:
+                        number_depth = numbered_heading_match.group(1).count('.') + 1
+                        new_level = min(number_depth + 1, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
+                    else:
+                        level_diff = current_level - current_chapter_level
+                        new_level = max(2, 2 + level_diff)
+                        new_level = min(new_level, 6)
+                        normalized_lines.append(f"{'#' * new_level} {heading_text_clean}")
             elif bold_match and not first_heading_found:
                 # 如果第一个内容是粗体文本且还没有找到标题，将其转换为二级标题
                 first_heading_found = True

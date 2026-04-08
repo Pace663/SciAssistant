@@ -866,7 +866,7 @@
              <form id="chat-form" class="flex items-center">
                 <textarea 
                     id="user-input" 
-                    placeholder="输入研究问题 · 已适配PubMed/arXiv/medRxiv文献检索" 
+                    placeholder="请输入您的研究问题..." 
                     class="flex-1 rounded-lg p-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none transition-all duration-200" 
                     rows="1"
                 ></textarea>
@@ -896,7 +896,7 @@
                             <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
                                 <input type="checkbox" value="arxiv" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
                                 <i class="fa fa-book text-orange-500" style="width: 16px; text-align: center;"></i>
-                                <span class="text-sm text-gray-700">Arxiv</span>
+                                <span class="text-sm text-gray-700">arXiv</span>
                             </label>
                             <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
                                 <input type="checkbox" value="pubmed" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
@@ -1368,15 +1368,15 @@ function copyToClipboard(text, button) {
                     if (toast.parentNode) {
                         toast.parentNode.removeChild(toast);
                     }
-                }, 300);
+                }, duration);
             }, duration);
         }
 
         // 显示复制成功提示
-        function showCopyToast(button) {
+        function showCopyToast(button, message = '已复制') {
             const toast = document.createElement('div');
             toast.className = 'copy-toast absolute bg-gray-800 text-white text-xs px-2 py-1 rounded z-10';
-            toast.textContent = '已复制';
+            toast.textContent = message;
             
             // 定位提示框在按钮上方
             const rect = button.getBoundingClientRect();
@@ -1419,6 +1419,9 @@ function copyToClipboard(text, button) {
                         session.querySelector('i').classList.add('text-gray-500');
                         session.querySelector('i').classList.remove('text-primary');
                     });
+                    
+                    let pendingSessionElement = null; // 用于存储有 pending 任务的会话元素
+                    
                     if(data.length>0){
                         
                         // 添加新会话到列表顶部
@@ -1451,6 +1454,54 @@ function copyToClipboard(text, button) {
                             // 绑定菜单按钮事件
                             bindSessionMenuEvent(newSession);
                          })
+                         
+                         // 检查是否有 pending 任务的会话，并自动加载
+                         const checkPendingSessions = async () => {
+                             // 在检测期间隐藏欢迎页面，避免闪烁
+                             const initialPrompt = document.getElementById('initial-prompt');
+                             if (initialPrompt) {
+                                 initialPrompt.style.display = 'none';
+                             }
+                             
+                             // 只检查最新的1个会话（默认按 update_time 排序）
+                             if (data.length > 0) {
+                                 const latestSession = data[0];
+                                 console.log(`[页面加载] 检查最新会话: ${latestSession.session_id}`);
+                                 
+                                 try {
+                                     const response = await fetch(`/5000/api/chat/messages/${latestSession.session_id}`, {
+                                         headers: {
+                                             'Authorization': `Bearer ${window.userToken}`
+                                         }
+                                     });
+                                     const sessionData = await response.json();
+                                     
+                                     console.log(`[页面加载] has_pending_task:`, sessionData.has_pending_task);
+                                     
+                                     // 如果有 pending 任务，自动加载会话
+                                     if (sessionData.has_pending_task) {
+                                         pendingSessionElement = document.querySelector(`[data-id="${latestSession.session_id}"]`);
+                                         console.log('[页面加载] 发现 pending 任务，自动加载会话');
+                                     }
+                                 } catch (error) {
+                                     console.error(`[页面加载] 检查会话失败:`, error);
+                                 }
+                             }
+                             
+                             // 如果找到有 pending 任务的会话，自动点击加载
+                             if (pendingSessionElement) {
+                                 pendingSessionElement.click();
+                             } else {
+                                 // 没有 pending 任务，显示欢迎页面
+                                 if (initialPrompt) {
+                                     initialPrompt.style.display = '';
+                                     initialPrompt.classList.remove('hidden');
+                                 }
+                             }
+                         };
+                         
+                         // 执行检查
+                         checkPendingSessions();
                     }
                 })
                 .catch(error => {
@@ -1728,7 +1779,6 @@ function copyToClipboard(text, button) {
             const searchSourceLabel = document.getElementById('search-source-label');
             const allCheckbox = document.getElementById('search-source-all');
             const itemCheckboxes = document.querySelectorAll('.search-source-item');
-            const allCheckboxes = document.querySelectorAll('.search-source-checkbox');
             
             if (!searchSourceBtn || !searchSourceDropdown) return;
             
@@ -1741,21 +1791,9 @@ function copyToClipboard(text, button) {
                 if (checkedValues.length === 0) {
                     searchSourceLabel.textContent = '选择源';
                     buttonIcon.className = 'fa fa-globe text-blue-500';
-                } else if (checkedValues.length === itemCheckboxes.length) {
-                    searchSourceLabel.textContent = '全部源';
-                    buttonIcon.className = 'fa fa-check-square text-green-500';
-                } else if (checkedValues.length === 1) {
-                    const config = {
-                        'websearch': { label: '全网...', icon: 'fa fa-globe text-blue-500' },
-                        'arxiv': { label: 'Arxiv', icon: 'fa fa-book text-orange-500' },
-                        'pubmed': { label: 'Pubmed', icon: 'fa fa-heartbeat text-red-500' }
-                    };
-                    const selected = config[checkedValues[0]] || config['websearch'];
-                    searchSourceLabel.textContent = selected.label;
-                    buttonIcon.className = selected.icon;
                 } else {
                     searchSourceLabel.textContent = `${checkedValues.length}个源`;
-                    buttonIcon.className = 'fa fa-globe text-blue-500';
+                    buttonIcon.className = 'fa fa-check-circle text-green-500';
                 }
             }
             
@@ -1836,7 +1874,7 @@ function copyToClipboard(text, button) {
             const searchSourcesContainer = document.getElementById('search-sources-container');
             
             if (tabName === 'deepdiver') {
-                userInput.placeholder = '输入研究问题 · 已适配PubMed/arXiv/medRxiv文献检索';
+                userInput.placeholder = '请输入您的研究问题...';
                 // DeepDiver模式：隐藏"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.add('hidden');
@@ -1851,7 +1889,7 @@ function copyToClipboard(text, button) {
                     searchSourcesContainer.classList.remove('hidden');
                 }
             } else if (tabName === 'chat') {
-                userInput.placeholder = '输入问题 · 快速对话和文件辅助';
+                userInput.placeholder = '请输入您的问题...';
                 // Chat模式：显示"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.remove('hidden');
@@ -1866,7 +1904,7 @@ function copyToClipboard(text, button) {
                     searchSourcesContainer.classList.add('hidden');
                 }
             } else if (tabName === 'reasoner') {
-                userInput.placeholder = '输入推理问题 · 展示完整思考过程';
+                userInput.placeholder = '请输入需要推理的问题...';
                 // Reasoner模式：隐藏"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.add('hidden');
@@ -2216,7 +2254,9 @@ function copyToClipboard(text, button) {
             // 添加用户消息
             addMessage(message, 'user');
             // 立即持久化用户消息，确保切回会话时可加载
-            try { saveResultToDB(message, sessionId, 'user'); } catch (e) { console.warn('保存用户消息失败：', e); }
+            // 将当前模式保存到 think_msg 字段中，以便刷新后能恢复模式信息
+            const currentMode = window.selectedTab || 'chat';
+            try { saveResultToDB(message, sessionId, 'user', '', 0, currentMode); } catch (e) { console.warn('保存用户消息失败：', e); }
             
             // 先保存附件信息（在清除之前保存，以便后续使用）
             const savedAttachments = Array.from(window.attachedContexts || []);
@@ -3079,6 +3119,7 @@ ${contextText.trim()}
                 const requestBody = {
                     query: message,
                     taskId: taskId,  // 添加taskId字段
+                    frontend_session_id: sessionId,  // 前端会话ID，用于自动存储报告到数据库
                     user_files: userUploadedFiles,  // 强制使用的文件列表（直接上传）
                     reference_files: referenceFiles,  // 可选参考的文件列表（从文档库选择）
                     use_web_search: true,  // 是否启用网络检索（可选）
@@ -3149,7 +3190,13 @@ ${contextText.trim()}
                         }
                         if (result === null) {
                             report_title = '';
-                            result = extractAnswer(data.planner_result.task_summary);
+                            // 安全检查：确保 planner_result 和 task_summary 存在
+                            if (data.planner_result && data.planner_result.task_summary) {
+                                result = extractAnswer(data.planner_result.task_summary);
+                            } else {
+                                result = '任务执行完成，但未生成报告内容。';
+                                console.warn('[DeepDiver] planner_result 或 task_summary 不存在');
+                            }
                         } 
                         // 提取"完整答案"到"任务已圆满完成"之间的信息
                         function extractAnswer(content) {
@@ -3169,26 +3216,43 @@ ${contextText.trim()}
                         }
                         // 检查响应数据
                         if (result) {
-                            // console.log("展示的数据：",result)
+                            console.log('[DeepDiver] 收到报告，长度:', result.length, 'has_report:', has_report);
+                            console.log('[DeepDiver] currentSessionId:', window.currentSessionId, 'sessionId:', sessionId, '匹配:', window.currentSessionId === sessionId);
+                            
                             // 仅在当前会话时渲染AI回复
                             if (window.currentSessionId === sessionId) {
+                                console.log('[DeepDiver] 开始显示报告...');
+                                
+                                // 先清理pending状态和spinner
+                                window.pendingSessions = window.pendingSessions || {};
+                                if (window.pendingSessions[sessionId]) {
+                                    window.pendingSessions[sessionId].loading = false;
+                                    window.pendingSessions[sessionId].spinner = null;
+                                }
+                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                                
+                                // 添加报告消息
                                 addMessage(result, 'ai', backendSessionId, has_report);
+                                console.log('[DeepDiver] 报告已添加到DOM');
+                                
+                                // 强制滚动到底部
+                                setTimeout(() => {
+                                    const chatMessages = document.getElementById('chat-messages');
+                                    if (chatMessages) {
+                                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                                    }
+                                }, 100);
+                            } else {
+                                console.warn('[DeepDiver] 会话ID不匹配，跳过显示');
                             }
-                            // AI消息入库，传递报告标题
-                            saveResultToDB(result, sessionId, 'ai', backendSessionId, has_report, '', report_title);
+                            
+                            // DeepDiver模式保存逻辑:
+                            // 后端 a.py 已统一处理所有保存（完整报告和简单回复），前端无需保存
                         } else {
+                            console.warn('[DeepDiver] 未收到有效报告内容');
                             if (window.currentSessionId === sessionId) {
                                 addMessage('抱歉，未能获取有效的回复。', 'ai', backendSessionId);
                             }
-                        }
-                        // 清理pending状态
-                        window.pendingSessions = window.pendingSessions || {};
-                        if (window.pendingSessions[sessionId]) {
-                            window.pendingSessions[sessionId].loading = false;
-                            window.pendingSessions[sessionId].spinner = null;
-                        }
-                        if (window.currentSessionId === sessionId) {
-                            try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
                         }
 
                     })
@@ -3365,11 +3429,31 @@ ${contextText.trim()}
             const copyButton = document.createElement('button');
             copyButton.className = 'copy-btn p-2 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs';
             copyButton.innerHTML = '<i class="fa fa-copy" style="font-size: 0.875rem;"></i>';
-            copyButton.title = '复制消息';
-            copyButton.addEventListener('click', function (e) {
-                e.stopPropagation();
-                copyToClipboard(text, copyButton);
-            });
+            
+            // 用户消息：复制到输入框；AI消息：复制到剪贴板
+            if (sender === 'user') {
+                copyButton.title = '复制到输入框';
+                copyButton.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    // 将内容填充到输入框
+                    const userInput = document.getElementById('user-input');
+                    if (userInput) {
+                        userInput.value = text;
+                        userInput.focus();
+                        // 自动调整输入框高度
+                        userInput.style.height = 'auto';
+                        userInput.style.height = userInput.scrollHeight + 'px';
+                        // 显示提示
+                        showCopyToast(copyButton, '已填充到输入框');
+                    }
+                });
+            } else {
+                copyButton.title = '复制消息';
+                copyButton.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    copyToClipboard(text, copyButton);
+                });
+            }
             btnGroup.appendChild(copyButton); // 复制按钮先加入 → 左侧
             // 下载按钮（仅AI消息显示）- 使用下拉菜单选择格式
             if (sender === 'ai' && sessionId && hasReport==1) {
@@ -3775,6 +3859,49 @@ ${contextText.trim()}
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
         
+        // 重新加载会话消息的函数（用于轮询检测到新消息后刷新）
+        function loadSessionMessages(sessionId) {
+            console.log('[重新加载] 加载会话消息:', sessionId);
+            
+            // 清空当前聊天内容
+            chatMessages.innerHTML = '';
+            
+            // 清理 pending 状态
+            window.pendingSessions = window.pendingSessions || {};
+            if (window.pendingSessions[sessionId]) {
+                // 清理轮询
+                if (window.pendingSessions[sessionId].pollInterval) {
+                    clearInterval(window.pendingSessions[sessionId].pollInterval);
+                }
+                window.pendingSessions[sessionId].loading = false;
+                window.pendingSessions[sessionId].spinner = null;
+            }
+            
+            // 重新加载消息
+            fetch(`/5000/api/chat/messages/${sessionId}`, {
+                headers: {
+                    'Authorization': `Bearer ${window.userToken}`
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.messages && data.messages.length > 0) {
+                    data.messages.forEach(item => {
+                        const thinkMsg = (item.has_report === 0 && item.think_msg) ? item.think_msg : '';
+                        addMessage(item.content, item.from_who, item.uuid, item.has_report, thinkMsg);
+                    });
+                    
+                    // 滚动到底部
+                    setTimeout(() => {
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }, 100);
+                }
+            })
+            .catch(error => {
+                console.error('[重新加载] 加载失败:', error);
+            });
+        }
+        
         // 新建会话
         newChatBtn.addEventListener('click', createNewSession);
         
@@ -3943,7 +4070,7 @@ ${contextText.trim()}
                                 
                                 data.messages.forEach(item => {
                                     // 如果有 think_msg 字段，传递给 addMessage 显示推理过程
-                                    const thinkMsg = item.think_msg || '';
+                                    const thinkMsg = (item.has_report === 0 && item.think_msg) ? item.think_msg : '';
                                     addMessage(item.content, item.from_who, item.uuid, item.has_report, thinkMsg);
                                     messagesLoaded++;
                                     
@@ -3953,33 +4080,100 @@ ${contextText.trim()}
                                         setTimeout(() => {
                                             chatMessages.scrollTop = chatMessages.scrollHeight;
                                             scrollToBottomBtn.classList.remove('visible');
-                                            // 如果该会话处于生成中，补挂占位动画
+                                            
+                                            // 根据后端返回的任务状态显示加载提示
                                             try {
-                                                if (window.pendingSessions && window.pendingSessions[sessionId] && window.pendingSessions[sessionId].loading) {
-                                                    if (!chatMessages.querySelector('.pending-spinner')) {
-                                                        const pending = document.createElement('div');
-                                                        pending.className = 'mb-6 flex justify-start message-animation pending-spinner';
-                                                        const statusText = ((window.selectedTab || '').trim() === 'deepdiver') ? '正在整理报告…' : '正在思考…';
-                                                        pending.innerHTML = `
-                                                            <div class="flex items-start max-w-[80%]">
-                                                                <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
-                                                                <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex items-center">
-                                                                    <i class="fa fa-spinner fa-spin mr-2 text-gray-500 text-sm"></i>
-                                                                     <span class="text-gray-600 text-sm">${statusText}</span>
-                                                                </div>
+                                                if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner')) {
+                                                    const pending = document.createElement('div');
+                                                    pending.className = 'mb-6 flex justify-start message-animation pending-spinner';
+                                                    
+                                                    // 根据后端返回的模式显示不同的提示文本
+                                                    const queryModel = data.pending_mode || 'chat';
+                                                    const statusText = (queryModel === 'deepdiver') 
+                                                        ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' 
+                                                        : '正在思考…';
+                                                    
+                                                    pending.innerHTML = `
+                                                        <div class="flex items-start max-w-[80%]">
+                                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
+                                                            <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex items-center">
+                                                                <i class="fa fa-spinner fa-spin mr-2 text-gray-500 text-sm"></i>
+                                                                <span class="text-gray-600 text-sm">${statusText}</span>
                                                             </div>
-                                                        `;
-                                                        chatMessages.appendChild(pending);
-                                                        window.pendingSessions[sessionId].spinner = pending;
-                                                        chatMessages.scrollTop = chatMessages.scrollHeight;
-                                                    }
+                                                        </div>
+                                                    `;
+                                                    chatMessages.appendChild(pending);
+                                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                                    
+                                                    // 更新内存中的 pendingSessions（用于当前会话状态管理）
+                                                    window.pendingSessions = window.pendingSessions || {};
+                                                    window.pendingSessions[sessionId] = { 
+                                                        loading: true, 
+                                                        spinner: pending 
+                                                    };
+                                                    
+                                                    // 启动渐进式轮询：根据等待时间调整轮询间隔
+                                                    let pollCount = 0;
+                                                    const startTime = Date.now();
+                                                    
+                                                    const doPoll = () => {
+                                                        const elapsedMinutes = (Date.now() - startTime) / 60000;
+                                                        console.log(`[轮询] 检查是否有新的 AI 回复... (已等待 ${elapsedMinutes.toFixed(1)} 分钟)`);
+                                                        
+                                                        fetch(`/5000/api/chat/messages/${sessionId}`, {
+                                                            headers: {
+                                                                'Authorization': `Bearer ${window.userToken}`
+                                                            }
+                                                        })
+                                                        .then(res => res.json())
+                                                        .then(pollData => {
+                                                            console.log('[轮询] has_pending_task:', pollData.has_pending_task);
+                                                            // 如果任务已完成（有 AI 回复了）
+                                                            if (!pollData.has_pending_task) {
+                                                                console.log('[轮询] 检测到 AI 已回复，停止轮询并刷新页面');
+                                                                if (window.pendingSessions[sessionId]?.pollTimeout) {
+                                                                    clearTimeout(window.pendingSessions[sessionId].pollTimeout);
+                                                                }
+                                                                // 重新加载会话消息
+                                                                loadSessionMessages(sessionId);
+                                                            } else {
+                                                                // 根据等待时间调整轮询间隔
+                                                                let nextInterval;
+                                                                if (elapsedMinutes < 2) {
+                                                                    nextInterval = 5000;  // 前2分钟：5秒
+                                                                } else if (elapsedMinutes < 10) {
+                                                                    nextInterval = 15000; // 2-10分钟：15秒
+                                                                } else {
+                                                                    nextInterval = 30000; // 10分钟后：30秒
+                                                                }
+                                                                
+                                                                // 继续轮询
+                                                                const pollTimeout = setTimeout(doPoll, nextInterval);
+                                                                if (window.pendingSessions[sessionId]) {
+                                                                    window.pendingSessions[sessionId].pollTimeout = pollTimeout;
+                                                                }
+                                                            }
+                                                        })
+                                                        .catch(err => {
+                                                            console.error('[轮询] 检查失败:', err);
+                                                            // 出错后30秒重试
+                                                            const pollTimeout = setTimeout(doPoll, 30000);
+                                                            if (window.pendingSessions[sessionId]) {
+                                                                window.pendingSessions[sessionId].pollTimeout = pollTimeout;
+                                                            }
+                                                        });
+                                                    };
+                                                    
+                                                    // 首次轮询在5秒后开始
+                                                    const pollTimeout = setTimeout(doPoll, 5000);
+                                                    window.pendingSessions[sessionId].pollTimeout = pollTimeout;
                                                 }
-                                            } catch (e) { console.warn('重建占位失败', e); }
+                                            } catch (e) { 
+                                                console.warn('显示加载提示失败', e); 
+                                            }
                                         }, 0);
                                     }
                                 });
-                            } else {
-                                initialPrompt.classList.remove('hidden');
                             }
                         })
                         .catch(error => {
