@@ -2598,21 +2598,7 @@ function copyToClipboard(text, button) {
             loadingDiv.className = 'mb-6 flex justify-start message-animation';
             // 使用30%阈值判断语言
             const _zhCount = (message.match(/[\u4e00-\u9fff]/g) || []).length;
-            const _totalChars = message.trim().length;
-            const _hasChinese = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
-            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') 
-                ? (_hasChinese ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
-                : (_hasChinese ? '正在思考…' : 'Thinking…');
-            loadingDiv.innerHTML = `
-                <div class="flex items-start max-w-[80%]">
-                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
-                    <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex items-center">
-                        <i class="fa fa-spinner fa-spin mr-2 text-gray-500 text-sm"></i>
-                        <span class="text-gray-600 text-sm">${statusText}</span>
-                    </div>
-                </div>
-            `;
-            chatMessages.appendChild(loadingDiv);
+            const _hasChinese = _zhCount / Math.max(message.length, 1) > 0.3;
             // 记录当前会话的占位引用，便于切回时重建
             window.pendingSessions = window.pendingSessions || {};
             window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || { loading: true };
@@ -2623,6 +2609,19 @@ function copyToClipboard(text, button) {
             window.sessionLanguagePreference = window.sessionLanguagePreference || {};
             window.sessionLanguagePreference[sessionId] = _hasChinese;
             console.log(`[语言偏好] 保存会话 ${sessionId} 的语言偏好: ${_hasChinese ? '中文' : '英文'}`, window.sessionLanguagePreference);
+
+            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') 
+                ? (_hasChinese ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
+                : (_hasChinese ? '正在思考…' : 'Thinking…');
+            loadingDiv.innerHTML = `
+                <div class="flex items-start max-w-[80%]">
+                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
+                    <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex items-center">
+                        <i class="fa fa-spinner fa-spin mr-2 text-gray-500 text-sm"></i>
+                        <span class="text-gray-600 text-sm">${statusText}</span>
+                    </div>
+                </div>`;
+            chatMessages.appendChild(loadingDiv);
             
             chatMessages.scrollTop = chatMessages.scrollHeight;
             // 查看问答模式
@@ -3105,6 +3104,12 @@ function copyToClipboard(text, button) {
                 const originalHTML = cancelButton.innerHTML;
                 cancelButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
                 
+                    // 【关键修复】立即标记会话为已取消（在POST发出之前！）
+                    // 必须在POST之前标记，否则pending期间切换会话会重新显示"正在规划"
+                    window.cancelledSessions = window.cancelledSessions || {};
+                    window.cancelledSessions[currentSessionId] = Date.now();
+                    console.log('[Cancel] 立即标记会话为已取消（POST前）:', currentSessionId);
+                    
                     // 2. 调用后端中断接口
                     const url = `/8000/api/task/${taskId}/cancel`;
                     console.log(url)
@@ -3134,6 +3139,11 @@ function copyToClipboard(text, button) {
                             }
                          }
                         )
+                        // 【关键修复】标记会话为已取消，防止SSE onerror触发后保存重复错误消息
+                        // 以及防止轮询/loadSessionMessages重新显示pending状态
+                        window.cancelledSessions = window.cancelledSessions || {};
+                        window.cancelledSessions[currentSessionId] = Date.now();
+                        console.log('[Cancel] 标记会话为已取消:', currentSessionId);
                         // 1. 清理pending状态，防止切换会话时重新显示加载状态
                         window.pendingSessions = window.pendingSessions || {};
                         if (window.pendingSessions[window.currentSessionId]) {
@@ -3163,7 +3173,7 @@ function copyToClipboard(text, button) {
                                 submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
                             }
                         }
-                        // 5. 移除loading元素
+                        // 5. 移除loading元素和队列状态UI
                         const chatMessages = document.getElementById('chat-messages');
                         try { 
                             document.querySelectorAll('.pending-spinner').forEach(el => el.remove());
@@ -3173,6 +3183,9 @@ function copyToClipboard(text, button) {
                                     el.remove();
                                 }
                             });
+                            // 移除队列状态显示（如果有）
+                            const queueStatusEl = document.getElementById(`queue-status-${taskId}`);
+                            if (queueStatusEl) queueStatusEl.remove();
                         } catch (e) { 
                             console.warn('移除loading元素失败', e); 
                         }
@@ -3712,6 +3725,13 @@ function copyToClipboard(text, button) {
                     try {
                         const data = JSON.parse(event.data);
                         console.log('[SSE] 接收到进度消息:', data);
+                        
+                        // 【关键修复】验证当前会话ID，防止切换会话时进度消息插入到错误的会话中
+                        if (window.currentSessionId !== sessionId) {
+                            console.log(`[SSE] 会话ID不匹配，忽略消息。当前会话: ${window.currentSessionId}, 消息来源会话: ${sessionId}`);
+                            return;
+                        }
+                        
                         if (data.type === 'progress') {
                             const timeline = document.getElementById(`progress-timeline-${taskId}`);
                             if (!timeline) return;
@@ -3787,7 +3807,17 @@ function copyToClipboard(text, button) {
                     eventSource.close();
                     delete window.sessionEventSources[sessionId];
                     
-                    // 【关键修复】SSE连接断开时，始终保存错误消息到数据库
+                    // 【关键修复】如果会话已被用户主动取消，跳过错误处理
+                    // 用户取消时会关闭SSE连接，触发onerror，但这不是真正的错误
+                    // 不应该保存错误消息到DB（否则会导致has_pending_task竞态问题）
+                    const isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId] 
+                        && (Date.now() - window.cancelledSessions[sessionId]) < 60000;
+                    if (isCancelledSession) {
+                        console.log('[SSE] 会话已被用户取消，跳过onerror错误处理:', sessionId);
+                        return;
+                    }
+                    
+                    // SSE连接断开时，保存错误消息到数据库
                     const errorMsg = '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。';
                     saveResultToDB(errorMsg, sessionId, "ai");
                     
@@ -3906,6 +3936,9 @@ function copyToClipboard(text, button) {
                                 try {
                                     // 立即标记为已取消，防止轮询触发reconnectSSE
                                     isQueueCancelled = true;
+                                    // 【关键修复】标记会话为已取消，防止has_pending_task竞态
+                                    window.cancelledSessions = window.cancelledSessions || {};
+                                    window.cancelledSessions[sessionId] = Date.now();
                                     const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
                                         method: 'POST',
                                         headers: { 'Content-Type': 'application/json' },
@@ -3959,7 +3992,10 @@ function copyToClipboard(text, button) {
                                         if (posEl) posEl.textContent = myTask.position;
                                     } else {
                                         // 任务不在队列中，检查是否已被取消
-                                        if (isQueueCancelled) {
+                                        const _queueCancelledByUser = window.cancelledSessions && window.cancelledSessions[sessionId]
+                                            && (Date.now() - window.cancelledSessions[sessionId]) < 120000;
+                                        if (isQueueCancelled || _queueCancelledByUser) {
+                                            console.log('[队列轮询] 任务已取消，停止轮询:', taskId);
                                             clearInterval(queuePollInterval);
                                             return;
                                         }
@@ -5027,7 +5063,12 @@ function copyToClipboard(text, button) {
                                             
                                             // 根据后端返回的任务状态显示加载提示
                                             try {
-                                                if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner')) {
+                                                // 【关键修复】如果会话已被用户取消，跳过pending task显示
+                                                // 防止saveResultToDB异步写入未完成时，has_pending_task仍为true导致重新显示加载状态
+                                                const _isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId]
+                                                    && (Date.now() - window.cancelledSessions[sessionId]) < 120000;
+                                                console.log('[诊断-路径3] loadSessionMessages检查pending:', 'has_pending_task=', data.has_pending_task, 'has_spinner=', !!chatMessages.querySelector('.pending-spinner'), 'isCancelled=', !!_isCancelledSession, 'sessionId:', sessionId, 'cancelledSessions:', JSON.stringify(window.cancelledSessions || {}));
+                                                if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner') && !_isCancelledSession) {
                                                     const queryModel = data.pending_mode || 'chat';
                                                     // 如果有 taskID 且是 DeepDiver 模式，直接使用 SSE，跳过静态提示和轮询
                                                     if (window.taskId && queryModel === 'deepdiver') {
@@ -7055,6 +7096,13 @@ function copyToClipboard(text, button) {
         // 重新连接 SSE 以恢复进度显示（页面刷新后使用）
         function reconnectSSE(taskId, sessionId) {
             console.log('[SSE恢复] 重新连接 SSE，taskId:', taskId, 'sessionId:', sessionId);
+            // 【关键修复】如果会话已被用户主动取消，不要重新连接SSE和显示spinner
+            const _isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId]
+                && (Date.now() - window.cancelledSessions[sessionId]) < 120000; // 2分钟内取消的
+            if (_isCancelledSession) {
+                console.log('[SSE恢复] 会话已被用户取消，跳过reconnectSSE:', sessionId);
+                return;
+            }
             // 先关闭该会话已有的SSE连接，避免重复
             if (window.sessionEventSources && window.sessionEventSources[sessionId]) {
                 console.log('[SSE恢复] 关闭已有的SSE连接:', sessionId);
@@ -7164,6 +7212,13 @@ function copyToClipboard(text, button) {
                 try {
                     const data = JSON.parse(event.data);
                     console.log('[SSE恢复] 接收到进度消息:', data);
+                    
+                    // 【关键修复】验证当前会话ID，防止切换会话时进度消息插入到错误的会话中
+                    if (window.currentSessionId !== sessionId) {
+                        console.log(`[SSE恢复] 会话ID不匹配，忽略消息。当前会话: ${window.currentSessionId}, 消息来源会话: ${sessionId}`);
+                        return;
+                    }
+                    
                     if (data.type === 'progress') {
                         const timeline = document.getElementById(`progress-timeline-${taskId}`);
                         if (!timeline) return;
@@ -7260,6 +7315,13 @@ function copyToClipboard(text, button) {
                 console.error('[SSE恢复] 连接错误:', error);
                 eventSource.close();
                 delete window.sessionEventSources[sessionId];
+                // 【关键修复】如果会话已被用户主动取消，跳过后续处理
+                const isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId]
+                    && (Date.now() - window.cancelledSessions[sessionId]) < 60000;
+                if (isCancelledSession) {
+                    console.log('[SSE恢复] 会话已被用户取消，跳过onerror处理:', sessionId);
+                    return;
+                }
             };
         }
     </script>

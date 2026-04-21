@@ -1155,6 +1155,13 @@ async def handle_single_query(request: SingleQueryRequest):
     
     # 有空闲槽位，提交到后台执行（不等待完成）
     task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+    # 【关键修复】保存frontend_session_id到progress，供app.py交叉验证has_pending_task使用
+    if request.frontend_session_id:
+        task_manager.update_task_progress(task_id, {
+            'params': {
+                'frontend_session_id': request.frontend_session_id
+            }
+        })
     loop = asyncio.get_event_loop()
     
     # 使用线程池执行，避免阻塞事件循环
@@ -1276,6 +1283,13 @@ async def handle_single_query_sync(request: SingleQueryRequest):
     
     # 有空闲槽位，同步执行并等待完成
     task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+    # 【关键修复】保存frontend_session_id到progress，供app.py交叉验证has_pending_task使用
+    if request.frontend_session_id:
+        task_manager.update_task_progress(task_id, {
+            'params': {
+                'frontend_session_id': request.frontend_session_id
+            }
+        })
     loop = asyncio.get_event_loop()
     
     if executor is None:
