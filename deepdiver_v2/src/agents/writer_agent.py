@@ -376,7 +376,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                     self.progress_callback(self.task_id, {
                         'type': 'progress',
                         'stage': 'writing_started',
-                        'message': '开始撰写报告',
+                        'message': '开始撰写报告' if getattr(self, '_is_chinese_query', True) else 'Starting report writing',
                         'details': {
                             'key_files_count': valid_file_count,
                             'total_retrieved_count': total_retrieved_count,
@@ -563,7 +563,8 @@ For each function call, return a JSON object placed within the [unused11][unused
                                         chapter_title = outline.split('\n')[0].strip()
                                         chapter_title = chapter_title.replace('#', '').strip()[:50]
                                         
-                                        self._send_progress('writing_chapter', f'正在撰写: {chapter_title}', {
+                                        _writing_prefix = '正在撰写: ' if getattr(self, '_is_chinese_query', True) else 'Writing: '
+                                        self._send_progress('writing_chapter', f'{_writing_prefix}{chapter_title}', {
                                             'chapter_title': chapter_title
                                         })
                                 except Exception as e:

@@ -228,8 +228,12 @@
         });
         
         // 6.2 引用格式（只有标题）- 使用回形针图标表示文档引用
-        html = html.replace(/\[(\d+)\]\s+([^\n\[\],，]+?)(?=\s*\n|\s*$|\s*\[)/gi, function(match, num, title) {
+        html = html.replace(/\[(\d+)\]\s+([^\n\[\],，|]+?)(?=\s*\n|\s*$|\s*\[)/gi, function(match, num, title) {
             if (title.includes('http') || title.includes('](')) {
+                return match;
+            }
+            // 标题太短（去除空白后不足2个字符）说明不是真正的引用，跳过
+            if (title.trim().length < 2) {
                 return match;
             }
             // 没有URL的引用默认使用回形针图标（表示本地文档）
@@ -3095,6 +3099,14 @@ ${contextText.trim()}
                                 if (window.currentSessionId === sessionId) {
                                     try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
                                     
+                                    // 附加搜索来源到显示内容（与chat模式一致）
+                                    if (fullResponse.trim() && reasonerSearchResults.length > 0) {
+                                        fullResponse += '\n\n---\n**搜索来源：**\n';
+                                        reasonerSearchResults.forEach((sr, idx) => {
+                                            fullResponse += `${idx + 1}. [${sr.title}](${sr.url})\n`;
+                                        });
+                                    }
+                                    
                                     // 如果有完整响应，更新DOM并保存到数据库
                                     if (fullResponse.trim() || reasoningContent.trim()) {
                                         // 查找并移除临时的流式消息元素
@@ -3199,6 +3211,16 @@ ${contextText.trim()}
                                         
                                         chatMessages.appendChild(messageDiv);
                                         chatMessages.scrollTop = chatMessages.scrollHeight;
+                                        
+                                        // 为搜索来源链接添加锚点ID（与chat模式一致）
+                                        if (reasonerSearchResults.length > 0) {
+                                            const links = messageDiv.querySelectorAll('a[target="_blank"]');
+                                            const sourceLinks = Array.from(links).slice(-reasonerSearchResults.length);
+                                            sourceLinks.forEach((link, idx) => {
+                                                const parentDiv = link.closest('div') || link.parentElement;
+                                                if (parentDiv) parentDiv.id = `search-source-${idx + 1}`;
+                                            });
+                                        }
                                         
                                         // AI消息入库 - reasoner 模式分别保存推理过程和主要内容
                                         saveResultToDB(fullResponse || '', sessionId, 'ai', '', 0, reasoningContent);
