@@ -2147,12 +2147,12 @@ def chat_search_enhanced():
                                     with connection.cursor() as cursor:
                                         sql = """
                                             INSERT INTO conversation_detail 
-                                            (session_id, from_who, round, timestamp, content, think_msg, create_time)
-                                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                                            (session_id, from_who, round, timestamp, content, think_msg, create_time, has_report)
+                                            VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
                                         """
                                         cursor.execute(sql, (
                                             session_id, 'ai', 1, datetime.datetime.now(),
-                                            save_content, reasoning_content
+                                            save_content, reasoning_content, 0
                                         ))
                                         sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
                                         cursor.execute(sql1, (session_id,))
@@ -2200,8 +2200,8 @@ def health_check():
 if __name__ == '__main__':
     # 禁用 Werkzeug 的 HTTP 访问日志
     import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)  # 只显示错误，不显示 INFO 级别的访问日志
+    # log = logging.getLogger('werkzeug')
+    # log.setLevel(logging.ERROR)  # 只显示错误，不显示 INFO 级别的访问日志
     
     # 生产环境请修改debug=False，并配置合适的host和port
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

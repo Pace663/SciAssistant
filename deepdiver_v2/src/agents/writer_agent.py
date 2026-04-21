@@ -203,15 +203,24 @@ Then you strictly follow the steps given below:
               * For English: "## 1. Introduction", "## 2. Core Concepts"
               * For Chinese: "## 1. 引言", "## 2. 核心概念"
               * Do NOT use Chinese numerals like "一、" or "Chapter 1".
-            - Level 2 headings (Subsections) MUST be **PLAIN TEXT WITHOUT any markdown symbols** (no ###, no **, no *):
+            - Level 2 headings (Subsections) MUST be PLAIN TEXT WITHOUT any markdown symbols (no ###, no **, no *):
+              * CRITICAL RULE: DO NOT add "###" before Level 2 headings! They must be plain text only!
               * Sub-heading numbers MUST match parent chapter number: Chapter 1 → 1.1, 1.2; Chapter 2 → 2.1, 2.2; Chapter 3 → 3.1, 3.2, etc.
               * For English: "1.1 Background", "1.2 Main Findings" (for Chapter 1), "2.1 Methods" (for Chapter 2)
               * For Chinese: "1.1 背景", "1.2 主要发现" (第1章), "2.1 方法" (第2章)
-              * **WRONG FORMAT**: "### 2.1 Title" or "**### 2.1 Title**" (has markdown symbols)
-              * **WRONG FORMAT**: "2.1 xxx" under "## 1. Title" (sub-heading number doesn't match chapter)
-              * **CORRECT FORMAT**: "1.1 Title" under "## 1. Title" (plain text, number matches chapter)
+              * WRONG FORMAT EXAMPLES (NEVER use these):
+                - "### 2.1 Title" (has ### symbol)
+                - "### 2.4 大规模语言模型与强化学习的融合" (has ### symbol)
+                - "**2.1 Title**" (has ** symbols)
+                - "2.1 xxx" under "## 1. Title" (Should be "1.1 xxx" to match chapter 1)
+                - "2.2 xxx" under "## 3. Title" (Should be "3.2 xxx" to match chapter 3)
+              * CORRECT FORMAT EXAMPLES (ALWAYS use these):
+                - "1.1 Title" (plain text, under "## 1. xxx")
+                - "2.4 大规模语言模型与强化学习的融合" (plain text, under "## 2. xxx")
+                - "3.2 Methods" (plain text, under "## 3. xxx")
             - This structure is CRITICAL for the final PDF table of contents.
-        - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 4-8) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
+            - REMINDER: Every Level 2 heading (1.1, 1.2, 2.1, 2.2, 2.3, 2.4, etc.) MUST be plain text without any markdown symbols!
+        - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 3-6) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
         
         2. FILE CLASSIFICATION  
         - Use the search_result_classifier tool to reasonably split the outline generated above and accurately assign key files to each chapter of the outline.

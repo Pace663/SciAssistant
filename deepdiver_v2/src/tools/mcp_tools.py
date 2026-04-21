@@ -705,6 +705,11 @@ def _process_inline_formatting(text: str) -> str:
 
     def protect_code(match):
         code_content = match.group(1)
+        # 修复：科学计数法中的 Unicode 上下标（如 10⁻¹⁴）会先被转换为 <sup>/<sub>。
+        # 若此时仍按反引号代码处理，会把标签转义成文本，导致 PDF 显示成“代码样式”而非上标。
+        if re.search(r'</?\s*(sup|sub)\b', code_content, flags=re.IGNORECASE):
+            return code_content
+
         # HTML 转义
         code_content = code_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         # 检查是否包含中文字符
@@ -3628,30 +3633,37 @@ class MCPTools:
                     # 检查是否是标题格式（# 开头或 **粗体**）
                     heading_match = re.match(r'^(#+\s*|\*\*)(.+)', first_line)
                     if heading_match:
-                        # 提取标题文本（去除Markdown标记）
-                        existing_title = heading_match.group(2)
-                        # 如果是粗体结尾，也要去掉
-                        if existing_title.endswith('**'):
-                            existing_title = existing_title[:-2]
-                        existing_title = existing_title.strip()
+                        # 【关键修复】检查是否是章节标题(如"## 1. xxx", "## 2. xxx")
+                        # 章节标题不应该被删除,只删除真正重复的文档标题
+                        is_chapter_heading = re.match(r'^##\s+\d+\.', first_line)
+                        
+                        if not is_chapter_heading:
+                            # 提取标题文本（去除Markdown标记）
+                            existing_title = heading_match.group(2)
+                            # 如果是粗体结尾，也要去掉
+                            if existing_title.endswith('**'):
+                                existing_title = existing_title[:-2]
+                            existing_title = existing_title.strip()
 
-                        # 计算相似度
-                        similarity = SequenceMatcher(None, existing_title, title).ratio()
+                            # 计算相似度
+                            similarity = SequenceMatcher(None, existing_title, title).ratio()
 
-                        # 如果相似度高，或者包含关系，则认为是重复标题
-                        # 降低包含关系的误判风险：只有当现有标题长度接近新标题时才考虑包含关系
-                        is_contained = (title in existing_title or existing_title in title)
-                        len_ratio = min(len(title), len(existing_title)) / max(len(title), len(existing_title))
+                            # 如果相似度高，或者包含关系，则认为是重复标题
+                            # 降低包含关系的误判风险：只有当现有标题长度接近新标题时才考虑包含关系
+                            is_contained = (title in existing_title or existing_title in title)
+                            len_ratio = min(len(title), len(existing_title)) / max(len(title), len(existing_title))
 
-                        if similarity > 0.7 or (is_contained and len_ratio > 0.6):
-                            print(f"检测到重复标题，已移除原文件开头的标题: {first_line}")
-                            # 移除该行
-                            lines.pop(first_content_idx)
-                            # 移除紧随其后的空行
-                            while first_content_idx < len(lines) and not lines[first_content_idx].strip():
+                            if similarity > 0.7 or (is_contained and len_ratio > 0.6):
+                                logger.info(f"检测到重复标题，已移除原文件开头的标题: {first_line}")
+                                # 移除该行
                                 lines.pop(first_content_idx)
-                            # 更新original_content
-                            original_content = '\n'.join(lines)
+                                # 移除紧随其后的空行
+                                while first_content_idx < len(lines) and not lines[first_content_idx].strip():
+                                    lines.pop(first_content_idx)
+                                # 更新original_content
+                                original_content = '\n'.join(lines)
+                        else:
+                            logger.info(f"保留章节标题: {first_line}")
 
             # 构建标题、摘要和关键词部分
             header_section = ""
@@ -3705,6 +3717,8 @@ class MCPTools:
         - 检测并转换非Markdown格式的章节标题
         - 确保第一个非空行是二级标题（章节标题）
         - 规范化所有子标题层级
+        - 修复错误使用###的二级标题(如"### 2.4 标题" -> "2.4 标题")
+        - 智能修复小节编号不匹配问题(如"## 1. xxx"下的"2.1"自动修复为"1.1")
 
         Args:
             content: 章节内容
@@ -3717,6 +3731,7 @@ class MCPTools:
         first_heading_found = False
         current_chapter_level = 0
         first_content_line = True
+        current_chapter_number = None  # 当前章节号
 
         for line in lines:
             stripped_line = line.strip()
@@ -3738,7 +3753,40 @@ class MCPTools:
                 current_level = len(hash_symbols)
 
                 heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
-                numbered_heading_match = re.match(r'^(\d+(?:\.\d+)+)\s+', heading_text_clean)
+                numbered_heading_match = re.match(r'^(\d+(?:\.\d+)*)\s+', heading_text_clean)
+
+                # 【关键修复1】提取章节号(如"## 1. xxx" -> 章节号为1)
+                if current_level == 2 and numbered_heading_match:
+                    chapter_num_str = numbered_heading_match.group(1)
+                    # 检查是否是一级编号(如"1", "2", "3"等,没有点)
+                    if '.' not in chapter_num_str:
+                        current_chapter_number = int(chapter_num_str)
+                        logger.info(f"检测到章节标题: {heading_text_clean}, 章节号: {current_chapter_number}")
+
+                # 【关键修复2】检测错误使用###的二级标题(如"### 2.4 标题")
+                # 二级标题应该是纯文本,不应该有###前缀
+                if numbered_heading_match and current_level == 3:
+                    # 这是一个编号标题(如"2.1 xxx"),且使用了###
+                    number_part = numbered_heading_match.group(1)
+                    # 检查是否是二级编号(如2.1, 2.2, 3.1等,只有一个点)
+                    if number_part.count('.') == 1:
+                        # 这是错误的二级标题格式,应该转换为纯文本
+                        # 同时修复编号不匹配问题
+                        if current_chapter_number is not None:
+                            parts = number_part.split('.')
+                            wrong_chapter_num = int(parts[0])
+                            subsection_num = parts[1]
+                            if wrong_chapter_num != current_chapter_number:
+                                # 编号不匹配,修复它
+                                correct_number = f"{current_chapter_number}.{subsection_num}"
+                                heading_text_clean = re.sub(r'^\d+\.\d+\s+', f'{correct_number} ', heading_text_clean)
+                                logger.info(f"修复错误的小节编号: {number_part} -> {correct_number} (章节号: {current_chapter_number})")
+                        logger.info(f"修复错误的二级标题格式: ### {heading_text_clean} -> {heading_text_clean}")
+                        normalized_lines.append(heading_text_clean)
+                        if not first_heading_found:
+                            first_heading_found = True
+                            first_content_line = False
+                        continue
 
                 # 如果是第一个标题，将其设为二级标题（章节标题）
                 if not first_heading_found:
@@ -3783,6 +3831,22 @@ class MCPTools:
                     first_content_line = False
                     normalized_lines.append(line)
             else:
+                # 【关键修复3】检测纯文本格式的小节标题(如"2.1 xxx")并修复编号
+                # 检查是否是纯文本的小节标题(格式: 数字.数字 标题)
+                plain_subsection_match = re.match(r'^(\d+)\.(\d+)\s+(.+)$', stripped_line)
+                if plain_subsection_match and current_chapter_number is not None:
+                    wrong_chapter_num = int(plain_subsection_match.group(1))
+                    subsection_num = plain_subsection_match.group(2)
+                    subsection_title = plain_subsection_match.group(3)
+                    
+                    if wrong_chapter_num != current_chapter_number:
+                        # 编号不匹配,修复它
+                        correct_line = f"{current_chapter_number}.{subsection_num} {subsection_title}"
+                        logger.info(f"修复纯文本小节编号: {wrong_chapter_num}.{subsection_num} -> {current_chapter_number}.{subsection_num} (章节号: {current_chapter_number})")
+                        normalized_lines.append(correct_line)
+                        first_content_line = False
+                        continue
+                
                 # 非标题行保持不变
                 first_content_line = False
                 normalized_lines.append(line)
