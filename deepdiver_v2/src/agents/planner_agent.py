@@ -964,7 +964,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                             },
                             "task_summary": {
                                 "type": "string",
-                                "description": "This field is mainly used to describe the main content of the article, briefly summarize it, and finally indicate the path where the final article is saved.",
+                                "description": "This field is mainly used to describe the main content of the article, briefly summarize it, and finally indicate the path where the final article is saved. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese summary, English query → English summary).",
                                 "format": "markdown"
                             },
                             "task_name": {
@@ -991,7 +991,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                         "properties": {
                             "task_summary": {
                                 "type": "string",
-                                "description": "Comprehensive markdown covering what the agent was asked to do, steps taken, tools used, key findings, files created, challenges",
+                                "description": "Comprehensive markdown covering what the agent was asked to do, steps taken, tools used, key findings, files created, challenges. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese summary, English query → English summary).",
                                 "format": "markdown"
                             },
                             "task_name": {
@@ -1027,7 +1027,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                             },
                             "final_answer": {
                                 "type": "string",
-                                "description": "The final response displayed to the user",
+                                "description": "The final response displayed to the user. CRITICAL: Must use the SAME LANGUAGE as the user's query (Chinese query → Chinese answer, English query → English answer).",
                             }
                         },
                         "required": ["task_summary", "task_name", "key_files", "completion_status", "final_answer"]
@@ -1348,7 +1348,9 @@ For each function call, return a JSON object placed within the [unused11][unused
             # 检测用户查询语言
             import re as _re
             _zh_count = len(_re.findall(r'[\u4e00-\u9fff]', user_query))
-            self._is_chinese_query = _zh_count > 0
+            _total_chars = len(user_query.strip())
+            # 只有当中文字符占比超过30%时才判定为中文查询
+            self._is_chinese_query = (_zh_count / max(_total_chars, 1)) > 0.3
             
             # 发送初始进度（根据语言切换）
             _init_msg = '开始分析任务' if self._is_chinese_query else 'Analyzing task'

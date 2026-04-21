@@ -1805,10 +1805,11 @@ class MCPTools:
 
         return "用户"  # 默认用户名
 
-    def set_session_context(self, session_id: str, session_workspace_path: str):
+    def set_session_context(self, session_id: str, session_workspace_path: str, user_query: str = ""):
         """Set session context for workspace-aware operations"""
         self.session_id = session_id
         self.session_workspace_path = Path(session_workspace_path)
+        self.user_query = user_query  # 存储用户查询，用于语言检测
         # Update workspace path to session-specific path
         self.workspace_path = self.session_workspace_path
         self.full_workspace_path = os.path.realpath(self.workspace_path)
@@ -1817,14 +1818,15 @@ class MCPTools:
         # 更新 username
         self.username = self._get_username_from_workspace()
         logger.info(
-            f"Set session context - ID: {session_id}, Workspace: {session_workspace_path}, Username: {self.username}")
+            f"Set session context - ID: {session_id}, Workspace: {session_workspace_path}, Username: {self.username}, Query: {user_query[:50] if user_query else 'N/A'}...")
 
     def get_session_context(self) -> Dict[str, Any]:
         """Get current session context"""
         return {
             "session_id": self.session_id,
             "session_workspace_path": str(self.session_workspace_path) if self.session_workspace_path else None,
-            "workspace_path": str(self.workspace_path)
+            "workspace_path": str(self.workspace_path),
+            "user_query": getattr(self, 'user_query', '')  # 返回用户查询
         }
     
     def _get_academic_sites_list(self, query: str = "") -> List[str]:
@@ -4427,7 +4429,26 @@ class MCPTools:
                     complete_article = f.read()
 
                 # 生成标题、摘要和关键词
-                abstract_keywords_result = self.generate_abstract_and_keywords(complete_article)
+                # 【关键修复】传递user_query参数，确保语言一致性
+                user_query = getattr(self, 'user_query', '')
+                
+                # 如果user_query为空，尝试从workspace的todo.md中读取
+                if not user_query:
+                    try:
+                        todo_path = self.workspace_path / 'todo.md'
+                        if todo_path.exists():
+                            with open(todo_path, 'r', encoding='utf-8') as f:
+                                todo_content = f.read()
+                                # 从todo.md中提取user_query（通常在文件开头）
+                                # 格式示例：# User Query\nReview on the Current Status and Future Challenges of Cuttlefish Culture Technology
+                                query_match = re.search(r'(?:# User Query|用户查询|User Query)[:\s]*\n(.+?)(?:\n#|\Z)', todo_content, re.DOTALL)
+                                if query_match:
+                                    user_query = query_match.group(1).strip()
+                                    logger.info(f"从todo.md中读取到user_query: {user_query[:100]}...")
+                    except Exception as e:
+                        logger.warning(f"从todo.md读取user_query失败: {e}")
+                
+                abstract_keywords_result = self.generate_abstract_and_keywords(complete_article, user_query=user_query)
 
                 # 将标题、摘要和关键词插入到文件开头
                 # 使用self.username（从MCPTools初始化时传入）

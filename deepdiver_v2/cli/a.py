@@ -288,27 +288,55 @@ def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]]
     if not user_files_data:
         return query_text
 
+    # 检测用户query的语言(使用30%阈值)
+    import re
+    _zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
+    _total_chars = len(query_text.strip())
+    _is_chinese = (_zh_count / max(_total_chars, 1)) > 0.3
+
     # 分离强制文件和可选文件
     mandatory_files = [f for f in user_files_data if f.get('type') == 'mandatory']
     optional_files = [f for f in user_files_data if f.get('type') == 'optional']
 
     file_info_text = ""
 
-    # 添加强制使用的文件信息
+    # 添加强制使用的文件信息(根据用户query语言选择提示语言)
     if mandatory_files:
-        file_info_text += "\n\n【用户强制要求使用的文件（必须在报告中使用）】：\n"
+        if _is_chinese:
+            file_info_text += "\n\n【用户强制要求使用的文件（必须在报告中使用）】：\n"
+        else:
+            file_info_text += "\n\n[User-Required Files (Must be used in the report)]:\n"
         for i, file_info in enumerate(mandatory_files, 1):
-            file_info_text += f"{i}. ./user_uploads/{file_info['filename']} (文件ID: {file_info['file_id']})\n"
-        file_info_text += "\n这些文件必须被分析和引用。"
+            if _is_chinese:
+                file_info_text += f"{i}. ./user_uploads/{file_info['filename']} (文件ID: {file_info['file_id']})\n"
+            else:
+                file_info_text += f"{i}. ./user_uploads/{file_info['filename']} (File ID: {file_info['file_id']})\n"
+        if _is_chinese:
+            file_info_text += "\n这些文件必须被分析和引用。"
+        else:
+            file_info_text += "\nThese files must be analyzed and cited."
 
-    # 添加可选参考的文件信息
+    # 添加可选参考的文件信息(根据用户query语言选择提示语言)
     if optional_files:
-        file_info_text += "\n\n【用户提供的可选参考文件（根据相关性自行判断是否使用）】：\n"
+        if _is_chinese:
+            file_info_text += "\n\n【用户提供的可选参考文件（根据相关性自行判断是否使用）】：\n"
+        else:
+            file_info_text += "\n\n[Optional Reference Files (Use based on relevance)]:\n"
         for i, file_info in enumerate(optional_files, 1):
-            file_info_text += f"{i}. ./library_refs/{file_info['filename']} (文件ID: {file_info['file_id']})\n"
-        file_info_text += "\n这些文件可以作为参考资料，与网络检索结果一起评估相关性后选择使用。"
+            if _is_chinese:
+                file_info_text += f"{i}. ./library_refs/{file_info['filename']} (文件ID: {file_info['file_id']})\n"
+            else:
+                file_info_text += f"{i}. ./library_refs/{file_info['filename']} (File ID: {file_info['file_id']})\n"
+        if _is_chinese:
+            file_info_text += "\n这些文件可以作为参考资料，与网络检索结果一起评估相关性后选择使用。"
+        else:
+            file_info_text += "\nThese files can be used as references, evaluate relevance with web search results before using."
 
-    file_info_text += "\n\n请使用 document_extract 工具分析文件内容，并进行网络检索来补充最新信息，确保报告内容的全面性和时效性。\n"
+    if _is_chinese:
+        file_info_text += "\n\n请使用 document_extract 工具分析文件内容，并进行网络检索来补充最新信息，确保报告内容的全面性和时效性。\n"
+    else:
+        file_info_text += "\n\nPlease use the document_extract tool to analyze file content and perform web searches to supplement with latest information, ensuring comprehensive and up-to-date report content.\n"
+    
     return file_info_text + query_text
 
 
@@ -412,6 +440,15 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
             raise HTTPException(status_code=499, detail="Task was cancelled by user")
 
+        # 【关键修复】先基于原始query检测语言，避免enhanced_query中的文件提示文本影响语言判断
+        import re
+        _zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
+        _total_chars = len(query_text.strip())
+        _is_chinese_query = (_zh_count / max(_total_chars, 1)) > 0.3
+        # 将语言标志传递给agent，确保在execute_task之前就设置好
+        agent._is_chinese_query = _is_chinese_query
+        logger.info(f"[语言检测] 原始query: {query_text[:100]}, 中文字符数: {_zh_count}, 总字符数: {_total_chars}, 判定为中文: {_is_chinese_query}")
+        
         # 构建增强的查询文本
         enhanced_query = _build_enhanced_query(query_text, user_files_data)
 
@@ -508,7 +545,9 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     # 检测用户查询语言，决定统计信息的语言
                     import re
                     query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-                    is_chinese_query = query_zh_count > 0  # 如果包含中文字符，则使用中文
+                    query_total_chars = len(query_text.strip())
+                    # 只有当中文字符占比超过30%时才判定为中文查询
+                    is_chinese_query = (query_zh_count / max(query_total_chars, 1)) > 0.3
                     
                     # 添加换页符，使统计信息显示在新的一页
                     if is_chinese_query:
@@ -795,9 +834,13 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         })
         
+        # 【关键修复】检查是否是用户主动取消（499错误），如果是则不存储错误消息
+        is_user_cancelled = isinstance(e, HTTPException) and e.status_code == 499
+        
         # 【关键修复】将错误消息写入数据库，让前端轮询能感知任务失败
+        # 但如果是用户主动取消（499），则跳过存储，避免显示多余的错误提示
         try:
-            if frontend_session_id:
+            if frontend_session_id and not is_user_cancelled:
                 # 检测用户查询语言，决定错误提示的语言
                 import re
                 query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
@@ -825,6 +868,8 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     logger.info(f"成功存储错误消息到数据库: session_id={frontend_session_id}")
                 else:
                     logger.error(f"存储错误消息失败: {http_response.status_code}, {http_response.text}")
+            elif is_user_cancelled:
+                logger.info(f"用户主动取消任务 (499)，跳过错误消息存储: task_id={task_id}")
         except Exception as store_error:
             logger.error(f"存储错误消息到数据库失败: {store_error}")
         

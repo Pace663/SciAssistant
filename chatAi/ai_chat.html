@@ -29,6 +29,9 @@
     <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-css.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-markup.min.js"></script>
     
+    <!-- 多选删除功能 -->
+    <script src="./multi-select.js"></script>
+    
     <!-- 引入KaTeX数学公式渲染 -->
     <link href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
@@ -1472,9 +1475,17 @@ function copyToClipboard(text, button) {
             chatHistory.innerHTML = '';
             // 顶部历史会话标题
             const historyHeader = document.createElement('div');
-            historyHeader.className = 'chat-history-header px-3 py-2 text-sm font-semibold text-gray-700 flex items-center border-b border-gray-200';
-            historyHeader.innerHTML = '<i class="fa fa-history mr-2 text-gray-500"></i><span>历史会话</span>';
+            historyHeader.className = 'chat-history-header px-3 py-2 text-sm font-semibold text-gray-700 flex items-center justify-between border-b border-gray-200';
+            historyHeader.innerHTML = '<div class="flex items-center"><i class="fa fa-history mr-2 text-gray-500"></i><span>历史会话</span></div><button id="toggle-multi-select-btn" class="text-xs px-2 py-1 rounded hover:bg-gray-100 text-gray-600 transition-colors" title="多选模式"><i class="fa fa-check-square-o"></i></button>';
             chatHistory.appendChild(historyHeader);
+            
+            // 批量操作工具栏（默认隐藏）
+            const batchToolbar = document.createElement('div');
+            batchToolbar.id = 'batch-toolbar';
+            batchToolbar.className = 'hidden px-3 py-2 bg-blue-50 border-b border-blue-200 flex items-center justify-between';
+            batchToolbar.innerHTML = '<div class="flex items-center space-x-2"><button id="select-all-sessions-btn" class="text-xs px-2 py-1 rounded bg-white hover:bg-gray-100 text-gray-700 border border-gray-300 transition-colors"><i class="fa fa-check-square-o mr-1"></i>全选</button><span id="selected-count" class="text-xs text-gray-600">已选 0 项</span></div><button id="batch-delete-sessions-btn" class="text-xs px-2 py-1 rounded bg-red-500 hover:bg-red-600 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled><i class="fa fa-trash-o mr-1"></i>批量删除</button>';
+            chatHistory.appendChild(batchToolbar);
+            
             fetch(`/5000/api/chat/sessions/${userId}`)
              .then(response => {
                 // 检查响应状态
@@ -1490,13 +1501,16 @@ function copyToClipboard(text, button) {
                     const sessions = document.querySelectorAll('.chat-session');
                     sessions.forEach(session => {
                         session.classList.remove('active', 'bg-primary/10', 'text-primary');
-                        session.querySelector('i').classList.add('text-gray-500');
-                        session.querySelector('i').classList.remove('text-primary');
+                        const icon = session.querySelector('i.fa-comments-o');
+                        if (icon) {
+                            icon.classList.add('text-gray-500');
+                            icon.classList.remove('text-primary');
+                        }
                     });
                     
                     let pendingSessionElement = null; // 用于存储有 pending 任务的会话元素
                     
-                    if(data.length>0){
+                    if(data && data.length>0){
                         
                         // 添加新会话到列表顶部
                         data.forEach(item=>{
@@ -1505,6 +1519,7 @@ function copyToClipboard(text, button) {
                             newSession.className = 'chat-session p-1 rounded-lg cursor-pointer mb-px flex items-center transition-all duration-200 hover:bg-gray-100';
                             newSession.setAttribute('data-id', item.session_id); // 添加会话ID标识
                             newSession.innerHTML = `
+                                <input type="checkbox" class="session-checkbox hidden mr-2" style="width: 16px; height: 16px;">
                                 <i class="fa fa-comments-o mr-3 text-gray-500"></i>
                                 <span class="truncate sidebar-text text-sm leading-normal flex-grow">${item.title}</span>
                                 <div class="session-actions ml-2 opacity-0 hover:opacity-100 transition-opacity duration-200">
@@ -1528,6 +1543,125 @@ function copyToClipboard(text, button) {
                             // 绑定菜单按钮事件
                             bindSessionMenuEvent(newSession);
                          })
+                         
+                         // 绑定多选模式相关事件
+                         initMultiSelectMode();
+                         
+                         // 初始化多选模式功能
+                         function initMultiSelectMode() {
+                             const toggleBtn = document.getElementById('toggle-multi-select-btn');
+                             const batchToolbar = document.getElementById('batch-toolbar');
+                             const selectAllBtn = document.getElementById('select-all-sessions-btn');
+                             const batchDeleteBtn = document.getElementById('batch-delete-sessions-btn');
+                             const selectedCountSpan = document.getElementById('selected-count');
+                             let isMultiSelectMode = false;
+                             
+                             // 切换多选模式
+                             if (toggleBtn) {
+                                 toggleBtn.addEventListener('click', function() {
+                                     isMultiSelectMode = !isMultiSelectMode;
+                                     
+                                     if (isMultiSelectMode) {
+                                         // 进入多选模式
+                                         batchToolbar.classList.remove('hidden');
+                                         document.querySelectorAll('.session-checkbox').forEach(cb => {
+                                             cb.classList.remove('hidden');
+                                         });
+                                         // 隐藏会话操作按钮
+                                         document.querySelectorAll('.session-actions').forEach(actions => {
+                                             actions.style.display = 'none';
+                                         });
+                                     } else {
+                                         // 退出多选模式
+                                         batchToolbar.classList.add('hidden');
+                                         document.querySelectorAll('.session-checkbox').forEach(cb => {
+                                             cb.classList.add('hidden');
+                                             cb.checked = false;
+                                         });
+                                         // 显示会话操作按钮
+                                         document.querySelectorAll('.session-actions').forEach(actions => {
+                                             actions.style.display = '';
+                                         });
+                                         updateSelectedCount();
+                                     }
+                                 });
+                             }
+                             
+                             // 更新选中数量
+                             function updateSelectedCount() {
+                                 const checkedBoxes = document.querySelectorAll('.session-checkbox:checked');
+                                 if (selectedCountSpan) {
+                                     selectedCountSpan.textContent = `已选 ${checkedBoxes.length} 项`;
+                                 }
+                                 if (batchDeleteBtn) {
+                                     batchDeleteBtn.disabled = checkedBoxes.length === 0;
+                                 }
+                             }
+                             
+                             // 全选/取消全选
+                             if (selectAllBtn) {
+                                 selectAllBtn.addEventListener('click', function() {
+                                     const allCheckboxes = document.querySelectorAll('.session-checkbox');
+                                     const checkedBoxes = document.querySelectorAll('.session-checkbox:checked');
+                                     const shouldCheck = checkedBoxes.length < allCheckboxes.length;
+                                     
+                                     allCheckboxes.forEach(cb => {
+                                         cb.checked = shouldCheck;
+                                     });
+                                     
+                                     updateSelectedCount();
+                                 });
+                             }
+                             
+                             // 监听复选框变化
+                             document.addEventListener('change', function(e) {
+                                 if (e.target.classList.contains('session-checkbox')) {
+                                     updateSelectedCount();
+                                 }
+                             });
+                             
+                             // 批量删除
+                             if (batchDeleteBtn) {
+                                 batchDeleteBtn.addEventListener('click', async function() {
+                                     const checkedBoxes = document.querySelectorAll('.session-checkbox:checked');
+                                     if (checkedBoxes.length === 0) return;
+                                     
+                                     if (!confirm(`确定要删除选中的 ${checkedBoxes.length} 个会话吗？此操作不可恢复。`)) {
+                                         return;
+                                     }
+                                     
+                                     const sessionIds = Array.from(checkedBoxes).map(cb => {
+                                         return cb.closest('.chat-session').getAttribute('data-id');
+                                     });
+                                     
+                                     try {
+                                         // 调用批量删除API
+                                         const response = await fetch('/5000/api/chat/sessions/batch-delete', {
+                                             method: 'POST',
+                                             headers: {
+                                                 'Content-Type': 'application/json',
+                                                 'Authorization': `Bearer ${window.userToken}`
+                                             },
+                                             body: JSON.stringify({ session_ids: sessionIds })
+                                         });
+                                         
+                                         if (!response.ok) {
+                                             throw new Error(`批量删除失败: ${response.status}`);
+                                         }
+                                         
+                                         const data = await response.json();
+                                         console.log('批量删除成功:', data);
+                                         showToast(`成功删除 ${sessionIds.length} 个会话`, 'success');
+                                         
+                                         // 刷新会话列表
+                                         getList(getUserId());
+                                     } catch (error) {
+                                         console.error('批量删除失败:', error);
+                                         showToast(`批量删除失败: ${error.message}`, 'error');
+                                     }
+                                 });
+                             }
+                         }
                          
                          // 检查是否有 pending 任务的会话，并自动加载
                          const checkPendingSessions = async () => {
@@ -2416,7 +2550,10 @@ function copyToClipboard(text, button) {
             // 显示加载状态
             const loadingDiv = document.createElement('div');
             loadingDiv.className = 'mb-6 flex justify-start message-animation';
-            const _hasChinese = /[\u4e00-\u9fff]/.test(message);
+            // 使用30%阈值判断语言
+            const _zhCount = (message.match(/[\u4e00-\u9fff]/g) || []).length;
+            const _totalChars = message.trim().length;
+            const _hasChinese = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
             const statusText = ((window.selectedTab || '').trim() === 'deepdiver') 
                 ? (_hasChinese ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
                 : (_hasChinese ? '正在思考…' : 'Thinking…');
@@ -2434,6 +2571,13 @@ function copyToClipboard(text, button) {
             window.pendingSessions = window.pendingSessions || {};
             window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || { loading: true };
             window.pendingSessions[sessionId].spinner = loadingDiv;
+            window.pendingSessions[sessionId].isChinese = _hasChinese; // 保存语言偏好
+            
+            // 【关键修复】将语言偏好保存到独立的全局对象中，确保持久化
+            window.sessionLanguagePreference = window.sessionLanguagePreference || {};
+            window.sessionLanguagePreference[sessionId] = _hasChinese;
+            console.log(`[语言偏好] 保存会话 ${sessionId} 的语言偏好: ${_hasChinese ? '中文' : '英文'}`, window.sessionLanguagePreference);
+            
             chatMessages.scrollTop = chatMessages.scrollHeight;
             // 查看问答模式
             let query_model = window.selectedTab;
@@ -2893,6 +3037,12 @@ function copyToClipboard(text, button) {
             
             // 创建中断的事件处理函数
             window.cancelButtonHandler = async function() {
+                // 防抖：如果正在处理中断请求，直接返回
+                if (cancelButton.disabled) {
+                    console.log('[Cancel] 中断请求正在处理中，忽略重复点击');
+                    return;
+                }
+                
                 const currentSessionId = window.currentSessionId;
                 // 获取当前会话的 controller 和 taskId
                 const controller = window.sessionControllers ? window.sessionControllers[currentSessionId] : null;
@@ -2902,6 +3052,12 @@ function copyToClipboard(text, button) {
                 if (!controller || !currentSessionId || !taskId) {
                     return;
                 }
+                
+                // 禁用按钮，防止重复点击
+                cancelButton.disabled = true;
+                const originalHTML = cancelButton.innerHTML;
+                cancelButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+                
                     // 2. 调用后端中断接口
                     const url = `/8000/api/task/${taskId}/cancel`;
                     console.log(url)
@@ -2991,7 +3147,12 @@ function copyToClipboard(text, button) {
                     .catch(error => {
                         console.error('中断操作失败:', error);
                         showToast(`操作失败: ${error.message}`, 'error', 3000);
-                    });
+                    })
+                    .finally(() => {
+                                        // 恢复按钮状态（无论成功还是失败）
+                                        cancelButton.disabled = false;
+                                        cancelButton.innerHTML = originalHTML;
+                                    });
             };
             
             // 添加事件监听器
@@ -3219,7 +3380,7 @@ function copyToClipboard(text, button) {
                                         chatMessages.appendChild(messageDiv);
                                         chatMessages.scrollTop = chatMessages.scrollHeight;
                                         
-                                        // 为搜索来源链接添加锚点ID（与chat模式一致）
+                                        // 为搜索来源链接添加锚点ID
                                         if (reasonerSearchResults.length > 0) {
                                             const links = messageDiv.querySelectorAll('a[target="_blank"]');
                                             const sourceLinks = Array.from(links).slice(-reasonerSearchResults.length);
@@ -3490,7 +3651,11 @@ function copyToClipboard(text, button) {
                         console.log('[DeepDiver] SSE连接已建立, timestamp:', Date.now());
                         const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
                         if (statusSpan) {
-                            statusSpan.textContent = /[\u4e00-\u9fff]/.test(message) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
+                            // 使用30%阈值判断语言
+                            const _zhCount = (message.match(/[\u4e00-\u9fff]/g) || []).length;
+                            const _totalChars = message.trim().length;
+                            const _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                            statusSpan.textContent = _isCn ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
                         }
                     };
                 // SSE消息处理
@@ -3584,7 +3749,12 @@ function copyToClipboard(text, button) {
                         
                         // 检测用户消息语言
                         const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
-                        const _isCn = _lastUserMsg ? /[一-鿿]/.test(_lastUserMsg.textContent) : true;
+                        let _isCn = true;
+                        if (_lastUserMsg && _lastUserMsg.textContent) {
+                            const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                            const _totalChars = _lastUserMsg.textContent.trim().length;
+                            _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                        }
                         const errorMsg = _isCn 
                             ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
                             : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
@@ -3842,7 +4012,12 @@ function copyToClipboard(text, button) {
                         
                         // 检测用户消息语言
                         const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
-                        const _isCn = _lastUserMsg ? /[一-鿿]/.test(_lastUserMsg.textContent) : true;
+                        let _isCn = true;
+                        if (_lastUserMsg && _lastUserMsg.textContent) {
+                            const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                            const _totalChars = _lastUserMsg.textContent.trim().length;
+                            _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                        }
                         const errorMsg = _isCn 
                             ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
                             : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
@@ -4767,7 +4942,22 @@ function copyToClipboard(text, button) {
                             return response.json();
                         })
                         .then(data => {
-                            // 隐藏初始提示
+                            // 只保存有活跃SSE连接的进度容器
+                            const progressContainers = chatMessages.querySelectorAll('[data-progress-container]');
+                            const savedContainers = [];
+                            const hasActiveSSE = window.sessionEventSources && window.sessionEventSources[sessionId];
+                            if (hasActiveSSE) {
+                                progressContainers.forEach(container => {
+                                    savedContainers.push({
+                                        element: container.cloneNode(true),
+                                        taskId: container.getAttribute('data-progress-container')
+                                    });
+                                });
+                                console.log(`[切换会话] 保存了会话 ${sessionId} 的 ${progressContainers.length} 个进度容器`);
+                            } else {
+                                console.log(`[切换会话] 跳过保存进度容器（无活跃SSE）`);
+                            }
+                            chatMessages.innerHTML = '';
                             if (data.messages && data.messages.length > 0) {
                                 initialPrompt.classList.add('hidden');
                                 
@@ -4790,29 +4980,60 @@ function copyToClipboard(text, button) {
                                             
                                             // 根据后端返回的任务状态显示加载提示
                                             try {
+                                                // 【关键修复】同步后端任务状态：如果后端说没有pending task，清除前端的sessionTasks
+                                                if (!data.has_pending_task && window.sessionTasks && window.sessionTasks[sessionId]) {
+                                                    console.log(`[任务状态同步] 后端返回无待处理任务，清除前端sessionTasks[${sessionId}]`);
+                                                    delete window.sessionTasks[sessionId];
+                                                }
+                                                
                                                 if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner')) {
                                                     const queryModel = data.pending_mode || 'chat';
+                                                    // 【关键修复】使用sessionTasks而不是全局taskId，避免误判任务状态
+                                                    const currentTaskId = window.sessionTasks && window.sessionTasks[sessionId];
                                                     // 如果有 taskID 且是 DeepDiver 模式，直接使用 SSE，跳过静态提示和轮询
-                                                    if (window.taskId && queryModel === 'deepdiver') {
+                                                    if (currentTaskId && queryModel === 'deepdiver') {
                                                         // 检查是否需要重连SSE（切换会话时设置的标志）
                                                         if (window.needReconnectSSE) {
                                                             console.log('[切换会话] 历史消息加载完成，现在重连SSE');
-                                                            reconnectSSE(window.taskId, sessionId);
+                                                            reconnectSSE(currentTaskId, sessionId);
                                                             window.needReconnectSSE = false;
                                                             return;
                                                         }
                                                         // 页面刷新恢复场景
                                                         console.log('[页面恢复] 检测到 taskId，直接使用 SSE 恢复进度显示');
-                                                        reconnectSSE(window.taskId, sessionId);
+                                                        reconnectSSE(currentTaskId, sessionId);
                                                         return; // 跳过后续的静态提示和轮询逻辑
                                                     }
                                                     // 否则，显示静态提示并启动轮询
                                                     const pending = document.createElement('div');
                                                     pending.className = 'mb-6 flex justify-start message-animation pending-spinner';
-                                                    
-                                                    // 根据后端返回的模式显示不同的提示文本（根据最后一条用户消息语言切换）
-                                                    const _lastUserMsg = data.messages.filter(m => m.from_who === 'user').pop();
-                                                    const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.content) : true;
+                                                    // 根据后端返回的模式显示不同的提示文本
+                                                    let _isCn = true; // 默认中文
+                                                    if (window.sessionLanguagePreference && typeof window.sessionLanguagePreference[sessionId] !== 'undefined') {
+                                                        _isCn = window.sessionLanguagePreference[sessionId];
+                                                        console.log(`[语言偏好] 从sessionLanguagePreference读取会话 ${sessionId} 的语言: ${_isCn ? '中文' : '英文'}`);
+                                                    } else if (window.pendingSessions && window.pendingSessions[sessionId] && typeof window.pendingSessions[sessionId].isChinese !== 'undefined') {
+                                                        _isCn = window.pendingSessions[sessionId].isChinese;
+                                                        console.log(`[语言偏好] 从pendingSessions读取会话 ${sessionId} 的语言: ${_isCn ? '中文' : '英文'}`);
+                                                        // 【关键修复】立即保存到sessionLanguagePreference，确保下次切换时能直接读取
+                                                        window.sessionLanguagePreference = window.sessionLanguagePreference || {};
+                                                        window.sessionLanguagePreference[sessionId] = _isCn;
+                                                        console.log(`[语言偏好] 保存到sessionLanguagePreference:`, window.sessionLanguagePreference);
+                                                    } else {
+                                                        const _lastUserMsg = data.messages.filter(m => m.from_who === 'user').pop();
+                                                        if (_lastUserMsg && _lastUserMsg.content) {
+                                                            const _zhCount = (_lastUserMsg.content.match(/[\u4e00-\u9fff]/g) || []).length;
+                                                            const _totalChars = _lastUserMsg.content.trim().length;
+                                                            _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                                                        } else {
+                                                            _isCn = true;
+                                                        }
+                                                        console.log(`[语言偏好] 从最后一条用户消息检测会话 ${sessionId} 的语言: ${_isCn ? '中文' : '英文'}`, _lastUserMsg?.content);
+                                                        // 【关键修复】立即保存到sessionLanguagePreference，确保下次切换时能直接读取
+                                                        window.sessionLanguagePreference = window.sessionLanguagePreference || {};
+                                                        window.sessionLanguagePreference[sessionId] = _isCn;
+                                                        console.log(`[语言偏好] 保存到sessionLanguagePreference:`, window.sessionLanguagePreference);
+                                                    }
                                                     const statusText = (queryModel === 'deepdiver') 
                                                         ? (_isCn ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
                                                         : (_isCn ? '正在思考…' : 'Thinking…');
@@ -4853,7 +5074,12 @@ function copyToClipboard(text, button) {
                                                             reminderShown = true;
                                                             console.log('[轮询] 已等待45分钟，显示进度提醒');
                                                             const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
-                                                            const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.textContent) : true;
+                                                            let _isCn = true;
+                                                            if (_lastUserMsg && _lastUserMsg.textContent) {
+                                                                const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                                                                const _totalChars = _lastUserMsg.textContent.trim().length;
+                                                                _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                                                            }
                                                             const reminderMsg = _isCn 
                                                                 ? '您的任务仍在处理中（已等待45分钟）。复杂的研究报告可能需要40-90分钟，请耐心等待...'
                                                                 : 'Your task is still being processed (45 minutes elapsed). Complex research reports may take 40-90 minutes, please be patient...';
@@ -4875,7 +5101,12 @@ function copyToClipboard(text, button) {
                                                             
                                                             // 显示超时错误消息
                                                             const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
-                                                            const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.textContent) : true;
+                                                            let _isCn = true;
+                                                            if (_lastUserMsg && _lastUserMsg.textContent) {
+                                                                const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                                                                const _totalChars = _lastUserMsg.textContent.trim().length;
+                                                                _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                                                            }
                                                             const timeoutMsg = _isCn 
                                                                 ? '抱歉，处理您的请求超时（超过90分钟）。这可能是由于任务过于复杂或系统异常。\n\n建议：\n1. 检查后台服务是否正常运行\n2. 尝试简化您的问题\n3. 将复杂问题拆分为多个简单问题\n4. 联系技术支持'
                                                                 : 'Sorry, the request timed out (over 90 minutes). This may be due to task complexity or system issues.\n\nSuggestions:\n1. Check if backend services are running\n2. Try simplifying your question\n3. Break complex questions into smaller ones\n4. Contact technical support';
@@ -5157,7 +5388,8 @@ function copyToClipboard(text, button) {
                 // 调整会话项样式，使图标居中
                 document.querySelectorAll('.chat-session').forEach(session => {
                     session.classList.add('justify-center', 'px-0');
-                    session.querySelector('i').classList.remove('mr-3');
+                    session.querySelector('i').classList.remove('text-gray-500');
+                    session.querySelector('i').classList.remove('text-primary');
                 });
                 
                 // 调整文件库管理按钮样式（只显示图标）
@@ -5820,7 +6052,7 @@ function copyToClipboard(text, button) {
                 const data = await response.json();
                 console.log('批量删除成功:', data);
 
-                // 显示成功提示
+                // 显示删除成功提示
                 showToast(`成功删除 ${selectedIds.length} 个文件`, 'success');
 
                 // 刷新文件列表
@@ -5953,25 +6185,25 @@ function copyToClipboard(text, button) {
                     await batchDeleteFiles();
                 } else if (currentDeletingFileId) {
                     // 执行单个文件删除
-                // 调用后端API删除文件
-                const response = await fetch(`/5000/api/files/delete/${currentDeletingFileId}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${window.userToken}`
+                    // 调用后端API删除文件
+                    const response = await fetch(`/5000/api/files/delete/${currentDeletingFileId}`, {
+                        method: 'DELETE',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${window.userToken}`
+                        }
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`删除失败: ${response.status}`);
                     }
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`删除失败: ${response.status}`);
+                    
+                    const data = await response.json();
+                    console.log('文件删除成功:', data);
+                    
+                    // 显示删除成功提示
+                    showToast('文件删除成功', 'success');
                 }
-                
-                const data = await response.json();
-                console.log('文件删除成功:', data);
-                
-                // 显示删除成功提示
-                showToast('文件删除成功', 'success');
-       }
                 
                 // 刷新文件列表
                 loadFileLibrary();
@@ -6824,6 +7056,26 @@ function copyToClipboard(text, button) {
             }
             if (!progressContainer) {
                 // 没有保存的容器，创建新的空容器
+                // 【关键修复】使用sessionLanguagePreference来决定提示语语言
+                let _isCn = true;
+                if (window.sessionLanguagePreference && typeof window.sessionLanguagePreference[sessionId] !== 'undefined') {
+                    _isCn = window.sessionLanguagePreference[sessionId];
+                    console.log(`[SSE恢复] 从sessionLanguagePreference读取会话 ${sessionId} 的语言: ${_isCn ? '中文' : '英文'}`);
+                } else {
+                    const _msgs = chatMessages.querySelectorAll('.justify-end .message-container div');
+                    const _lastMsg = _msgs.length > 0 ? _msgs[_msgs.length - 1].textContent : '';
+                    if (_lastMsg) {
+                        const _zhCount = (_lastMsg.match(/[\u4e00-\u9fff]/g) || []).length;
+                        const _totalChars = _lastMsg.trim().length;
+                        _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                    }
+                    console.log(`[SSE恢复] 从最后一条用户消息检测会话 ${sessionId} 的语言: ${_isCn ? '中文' : '英文'}`);
+                    // 立即保存到sessionLanguagePreference
+                    window.sessionLanguagePreference = window.sessionLanguagePreference || {};
+                    window.sessionLanguagePreference[sessionId] = _isCn;
+                }
+                const statusText = _isCn ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
+                
                 progressContainer = document.createElement('div');
                 progressContainer.className = 'mb-6 flex justify-start message-animation';
                 progressContainer.setAttribute('data-progress-container', taskId);
@@ -6833,7 +7085,7 @@ function copyToClipboard(text, button) {
                         <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
                             <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
                                 <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
-                                <span class="text-sm text-gray-600">${(() => { const _msgs = chatMessages.querySelectorAll('.justify-end .message-container div'); const _lastMsg = _msgs.length > 0 ? _msgs[_msgs.length - 1].textContent : ''; return /[\u4e00-\u9fff]/.test(_lastMsg) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...'; })()}</span>
+                                <span class="text-sm text-gray-600">${statusText}</span>
                             </div>
                             <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
                                 <!-- 进度条目将动态插入 -->
@@ -6915,6 +7167,11 @@ function copyToClipboard(text, button) {
                         console.log('[SSE恢复] 任务完成');
                         eventSource.close();
                         delete window.sessionEventSources[sessionId];
+                        // 【关键修复】清除sessionTasks，避免切换回来时误认为任务还在运行
+                        if (window.sessionTasks && window.sessionTasks[sessionId]) {
+                            delete window.sessionTasks[sessionId];
+                            console.log(`[SSE恢复] 已清除会话 ${sessionId} 的taskId记录`);
+                        }
                         const cancelBtn = document.getElementById('cancel-button');
                         if (cancelBtn) cancelBtn.classList.add('hidden');
                         const submitBtn = document.querySelector('button[type="submit"]');
@@ -6969,6 +7226,42 @@ function copyToClipboard(text, button) {
                 console.error('[SSE恢复] 连接错误:', error);
                 eventSource.close();
                 delete window.sessionEventSources[sessionId];
+                
+                // 【关键修复】SSE恢复连接断开时，显示错误消息并移除加载提示
+                if (window.currentSessionId === sessionId) {
+                    // 移除进度容器
+                    if (progressContainer && progressContainer.parentNode) {
+                        progressContainer.remove();
+                    }
+                    // 移除加载提示
+                    try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                    
+                    // 检测用户消息语言
+                    const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                    let _isCn = true;
+                    if (_lastUserMsg && _lastUserMsg.textContent) {
+                        const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                        const _totalChars = _lastUserMsg.textContent.trim().length;
+                        _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                    }
+                    const errorMsg = _isCn 
+                        ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
+                        : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
+                    
+                    addMessage(errorMsg, 'ai');
+                    saveResultToDB(errorMsg, sessionId, "ai");
+                    
+                    // 重置UI状态
+                    const submitBtn = document.querySelector('button[type="submit"]');
+                    if (submitBtn) {
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                    }
+                    const cancelBtn = document.getElementById('cancel-button');
+                    if (cancelBtn) {
+                        cancelBtn.classList.add('hidden');
+                    }
+                }
             };
         }
     </script>
