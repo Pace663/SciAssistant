@@ -709,6 +709,35 @@ def get_chat_messages_by_session_id(session_id):
                         else:
                             # 兜底：如果没有模式信息，默认为 chat
                             pending_mode = 'chat'
+                        
+                        # 【关键修复】对deepdiver模式，交叉验证任务管理器中的实际任务状态
+                        # 解决：用户取消任务后，saveResultToDB异步写入未完成 → 刷新页面 → 
+                        # DB最后一条仍是用户消息 → has_pending_task误判为true的问题
+                        if pending_mode == 'deepdiver':
+                            try:
+                                task_resp = requests.get('http://localhost:8000/api/tasks', timeout=3)
+                                if task_resp.status_code == 200:
+                                    tasks_data = task_resp.json()
+                                    all_tasks = tasks_data.get('tasks', [])
+                                    # 查找与当前session_id关联的任务
+                                    # 注意：/api/tasks 返回的 tasks 是列表，不是字典
+                                    session_has_active_task = False
+                                    for task_info in all_tasks:
+                                        progress = task_info.get('progress', {})
+                                        params = progress.get('params', {})
+                                        task_session_id = params.get('frontend_session_id', '')
+                                        if task_session_id == session_id:
+                                            task_status = task_info.get('status', '')
+                                            if task_status in ('running', 'queued', 'pending'):
+                                                session_has_active_task = True
+                                                break
+                                    
+                                    if not session_has_active_task:
+                                        logger.info(f"[has_pending_task] session {session_id}: DB显示pending但任务管理器无活跃任务，覆盖为false")
+                                        has_pending_task = False
+                                        pending_mode = None
+                            except Exception as task_check_err:
+                                logger.warning(f"[has_pending_task] 查询任务管理器失败: {task_check_err}")
 
                 return jsonify({
                     'success': True,
