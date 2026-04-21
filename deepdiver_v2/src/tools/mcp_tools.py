@@ -119,7 +119,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-proxy = {}
+# Import proxy configuration
+from config.config import get_proxy_config
+proxy = get_proxy_config()
 
 
 @dataclass
@@ -648,11 +650,11 @@ def _process_inline_formatting(text: str) -> str:
         # 注意：添加style属性确保图标不受父元素斜体样式影响
         return f'[{num}] <font name="EmojiFont" style="font-style: normal;">📄</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
     
-    # 匹配学术论文引用：arXiv/PubMed/学术期刊网站（非 PDF 链接）
+    # 匹配学术论文引用：arXiv/PubMed/学术期刊网站/Sci-Hub/Google Scholar（非 PDF 链接）
     # 使用负向前瞻，跳过已经有图标的引用
-    # 扩展范围：包含 Nature、Lancet、MDPI、Frontiers、Springer、Wiley 等学术期刊
+    # 扩展范围：包含 Nature、Lancet、MDPI、Frontiers、Springer、Wiley、Sci-Hub、Google Scholar 等学术网站
     # 添加 (?:www\.)? 支持，因为很多学术网站URL包含www前缀（如www.mdpi.com）
-    academic_pattern = r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://(?:(?:www\.)?arxiv\.org/(?:abs|html)/|pubmed\.ncbi\.nlm\.nih\.gov/|pmc\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/|(?:www\.)?medrxiv\.org/content/|(?:www\.)?biorxiv\.org/content/|(?:www\.)?nature\.com/articles/(?!d41586-)|(?:www\.)?thelancet\.com/(?:journals/|article/)|(?:www\.)?science\.org/doi/|(?:www\.)?cell\.com/|(?:www\.)?nejm\.org/doi/|(?:www\.)?mdpi\.com/|(?:www\.)?frontiersin\.org/(?:journals/|articles/)|(?:www\.)?plos\.org/|link\.springer\.com/article/|onlinelibrary\.wiley\.com/doi/|(?:www\.)?bmj\.com/content/|jamanetwork\.com/journals/)[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)'
+    academic_pattern = r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://(?:(?:www\.)?arxiv\.org/(?:abs|html)/|pubmed\.ncbi\.nlm\.nih\.gov/|pmc\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/|(?:www\.)?medrxiv\.org/content/|(?:www\.)?biorxiv\.org/content/|(?:www\.)?nature\.com/articles/(?!d41586-)|(?:www\.)?thelancet\.com/(?:journals/|article/)|(?:www\.)?science\.org/doi/|(?:www\.)?cell\.com/|(?:www\.)?nejm\.org/doi/|(?:www\.)?mdpi\.com/|(?:www\.)?frontiersin\.org/(?:journals/|articles/)|(?:www\.)?plos\.org/|link\.springer\.com/article/|onlinelibrary\.wiley\.com/doi/|(?:www\.)?bmj\.com/content/|jamanetwork\.com/journals/|sci-hub\.(?:se|st|ru|tw|ren)/|scholar\.google\.com/|doi\.org/)[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)'
     text = re.sub(academic_pattern, replace_academic_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 格式2: [数字] 标题，URL，日期 - 网页引用
@@ -6155,7 +6157,7 @@ Strictly follow the following format for output:
     def document_qa(
             self,
             tasks: List[Dict],
-            model: str = "gpt-4o",
+            model: str = "pangu_auto",
             temperature: float = 0.3,
             max_tokens: int = 8192,
             max_workers: int = 5
@@ -6202,8 +6204,15 @@ Strictly follow the following format for output:
                     "CONTEXT:\n{context}"
                 ).format(context=content)
 
-                # 3. 调用大模型API
-                import litellm
+                # 3. 调用大模型API（使用requests.post直接调用，与document_extract一致）
+                # Get model URL and token from config
+                config = get_config()
+                model_config = config.get_custom_llm_config()
+                
+                model_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
+                model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
+                headers = {'Content-Type': 'application/json', 'csb-token': model_token}
+                
                 try:
                     # Add retry logic for AI model call
                     max_retries = 5
@@ -6211,17 +6220,23 @@ Strictly follow the following format for output:
 
                     for attempt in range(max_retries):
                         try:
-                            response = litellm.completion(
-                                model=model,
-                                messages=[
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": question}
-                                ],
-                                temperature=temperature,
-                                # temperature=1,
-                                max_tokens=max_tokens,
-                                proxy=proxy
+                            response = requests.post(
+                                url=model_url,
+                                headers=headers,
+                                json={
+                                    "model": model_config.get('model', model),
+                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
+                                    "messages": [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": question}
+                                    ],
+                                    "max_tokens": max_tokens,
+                                    "spaces_between_special_tokens": False,
+                                    "temperature": temperature,
+                                },
+                                timeout=model_config.get("timeout", 180)
                             )
+                            response = response.json()
                             break  # Success, exit retry loop
                         except Exception as e:
                             logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
@@ -6232,7 +6247,7 @@ Strictly follow the following format for output:
                     if response is None:
                         raise Exception("Failed to get response after all retries")
 
-                    answer = response.choices[0].message.content
+                    answer = response["choices"][0]["message"]["content"]
                     return {
                         'file_path': file_path,
                         'question': question,
@@ -9653,6 +9668,383 @@ Strictly follow the following format for output:
                 error=f"Failed to get paper: {str(e)}"
             )
 
+    def scihub_search(self, query: str, num_results: int = 5) -> MCPToolResult:
+        """
+        Search for academic papers via CrossRef API (used as Sci-Hub search backend).
+        Returns paper metadata including DOI which can be used with scihub_get_paper.
+
+        Args:
+            query: Search query string (keywords, paper title, etc.)
+            num_results: Number of results to retrieve (default: 5)
+
+        Returns:
+            MCPToolResult: Standardized result format with search results including DOI
+        """
+        try:
+            url = f"https://api.crossref.org/works?query={quote(query)}&rows={num_results}"
+            response = requests.get(url, proxies=proxy, timeout=15, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"CrossRef API request failed: HTTP {response.status_code}"
+                )
+
+            data = response.json()
+            items = data.get('message', {}).get('items', [])
+
+            papers = []
+            for item in items:
+                try:
+                    doi = item.get('DOI', '')
+                    title_list = item.get('title', [])
+                    title = title_list[0] if title_list else 'No title available'
+                    
+                    # Extract authors
+                    author_list = item.get('author', [])
+                    authors = []
+                    for a in author_list:
+                        given = a.get('given', '')
+                        family = a.get('family', '')
+                        authors.append(f"{given} {family}".strip())
+                    authors_str = ', '.join(authors) if authors else 'No authors available'
+                    
+                    # Extract year
+                    created = item.get('created', {})
+                    date_parts = created.get('date-parts', [[]])
+                    year = str(date_parts[0][0]) if date_parts and date_parts[0] else ''
+                    
+                    # Extract URL
+                    paper_url = item.get('URL', '')
+                    
+                    # Extract journal/container
+                    container = item.get('container-title', [])
+                    journal = container[0] if container else ''
+                    
+                    # Extract abstract if available
+                    abstract = item.get('abstract', 'No abstract available')
+                    # Clean HTML tags from abstract
+                    if abstract and abstract != 'No abstract available':
+                        abstract = re.sub(r'<[^>]+>', '', abstract).strip()
+
+                    papers.append({
+                        'DOI': doi,
+                        'Title': title,
+                        'Authors': authors_str,
+                        'Year': year,
+                        'URL': paper_url,
+                        'Journal': journal,
+                        'Abstract': abstract
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to parse CrossRef item: {e}")
+                    continue
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "results": papers,
+                    "total_results": len(papers),
+                    "query": query
+                },
+                metadata={"tool_name": "scihub_search"}
+            )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub search (CrossRef) failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search failed: {str(e)}"
+            )
+
+    def scihub_search_by_title(self, title: str) -> MCPToolResult:
+        """
+        Search for a specific paper by title via CrossRef, returning best match with DOI.
+
+        Args:
+            title: The paper title to search for
+
+        Returns:
+            MCPToolResult: Best matching paper with DOI
+        """
+        try:
+            url = f"https://api.crossref.org/works?query.title={quote(title)}&rows=1"
+            response = requests.get(url, proxies=proxy, timeout=15, verify=False)
+
+            if response.status_code != 200:
+                return MCPToolResult(
+                    success=False,
+                    error=f"CrossRef API request failed: HTTP {response.status_code}"
+                )
+
+            data = response.json()
+            items = data.get('message', {}).get('items', [])
+
+            if not items:
+                return MCPToolResult(
+                    success=True,
+                    data={"result": None, "message": "No matching paper found"},
+                    metadata={"tool_name": "scihub_search_by_title"}
+                )
+
+            item = items[0]
+            doi = item.get('DOI', '')
+            title_list = item.get('title', [])
+            found_title = title_list[0] if title_list else 'No title available'
+            
+            author_list = item.get('author', [])
+            authors = []
+            for a in author_list:
+                given = a.get('given', '')
+                family = a.get('family', '')
+                authors.append(f"{given} {family}".strip())
+            authors_str = ', '.join(authors) if authors else 'No authors available'
+            
+            created = item.get('created', {})
+            date_parts = created.get('date-parts', [[]])
+            year = str(date_parts[0][0]) if date_parts and date_parts[0] else ''
+            
+            paper_url = item.get('URL', '')
+            container = item.get('container-title', [])
+            journal = container[0] if container else ''
+
+            return MCPToolResult(
+                success=True,
+                data={
+                    "result": {
+                        'DOI': doi,
+                        'Title': found_title,
+                        'Authors': authors_str,
+                        'Year': year,
+                        'URL': paper_url,
+                        'Journal': journal
+                    }
+                },
+                metadata={"tool_name": "scihub_search_by_title"}
+            )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub title search failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Search by title failed: {str(e)}"
+            )
+
+    def scihub_get_paper(self, doi: str) -> MCPToolResult:
+        """
+        Download and analyze a paper via Sci-Hub using DOI.
+        First tries Sci-Hub mirrors for direct PDF download, then falls back to
+        CrossRef URL + url_crawler for content extraction.
+
+        Args:
+            doi: The DOI of the paper (e.g., "10.1038/nature12373")
+
+        Returns:
+            MCPToolResult: Paper analysis result with file path
+        """
+        try:
+            import hashlib
+            doi_hash = hashlib.md5(doi.encode()).hexdigest()[:8]
+            
+            # Sci-Hub mirror list (ordered by reliability)
+            scihub_mirrors = [
+                "https://sci-hub.st",
+                "https://sci-hub.ru",
+                "https://sci-hub.se",
+            ]
+            
+            pdf_downloaded = False
+            saved_file_path = None
+            
+            logger.info(f"Attempting to download paper via Sci-Hub for DOI: {doi}")
+            
+            # Try Sci-Hub mirrors for direct PDF download
+            for idx, mirror in enumerate(scihub_mirrors, 1):
+                try:
+                    logger.info(f"Trying Sci-Hub mirror {idx}/{len(scihub_mirrors)}: {mirror}")
+                    scihub_url = f"{mirror}/{doi}"
+                    
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    
+                    response = requests.get(scihub_url, headers=headers, proxies=proxy, timeout=30, verify=False, allow_redirects=True)
+                    
+                    if response.status_code != 200:
+                        logger.warning(f"Sci-Hub mirror {mirror} returned status code {response.status_code} for DOI {doi}")
+                        continue
+                    
+                    # Parse Sci-Hub page to find embedded PDF URL
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Look for PDF embed/iframe
+                    pdf_url = None
+                    embed = soup.find('embed', {'type': 'application/pdf'})
+                    if embed and embed.get('src'):
+                        pdf_url = embed['src']
+                    else:
+                        iframe = soup.find('iframe', {'id': 'pdf'})
+                        if iframe and iframe.get('src'):
+                            pdf_url = iframe['src']
+                    
+                    if not pdf_url:
+                        # Try finding direct PDF link
+                        for a_tag in soup.find_all('a', href=True):
+                            href = a_tag['href']
+                            if href.endswith('.pdf') or '/pdf/' in href:
+                                pdf_url = href
+                                break
+                    
+                    if not pdf_url:
+                        logger.warning(f"No PDF URL found in Sci-Hub page from {mirror} for DOI {doi}")
+                        continue
+                    
+                    # Normalize PDF URL
+                    if pdf_url.startswith('//'):
+                        pdf_url = 'https:' + pdf_url
+                    elif pdf_url.startswith('/'):
+                        pdf_url = mirror + pdf_url
+                    
+                    # Download PDF
+                    pdf_response = requests.get(pdf_url, headers=headers, proxies=proxy, timeout=60, verify=False, stream=True)
+                    if pdf_response.status_code == 200 and len(pdf_response.content) > 1000:
+                        # 先保存PDF到临时文件
+                        temp_pdf_filename = f"scihub_{doi_hash}.pdf"
+                        temp_pdf_path = self.workspace_path / "url_crawler_save_files" / temp_pdf_filename
+                        temp_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        with open(temp_pdf_path, 'wb') as f:
+                            for chunk in pdf_response.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        
+                        # 提取PDF文本内容
+                        try:
+                            extracted_text = self._read_pdf_text(temp_pdf_path)
+                            if not extracted_text or len(extracted_text.strip()) < 100:
+                                logger.warning(f"PDF text extraction failed or content too short for DOI {doi}, keeping PDF file")
+                                saved_file_path = str(temp_pdf_path.relative_to(self.workspace_path))
+                                pdf_downloaded = True
+                                logger.info(f"✅ Successfully downloaded paper via Sci-Hub ({mirror}) for DOI: {doi} (kept as PDF)")
+                                break
+                            
+                            # 保存提取的文本为TXT，添加元数据头部
+                            txt_filename = f"scihub_{doi_hash}.txt"
+                            txt_path = self.workspace_path / "url_crawler_save_files" / txt_filename
+                            
+                            # 构建带元数据的内容（与url_crawler格式一致）
+                            # 尝试从PDF文本中提取标题（取前100个字符作为标题）
+                            first_line = extracted_text.split('\n')[0].strip()
+                            paper_title = first_line[:100] if first_line else f"Paper from Sci-Hub (DOI: {doi})"
+                            
+                            # 构建完整内容
+                            txt_content = f"""Title: {paper_title}
+
+URL Source: https://doi.org/{doi}
+
+Markdown Content:
+{extracted_text}"""
+                            
+                            with open(txt_path, 'w', encoding='utf-8') as f:
+                                f.write(txt_content)
+                            
+                            # 删除临时PDF文件
+                            temp_pdf_path.unlink()
+                            
+                            saved_file_path = str(txt_path.relative_to(self.workspace_path))
+                            pdf_downloaded = True
+                            logger.info(f"✅ Successfully downloaded and extracted paper via Sci-Hub ({mirror}) for DOI: {doi}")
+                            break
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to extract text from Sci-Hub PDF for DOI {doi}: {e}")
+                            # 提取失败时保留PDF文件
+                            saved_file_path = str(temp_pdf_path.relative_to(self.workspace_path))
+                            pdf_downloaded = True
+                            logger.info(f"✅ Successfully downloaded paper via Sci-Hub ({mirror}) for DOI: {doi} (kept as PDF due to extraction error)")
+                            break
+                        
+                except Exception as e:
+                    logger.warning(f"Sci-Hub mirror {mirror} failed for DOI {doi}: {e}")
+                    continue
+            
+            # Fallback: use CrossRef URL + url_crawler
+            if not pdf_downloaded:
+                logger.info(f"Sci-Hub download failed, falling back to CrossRef URL for DOI: {doi}")
+                crossref_url = f"https://doi.org/{doi}"
+                filename = f"scihub_{doi_hash}.txt"
+                file_path = f"url_crawler_save_files/{filename}"
+                
+                crawler_result = self.url_crawler(documents=[{
+                    "url": crossref_url,
+                    "title": f"Sci-Hub Paper (DOI: {doi})",
+                    "file_path": file_path
+                }])
+                
+                if not crawler_result.success:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to fetch paper via both Sci-Hub and DOI redirect: {crawler_result.error}"
+                    )
+                
+                crawled_data = crawler_result.data if isinstance(crawler_result.data, list) else []
+                if not crawled_data:
+                    return MCPToolResult(
+                        success=False,
+                        error="No content retrieved from DOI URL"
+                    )
+                
+                result_data = crawled_data[0]
+                if not result_data.get('success', False):
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Failed to crawl DOI URL: {result_data.get('error', 'Unknown error')}"
+                    )
+                
+                saved_file_path = result_data.get('file_path')
+                if not saved_file_path:
+                    return MCPToolResult(
+                        success=False,
+                        error="File path not found in crawler result"
+                    )
+            
+            # Use document_extract to analyze the paper
+            extract_result = self.document_extract(
+                tasks=[{"file_path": saved_file_path, "task": "Analyze this academic paper obtained via Sci-Hub"}]
+            )
+            
+            paper_url = f"https://doi.org/{doi}"
+            
+            if extract_result.success:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "doi": doi,
+                        "url": paper_url,
+                        "analysis": extract_result.data,
+                        "message": f"Successfully downloaded and analyzed paper via Sci-Hub (DOI: {doi})"
+                    },
+                    metadata={"tool_name": "scihub_get_paper"}
+                )
+            else:
+                return MCPToolResult(
+                    success=True,
+                    data={
+                        "file_path": saved_file_path,
+                        "doi": doi,
+                        "url": paper_url,
+                        "message": f"Paper downloaded but analysis failed: {extract_result.error}"
+                    },
+                    metadata={"tool_name": "scihub_get_paper"}
+                )
+
+        except Exception as e:
+            logger.error(f"Sci-Hub get paper failed: {e}")
+            return MCPToolResult(
+                success=False,
+                error=f"Failed to get paper via Sci-Hub: {str(e)}"
+            )
+
     def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
                        start_year: int = None, end_year: int = None) -> MCPToolResult:
         """
@@ -10286,7 +10678,7 @@ MCP_TOOL_SCHEMAS = {
                 },
                 "model": {
                     "type": "string",
-                    "default": "gpt-4o-mini",
+                    "default": "pangu_auto",
                     "description": "AI model to use for generating answers"
                 },
                 "temperature": {
@@ -11093,6 +11485,52 @@ MCP_TOOL_SCHEMAS = {
                 }
             },
             "required": ["paper_url"]
+        }
+    },
+    "scihub_search": {
+        "name": "scihub_search",
+        "description": "Search for academic papers via CrossRef API (Sci-Hub search backend). Returns paper metadata including DOI, title, authors, year, journal, and abstract. The DOI can then be used with scihub_get_paper to download full paper content via Sci-Hub. Covers all academic disciplines with comprehensive DOI-based metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string (keywords, paper title, etc.)"
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to retrieve (default: 5)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    "scihub_search_by_title": {
+        "name": "scihub_search_by_title",
+        "description": "Search for a specific paper by exact title via CrossRef, returning the best match with DOI. Use this when you have a known paper title and need to find its DOI for downloading via scihub_get_paper.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The exact paper title to search for"
+                }
+            },
+            "required": ["title"]
+        }
+    },
+    "scihub_get_paper": {
+        "name": "scihub_get_paper",
+        "description": "Download and analyze a paper via Sci-Hub using its DOI. Attempts to download PDF from Sci-Hub mirrors first, then falls back to DOI redirect + content extraction. The paper will be saved to workspace and analyzed automatically. Use this after scihub_search to get full paper content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "doi": {
+                    "type": "string",
+                    "description": "The DOI of the paper (e.g., '10.1038/nature12373')"
+                }
+            },
+            "required": ["doi"]
         }
     },
     # DISABLED: Springer API currently unavailable

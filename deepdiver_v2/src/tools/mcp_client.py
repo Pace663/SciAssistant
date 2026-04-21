@@ -496,6 +496,11 @@ class MCPClient:
                 'env_var': 'SEARCH_SOURCE_GOOGLE_SCHOLAR',
                 'tools': ['google_scholar_search', 'advanced_google_scholar_search', 'google_scholar_get_paper', 'url_crawler']
             },
+            'SCIHUB': {
+                'name': 'Sci-Hub',
+                'env_var': 'SEARCH_SOURCE_SCIHUB',
+                'tools': ['scihub_search', 'scihub_search_by_title', 'scihub_get_paper', 'url_crawler']
+            },
             'SPRINGER': {
                 'name': 'Springer Nature',
                 'env_var': 'SEARCH_SOURCE_SPRINGER',
@@ -806,6 +811,11 @@ INFORMATION_SEEKER_TOOLS = [
     "google_scholar_search",
     "advanced_google_scholar_search",
     "google_scholar_get_paper",
+    
+    # Academic search tools - Sci-Hub
+    "scihub_search",
+    "scihub_search_by_title",
+    "scihub_get_paper",
     
     # Academic search tools - Springer Nature
     "springer_search",
