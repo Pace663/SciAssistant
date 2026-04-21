@@ -496,11 +496,22 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                 
                 # 在报告末尾添加统计信息
                 try:
+                    # 检测用户查询语言，决定统计信息的语言
+                    import re
+                    query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
+                    is_chinese_query = query_zh_count > 0  # 如果包含中文字符，则使用中文
+                    
                     # 添加换页符，使统计信息显示在新的一页
-                    stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
-                    stats_section += f"- 报告字数: {word_count:,} 字\n"
-                    stats_section += f"- 生成耗时: {execution_time:.2f} 秒 ({execution_time/60:.1f} 分钟)\n"
-                    stats_section += f"- 网站检索: {total_search_count:,} 次\n"
+                    if is_chinese_query:
+                        stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
+                        stats_section += f"- 报告字数: {word_count:,} 字\n"
+                        stats_section += f"- 生成耗时: {execution_time:.2f} 秒 ({execution_time/60:.1f} 分钟)\n"
+                        stats_section += f"- 网站检索: {total_search_count:,} 次\n"
+                    else:
+                        stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## Report Statistics\n\n"
+                        stats_section += f"- Word Count: {word_count:,} words\n"
+                        stats_section += f"- Generation Time: {execution_time:.2f} seconds ({execution_time/60:.1f} minutes)\n"
+                        stats_section += f"- Web Searches: {total_search_count:,} times\n"
                     
                     # 将统计信息追加到报告内容
                     final_report_content_with_stats = final_report_content + stats_section
@@ -838,15 +849,21 @@ def execute_queued_task(task_id: str, params: Dict[str, Any]):
 @app.post("/api/query", response_model=QueryResponse, summary="处理单个查询")
 async def handle_single_query(request: SingleQueryRequest):
     """异步处理单个查询，支持高并发和用户文件上传"""
+    import time
+    request_received_time = time.time()
 
     # 生成唯一任务ID
     task_id = request.taskId
+    
+    logger.info(f"[API] 收到任务创建请求: task_id={task_id}, timestamp={request_received_time}")
     
     # 【并发控制】检查当前运行中的query数量
     running_count = task_manager.get_running_tasks_count()
     
     # 创建任务
+    task_created_time = time.time()
     task_manager.create_task(task_id, request.query)
+    logger.info(f"[API] 任务已创建: task_id={task_id}, 创建耗时={task_created_time - request_received_time:.3f}秒")
 
     # 准备任务参数
     user_files_data = []
@@ -1112,11 +1129,14 @@ async def stream_task_progress(task_id: str):
     """
     
     async def event_generator():
+        import time
+        sse_start_time = time.time()
+        
         # 为该任务创建进度队列
         progress_queue = queue.Queue()
         progress_queues[task_id] = progress_queue
         
-        logger.info(f"[SSE] 客户端连接: task_id={task_id}")
+        logger.info(f"[SSE] 客户端连接: task_id={task_id}, timestamp={sse_start_time}")
         
         # 先发送历史进度消息（如果存在）
         if task_id in progress_history:
@@ -1126,17 +1146,24 @@ async def stream_task_progress(task_id: str):
                 yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
                 # 移除延迟，立即发送所有历史消息以加快显示速度
         
-        # 等待任务创建（最多5秒），允许前端先建立SSE连接再创建任务
+        # 等待任务创建（增加到15秒），允许前端先建立SSE连接再创建任务
         task_wait_count = 0
-        max_wait_iterations = 10  # 5秒 (10次 * 0.5秒)
+        max_wait_iterations = 30  # 15秒 (30次 * 0.5秒) - 增加等待时间
         while task_wait_count < max_wait_iterations:
             task_info = task_manager.get_task(task_id)
             if task_info:
-                logger.info(f"[SSE] 任务已找到: task_id={task_id}")
+                elapsed = time.time() - sse_start_time
+                logger.info(f"[SSE] 任务已找到: task_id={task_id}, 等待时长={elapsed:.2f}秒")
                 break
-            logger.info(f"[SSE] 等待任务创建: task_id={task_id}, 尝试 {task_wait_count + 1}/{max_wait_iterations}")
+            elapsed = time.time() - sse_start_time
+            logger.info(f"[SSE] 等待任务创建: task_id={task_id}, 尝试 {task_wait_count + 1}/{max_wait_iterations}, 已等待={elapsed:.2f}秒")
             await asyncio.sleep(0.5)
             task_wait_count += 1
+        
+        # 如果超时仍未找到任务，记录详细信息
+        if task_wait_count >= max_wait_iterations:
+            elapsed = time.time() - sse_start_time
+            logger.error(f"[SSE] 等待任务超时: task_id={task_id}, 总等待时长={elapsed:.2f}秒, 当前任务列表={list(task_manager.tasks.keys())}")
         
         try:
             while True:
