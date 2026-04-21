@@ -523,9 +523,26 @@ def _process_inline_formatting(text: str) -> str:
         math_formulas.append(formula)
         return placeholder
 
+    # 【关键】在匹配$...$公式之前，先保护所有<a>标签（含href/name属性）
+    # 防止$...$公式匹配跨越HTML锚点标签，导致_simplify_latex将属性中的_转为<sub>
+    # 例如: "公式$x$的值...<a href="#ref-msg_123">...$y$" 中两个$之间包含href属性
+    anchor_tag_placeholders = []
+    def protect_anchor_tag(match):
+        placeholder = f"__ANCHOR_TAG_{len(anchor_tag_placeholders)}__"
+        anchor_tag_placeholders.append(match.group(0))
+        return placeholder
+    # 保护完整的<a>标签（包括开标签和闭标签之间的所有内容，以及自闭合的<a name="..."></a>）
+    text = re.sub(r'<a\s[^>]*>.*?</a>', protect_anchor_tag, text, flags=re.IGNORECASE | re.DOTALL)
+    # 保护独立的<a name="..."></a>锚点定义
+    text = re.sub(r'<a\s[^>]*></a>', protect_anchor_tag, text, flags=re.IGNORECASE)
+
     # 保护行内数学公式 $...$
     # 使用非贪婪匹配,确保只匹配成对的$
     text = re.sub(r'\$([^\$]+?)\$', protect_math, text)
+
+    # 恢复锚点标签占位符
+    for i, original in enumerate(anchor_tag_placeholders):
+        text = text.replace(f"__ANCHOR_TAG_{i}__", original)
 
     # 清理孤立的$符号(没有配对的)
     # 统计剩余的$数量,如果是奇数,说明有孤立的$
@@ -1632,6 +1649,53 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                 else:
                     story.append(Paragraph(f'\u2022 {text}', style_normal))
             else:
+                # 检测纯文本格式的子标题（如 "2.1 标题" "2.1.1 标题" "3.2 Title"）
+                # 匹配模式：数字.数字[.数字...] 空格 标题文字（非空，且不以标点结尾）
+                plain_heading_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.+)$', line)
+                if plain_heading_match:
+                    heading_number = plain_heading_match.group(1)  # 如 "2.1" 或 "2.1.1"
+                    heading_text_raw = plain_heading_match.group(2).strip()
+                    # 排除误判：如果文字很长（超过80字符）或以句号等结尾，可能不是标题
+                    is_likely_heading = (
+                        len(heading_text_raw) < 80 and
+                        not re.search(r'[。？！.?!,，;；]$', heading_text_raw) and
+                        len(heading_text_raw) > 0
+                    )
+                    if is_likely_heading:
+                        # 根据编号层级确定标题级别：2.1 → h3(level 2), 2.1.1 → h4(level 3)
+                        dot_count = heading_number.count('.')
+                        if dot_count == 1:
+                            sub_style = style_h3
+                            target_level = 2  # h3 → outline level 2
+                        elif dot_count == 2:
+                            sub_style = style_h4
+                            target_level = 3  # h4 → outline level 3
+                        elif dot_count == 3:
+                            sub_style = style_h5
+                            target_level = 4
+                        else:
+                            sub_style = style_h6
+                            target_level = 5
+
+                        full_title = f"{heading_number} {heading_text_raw}"
+                        text = _process_inline_formatting(full_title)
+
+                        # 计算安全的大纲层级（与markdown标题逻辑一致）
+                        if target_level <= last_outline_level:
+                            safe_level = target_level
+                        else:
+                            safe_level = min(target_level, last_outline_level + 1)
+                        last_outline_level = safe_level
+
+                        # 创建书签
+                        clean_title = re.sub(r'<[^>]+>', '', full_title)
+                        bookmark_key = f'heading_{len(story)}'
+                        story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
+                        story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', sub_style))
+
+                        i += 1
+                        continue
+
                 # 处理行内格式
                 line = _process_inline_formatting(line)
                 
@@ -1646,7 +1710,31 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             i += 1
 
         # 生成 PDF（应用页码回调函数）
-        doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+        try:
+            doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+        except ValueError as ve:
+            if 'undefined destination target' in str(ve) or 'format not resolved' in str(ve):
+                logger.warning(f"PDF内部链接解析失败，将移除内部锚点链接后重试: {ve}")
+                # 重建story，移除所有内部href（#开头的链接）保留文本
+                cleaned_story = []
+                for item in story:
+                    if isinstance(item, Paragraph):
+                        raw = item.text
+                        # 移除指向内部锚点的<a href="#...">标签，保留链接文本
+                        cleaned = re.sub(r'<a\s+href="#[^"]*"[^>]*>(.*?)</a>', r'\1', raw, flags=re.IGNORECASE | re.DOTALL)
+                        cleaned_story.append(Paragraph(cleaned, item.style))
+                    else:
+                        cleaned_story.append(item)
+                doc2 = SimpleDocTemplate(
+                    str(output_path), pagesize=A4,
+                    rightMargin=2 * cm, leftMargin=2 * cm,
+                    topMargin=2 * cm, bottomMargin=2.5 * cm,
+                    title=pdf_title, author='PanguAI'
+                )
+                doc2.build(cleaned_story, onFirstPage=add_page_number, onLaterPages=add_page_number)
+                logger.info("已移除内部链接后成功生成PDF")
+            else:
+                raise
         return True
 
     except Exception as e:
@@ -2785,6 +2873,14 @@ class MCPTools:
             url_source = f"https://arxiv.org/abs/{paper_id}"
             logger.info(f"识别为 arXiv 文件: {filename}, URL: {url_source}")
 
+        # 检查是否是 PubMed 文件（通过文件名和父目录判断）
+        # PubMed 文件格式：{PMID}.txt 或 {PMID}_abstract.txt（纯数字PMID）
+        pubmed_match = re.match(r'^(\d{5,10})(?:_abstract)?\.txt$', filename)
+        if pubmed_match and ('pubmed' in str(file_path.parent).lower()):
+            pmid = pubmed_match.group(1)
+            url_source = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            logger.info(f"识别为 PubMed 文件: {filename}, PMID: {pmid}, URL: {url_source}")
+
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
@@ -2827,6 +2923,26 @@ class MCPTools:
                             title = re.sub(r'<[^>]+>', '', title).strip()
                             logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                             break
+
+                # 如果标题仍然未知，尝试从长文本行中提取第一句话作为标题
+                # 适用于 PubMed abstract 等内容为单行长文本的文件
+                if title == "Unknown Title" and lines:
+                    first_content_line = ""
+                    for line in lines[:10]:
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith('URL Source:') and not stripped.startswith('http'):
+                            first_content_line = stripped
+                            break
+                    if first_content_line and len(first_content_line) > 200:
+                        # 提取第一句话（以句号、问号、感叹号结尾）
+                        sentence_match = re.match(r'^(.{20,200}?[.!?])\s', first_content_line)
+                        if sentence_match:
+                            title = sentence_match.group(1).strip()
+                        else:
+                            # 没有明确的句子结束符，截取前200个字符
+                            title = first_content_line[:200].strip()
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        logger.info(f"从长文本提取标题: {title[:50]}...")
 
                 # 如果不是 arXiv 文件，从内容中提取 URL
                 if url_source == "Unknown URL":
@@ -3670,7 +3786,7 @@ class MCPTools:
         # 如果没有提供unique_id，生成一个基于时间戳的唯一ID
         if unique_id is None:
             import time
-            unique_id = f"msg_{int(time.time() * 1000)}"
+            unique_id = f"msg-{int(time.time() * 1000)}"
         report_files = []
         for section_content in section_contents:
             # Handle both dict format (expected) and string format (fallback)
@@ -4048,6 +4164,14 @@ class MCPTools:
                         is_arxiv_file = (file_path.startswith('arxiv/') or file_path.startswith('./arxiv/') or
                                         re.match(r'^\d{4}\.\d{5}(v\d+)?\.txt$', arxiv_filename))
                         
+                        # 检查是否是 PubMed 文件（通过路径或文件名格式判断）
+                        pubmed_filename = os.path.basename(file_path)
+                        pubmed_pmid_match = re.match(r'^(\d{5,10})(?:_abstract)?\.txt$', pubmed_filename)
+                        is_pubmed_file = (
+                            (file_path.startswith('pubmed/') or file_path.startswith('./pubmed/')) and
+                            pubmed_pmid_match is not None
+                        )
+
                         if is_arxiv_file:
                             # arXiv 文件特殊处理：从文件名构建 URL
                             # 提取 paper_id（例如：2603.02208v1.txt -> 2603.02208v1）
@@ -4064,6 +4188,22 @@ class MCPTools:
                             else:
                                 title = "Unknown Title"
                                 logger.warning(f"arXiv 文件不存在: {direct_file_path}")
+                        elif is_pubmed_file:
+                            # PubMed 文件特殊处理：从文件名构建 URL
+                            pmid = pubmed_pmid_match.group(1)
+                            url_source = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                            
+                            # 从文件内容提取标题
+                            direct_file_path = self.workspace_path / file_path
+                            if direct_file_path.exists():
+                                title, extracted_url = self._extract_title_from_file_content(direct_file_path)
+                                # 如果文件内容中有更好的URL（如PMC URL），使用它
+                                if extracted_url and extracted_url != "Unknown URL" and 'pmc' in extracted_url.lower():
+                                    url_source = extracted_url
+                                logger.info(f"PubMed 文件: {file_path}, PMID: {pmid}, URL: {url_source}")
+                            else:
+                                title = "Unknown Title"
+                                logger.warning(f"PubMed 文件不存在: {direct_file_path}")
                         else:
                             # 其他文件：先尝试直接路径
                             direct_file_path = self.workspace_path / file_path
@@ -4384,7 +4524,7 @@ class MCPTools:
             # 读取section_files中的文件内容，并获取摘要和关键词
             # 生成基于时间戳的唯一ID，避免多轮对话中的锚点冲突
             import time
-            unique_id = f"msg_{int(time.time() * 1000)}"
+            unique_id = f"msg-{int(time.time() * 1000)}"
             abstract_keywords = self.merge_reports(section_files, final_file_path, unique_id)
 
             # 如果没有返回摘要和关键词，设置默认值
@@ -5130,11 +5270,11 @@ OUTLINE TO ORGANIZE CONTENT:
 
 """
 
-            system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
+            system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure, and plan out tables based on the content of the current chapter to make the content more comprehensive and intuitive. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
 {user_file_priority_note}When drafting the current chapter content, strictly comply with the following requirements:
 - ⚠️ **CRITICAL CITATION REQUIREMENT - CITE ALL FILES**: In the web page information I gave you, each result is in the format of [webpage X begin]...[webpage X end], where X represents the numerical index of each article. **YOU MUST cite ALL provided webpages at least once in your chapter**. This is NON-NEGOTIABLE. Please cite the context at the end of the sentence when appropriate. Please cite the context in the corresponding part of the answer in the format of the reference number [X]. If a sentence comes from multiple contexts, please list all relevant reference numbers, such as [3][5]. Remember not to collect the references at the end and return the reference numbers, but list them in the corresponding part of the answer. **MANDATORY VERIFICATION**: Before submitting your chapter, verify that you have cited EVERY webpage (1 through {len(key_files) if key_files else 0}) at least once. Count your citations: webpage 1 [✓/✗], webpage 2 [✓/✗], etc. If any webpage is not cited, GO BACK and find appropriate places to cite it. **SPECIAL EMPHASIS**: User-uploaded files (typically webpages 1-{user_file_count if has_user_files else 0}) MUST be cited multiple times (3-5 times each) when they contain relevant information.
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
-- You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: You may appropriately use tables for narration when necessary. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
+- You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
 - You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
 - Be careful to ensure that the narrative content is highly relevant and does not contain any common sense errors, note that although you are asked to ensure the richness of information when writing, you must ensure that the content you write is highly relevant and that the context is logically coherent and readable.
 - Proceeding to explain the roles of other specified fields:
@@ -5142,6 +5282,14 @@ OUTLINE TO ORGANIZE CONTENT:
     * written_chapters: Reference written_chapters to avoid large amounts of repetitive or conflicting content
     * overall_outline: The purpose of giving an overall outline is to let you understand the summary of the article and avoid content inconsistent with other parts during your writing. In short, focus on writing the current chapter.
     * task_content: The task_content may provide the requirements for writing the current chapter as well as prompts for what to avoid. You can refer to this content when drafting.
+
+**📊 TABLE USAGE STRATEGY (MUST FOLLOW):**
+- **Extract and plan table data**: Before writing, extract the interrelated data from the provided web information and plan out tables. When there are comparisons of indicators, dataset sizes, ablation experiments, enumerations of hyperparameters, or any structured data, plan to present them in table form.
+- **Proactively use tables**: Do NOT wait for data to "perfectly fit" a table format. Whenever you encounter 2+ items being compared, contrasted, or listed with multiple attributes, USE A TABLE.
+- **Applicable scenarios include but are not limited to**: data comparison, technical parameter listing, feature/advantage/disadvantage contrast, chronological events, experimental results, statistical summaries, classification/categorization, multi-dimensional analysis, and policy/regulation comparisons.
+- **Table title format**: Every table MUST have a title line above it in the format "**表X: 表格标题**" (Chinese) or "**Table X: Table Title**" (English), where X is the sequential table number within the chapter (starting from 1). For example: "**表1: 不同方法的性能对比**" or "**Table 1: Performance Comparison of Different Methods**".
+- **Minimum expectation**: Each chapter (except Abstract/Introduction) should contain at least 1-2 tables when the source materials contain comparable or structured data. Actively look for opportunities to present information as tables.
+- **Table quality**: Tables must have clear headers, consistent formatting, and meaningful content. Do not create tables with only 1 column or 1 data row.
 
 Other points to note::
 - If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.  
@@ -5152,6 +5300,7 @@ Other points to note::
     - **错误格式**: "### 2.1 Title" 或 "**### 2.1 Title**" 或 "**2.1 Title**"（包含markdown符号）
     - **正确格式**: "2.1 Title" 或 "2.1 标题"（纯文本，只有数字+空格+标题）
   * 如果 current_chapter_outline 中的子标题包含markdown符号，你必须**移除这些符号**，只保留纯文本格式
+  * 当 current_chapter_outline 中的标题符号与 overall_outline 不一致时，以 overall_outline 的标题符号为准，保持全文符号一致性
   * 这对于PDF目录识别至关重要
 - Note that in Chapter 1, omit any mention of research objectives, methodology, or procedural details.
 - **🌐 CRITICAL LANGUAGE RULES (MUST FOLLOW)**:
@@ -8579,7 +8728,7 @@ Strictly follow the following format for output:
         # 生成搜索 URL
         try:
             search_url = generate_pubmed_search_url(term=keywords, num_results=max_results)
-            logger.info("Generated URL:", search_url)
+            logger.info(f"Generated URL: {search_url}")
 
             # 获取并解析搜索结果
             pmids = search_pubmed(search_url)
@@ -8601,7 +8750,7 @@ Strictly follow the following format for output:
             search_url = generate_pubmed_search_url(term=term, title=title, author=author,
                                                     journal=journal, start_date=start_date,
                                                     end_date=end_date, num_results=num_results)
-            logger.info("Generated URL:", search_url)
+            logger.info(f"Generated URL: {search_url}")
 
             # 获取并解析搜索结果
             pmids = search_pubmed(search_url)
@@ -8617,65 +8766,293 @@ Strictly follow the following format for output:
             logger.error(e)
             return MCPToolResult(success=False, error=f"获取pubmed信息失败!{e}")
 
+    def _extract_pmc_fulltext_xml(self, pmc_id_num: str) -> str:
+        """
+        通过PMC efetch API获取全文XML并提取纯文本
+        pmc_id_num: 纯数字PMC ID（不含'PMC'前缀）
+        """
+        efetch_pmc_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={pmc_id_num}&rettype=full&retmode=xml"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(efetch_pmc_url, headers=headers, verify=False, proxies=proxy, timeout=30)
+        if response.status_code != 200:
+            logger.warning(f"PMC efetch API returned status {response.status_code} for PMC ID {pmc_id_num}")
+            return ""
+
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as e:
+            logger.warning(f"Failed to parse PMC XML for {pmc_id_num}: {e}")
+            return ""
+
+        article_parts = []
+
+        # 提取标题
+        title_el = root.find(".//article-title")
+        if title_el is not None:
+            title_text = "".join(title_el.itertext()).strip()
+            if title_text:
+                article_parts.append(f"# {title_text}\n")
+
+        # 提取摘要
+        abstract_el = root.find(".//abstract")
+        if abstract_el is not None:
+            article_parts.append("## Abstract\n")
+            for sec in abstract_el.findall(".//sec"):
+                sec_title = sec.find("title")
+                if sec_title is not None:
+                    article_parts.append(f"### {sec_title.text.strip()}\n")
+                for p in sec.findall("p"):
+                    p_text = "".join(p.itertext()).strip()
+                    if p_text:
+                        article_parts.append(p_text + "\n")
+            # 也处理没有sec包裹的abstract段落
+            for p in abstract_el.findall("p"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    article_parts.append(p_text + "\n")
+
+        # 提取正文
+        body_el = root.find(".//body")
+        if body_el is not None:
+            for sec in body_el.findall(".//sec"):
+                sec_title = sec.find("title")
+                if sec_title is not None:
+                    sec_title_text = "".join(sec_title.itertext()).strip()
+                    if sec_title_text:
+                        article_parts.append(f"\n## {sec_title_text}\n")
+                for p in sec.findall("p"):
+                    p_text = "".join(p.itertext()).strip()
+                    if p_text:
+                        article_parts.append(p_text + "\n")
+            # 也处理没有sec包裹的body段落
+            for p in body_el.findall("./p"):
+                p_text = "".join(p.itertext()).strip()
+                if p_text:
+                    article_parts.append(p_text + "\n")
+
+        return "\n".join(article_parts)
+
     def get_pubmed_article(self, pmid) -> MCPToolResult:
         logger.info(f"Attempting to access full text for PMID: {pmid}")
         try:
-            # 首先，我们需要检查这篇文章是否有PMC ID
+            # 获取PMC ID
             efetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
             response = requests.get(efetch_url, headers=headers, verify=False, proxies=proxy)
 
             if response.status_code != 200:
-                return f"Error: Unable to fetch article data (status code: {response.status_code})"
+                return MCPToolResult(success=False, error=f"Unable to fetch article data (status code: {response.status_code})")
 
             root = ET.fromstring(response.content)
             pmc_id = root.find(".//ArticleId[@IdType='pmc']")
 
+            # 预先获取元数据（标题等），用于嵌入到保存的文件中
+            metadata = get_pubmed_metadata(pmid)
+            article_title = metadata.get("Title", "Unknown Title") if metadata else "Unknown Title"
+            pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+
+            # 无PMC ID，使用Abstract
             if pmc_id is None:
-                logger.info(f"No PMC ID found for PMID: {pmid}")
-                pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-                logger.info(f"You can check the article availability at: {pubmed_url}")
-                return f"No PMC ID found for PMID: {pmid}" + "\n" + f"You can check the article availability at: {pubmed_url}"
+                logger.info(f"No PMC ID found for PMID: {pmid}, falling back to abstract only")
+                if metadata and metadata.get("Abstract"):
+                    file_path = f"./pubmed/{pmid}_abstract.txt"
+                    # 嵌入元数据头，确保引用时能提取标题和URL
+                    content_with_header = f"# {article_title}\nURL Source: {pubmed_url}\n\n{metadata['Abstract']}"
+                    self.file_write(file_path=file_path, content=content_with_header, create_dirs=True)
+                    return MCPToolResult(success=True, data={
+                        "content": metadata["Abstract"],
+                        "file_path": file_path,
+                        "url": pubmed_url,
+                        "source_type": "pubmed_abstract",
+                        "pmid": pmid
+                    })
+                else:
+                    return MCPToolResult(success=False, error=f"No PMC ID or Abstract found for PMID: {pmid}")
+                
+            pmc_id = pmc_id.text  # e.g. "PMC7096724"
+            pmc_id_num = pmc_id.replace("PMC", "")  # e.g. "7096724"
+            pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
+            logger.info(f"Found PMC ID: {pmc_id} for PMID: {pmid}")
 
-            pmc_id = pmc_id.text
+            save_path = "./pubmed"
+            os.makedirs(self.workspace_path / save_path, exist_ok=True)
 
-            # 检查文章是否为开放访问
-            pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC8312049/"
-            pmc_response = requests.get(pmc_url, headers=headers, verify=False, proxies=proxy)
-            article = "pmc_sec_title".join(str(pmc_response.content).split("h2 class=\"pmc_sec_title")[1:-1])
-            logger.info("get pubmed content success")
-            '''
-            if pmc_response.status_code != 200:
-                logger.error(f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})")
-                logger.info(f"You can check the article availability at: {pmc_url}")
-                return f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})" + "\n" + f"You can check the article availability at: {pmc_url}"f"You can check the article availability at: {pmc_url}"
+            # ====== 方案1: PMC efetch XML API 获取全文（最可靠） ======
+            try:
+                logger.info(f"[方案1] Trying PMC efetch XML API for {pmc_id}")
+                xml_fulltext = self._extract_pmc_fulltext_xml(pmc_id_num)
+                if xml_fulltext and len(xml_fulltext.strip()) > 500:
+                    txt_file = f"{save_path}/{pmid}.txt"
+                    # 如果XML全文不是以#标题开头，则添加元数据头
+                    if not xml_fulltext.strip().startswith('# '):
+                        xml_fulltext = f"# {article_title}\nURL Source: {pmc_url}\n\n{xml_fulltext}"
+                    else:
+                        # 在标题后插入URL Source行
+                        lines = xml_fulltext.split('\n', 1)
+                        xml_fulltext = f"{lines[0]}\nURL Source: {pmc_url}\n{lines[1] if len(lines) > 1 else ''}"
+                    with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                        f.write(xml_fulltext)
+                    logger.info(f"[方案1 成功] PMC XML full text saved as {txt_file}, length: {len(xml_fulltext)}")
+                    return MCPToolResult(success=True, data={
+                        "content": xml_fulltext,
+                        "file_path": txt_file,
+                        "url": pmc_url,
+                        "source_type": "pubmed_pmc_xml",
+                        "pmid": pmid,
+                        "pmc_id": pmc_id
+                    })
+                else:
+                    logger.warning(f"[方案1 失败] PMC XML content too short ({len(xml_fulltext.strip()) if xml_fulltext else 0} chars)")
+            except Exception as e:
+                logger.warning(f"[方案1 异常] PMC efetch XML failed for {pmc_id}: {e}")
+
+            # ====== 方案2: 下载PDF并提取文本 ======
+            try:
+                logger.info(f"[方案2] Trying PDF download for {pmc_id}")
+                pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/pdf"
+                pdf_response = requests.get(pdf_url, headers=headers, verify=False, proxies=proxy, timeout=30, allow_redirects=True)
+                logger.info(f"[方案2] PDF response status: {pdf_response.status_code}, content-type: {pdf_response.headers.get('content-type', 'unknown')}")
+
+                if pdf_response.status_code == 200 and 'pdf' in pdf_response.headers.get('content-type', '').lower():
+                    temp_pdf = self.workspace_path / save_path / f"{pmid}_temp.pdf"
+                    with open(temp_pdf, 'wb') as f:
+                        f.write(pdf_response.content)
+                    
+                    pdf_text = self._read_pdf_text(temp_pdf)
+                    
+                    if temp_pdf.exists():
+                        temp_pdf.unlink()
+                    
+                    if pdf_text and len(pdf_text.strip()) > 100:
+                        txt_file = f"{save_path}/{pmid}.txt"
+                        # 添加元数据头
+                        pdf_text_with_header = f"# {article_title}\nURL Source: {pmc_url}\n\n{pdf_text}"
+                        with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                            f.write(pdf_text_with_header)
+                        logger.info(f"[方案2 成功] PDF text saved as {txt_file}, length: {len(pdf_text)}")
+                        return MCPToolResult(success=True, data={
+                            "content": pdf_text,
+                            "file_path": txt_file,
+                            "url": pmc_url,
+                            "source_type": "pubmed_pmc_pdf",
+                            "pmid": pmid,
+                            "pmc_id": pmc_id
+                        })
+                    else:
+                        logger.warning(f"[方案2 失败] PDF text extraction too short or empty")
+                else:
+                    logger.warning(f"[方案2 失败] PDF not available or wrong content-type")
+            except Exception as e:
+                logger.warning(f"[方案2 异常] PDF download failed for {pmc_id}: {e}")
+
+            # ====== 方案3: 抓取PMC HTML页面 ======
+            article = ""
+            try:
+                logger.info(f"[方案3] Trying PMC HTML scraping for {pmc_id}")
+                pmc_response = requests.get(pmc_url, headers=headers, verify=False, proxies=proxy, timeout=30)
+                logger.info(f"[方案3] HTML response status: {pmc_response.status_code}")
+
+                if pmc_response.status_code == 200:
+                    soup = BeautifulSoup(pmc_response.content, 'html.parser')
+                    
+                    # 提取标题 - 尝试多种选择器
+                    title = soup.find('h1', class_='content-title')
+                    if not title:
+                        title = soup.find('h1', id='article-title')
+                    if not title:
+                        title = soup.select_one('.article-title, .head-title, h1.heading-title')
+                    if title:
+                        article += f"# {title.get_text(strip=True)}\n\n"
+                    
+                    # 提取摘要
+                    abstract = soup.find('div', class_='abstract')
+                    if not abstract:
+                        abstract = soup.find('section', class_='abstract')
+                    if not abstract:
+                        abstract = soup.select_one('#abstract, .abstract-content')
+                    if abstract:
+                        article += "## Abstract\n\n"
+                        article += abstract.get_text(separator='\n', strip=True) + "\n\n"
+                    
+                    # 提取正文 - 尝试多种选择器
+                    main_content = soup.find('div', class_='jig-ncbiinpagenav')
+                    if not main_content:
+                        main_content = soup.find('div', id='mc')
+                    if not main_content:
+                        main_content = soup.find('div', class_='article-body')
+                    if not main_content:
+                        main_content = soup.find('main')
+                    if not main_content:
+                        main_content = soup.find('article')
+                    if not main_content:
+                        # 尝试所有 tsec class 的 div
+                        tsec_divs = soup.find_all('div', class_='tsec')
+                        if tsec_divs:
+                            for tsec in tsec_divs:
+                                for el in tsec.find_all(['p', 'h2', 'h3', 'h4']):
+                                    text = el.get_text(strip=True)
+                                    if text:
+                                        if el.name in ['h2', 'h3', 'h4']:
+                                            article += f"\n## {text}\n\n"
+                                        else:
+                                            article += text + "\n\n"
+                    
+                    if main_content:
+                        for section in main_content.find_all(['p', 'h2', 'h3', 'h4']):
+                            text = section.get_text(strip=True)
+                            if text:
+                                if section.name in ['h2', 'h3', 'h4']:
+                                    article += f"\n## {text}\n\n"
+                                else:
+                                    article += text + "\n\n"
+                    
+                    logger.info(f"[方案3] Extracted HTML content length: {len(article)}")
+            except Exception as e:
+                logger.warning(f"[方案3 异常] HTML scraping failed for {pmc_id}: {e}")
+
+            if article and len(article.strip()) > 200:
+                txt_file = f"{save_path}/{pmid}.txt"
+                # 如果HTML内容不是以#标题开头，添加元数据头
+                if not article.strip().startswith('# '):
+                    article = f"# {article_title}\nURL Source: {pmc_url}\n\n{article}"
+                else:
+                    lines = article.split('\n', 1)
+                    article = f"{lines[0]}\nURL Source: {pmc_url}\n{lines[1] if len(lines) > 1 else ''}"
+                with open(self.workspace_path / txt_file, 'w', encoding='utf-8') as f:
+                    f.write(article)
+                logger.info(f"[方案3 成功] HTML content saved as {txt_file}")
+                return MCPToolResult(success=True, data={
+                    "content": article,
+                    "file_path": txt_file,
+                    "url": pmc_url,
+                    "source_type": "pubmed_pmc_html",
+                    "pmid": pmid,
+                    "pmc_id": pmc_id
+                })
+
+            # ====== 所有方案失败，回退到摘要 ======
+            logger.warning(f"All full-text methods failed for PMID {pmid} ({pmc_id}), falling back to abstract")
+            if metadata and metadata.get("Abstract"):
+                file_path = f"./pubmed/{pmid}_abstract.txt"
+                content_with_header = f"# {article_title}\nURL Source: {pmc_url}\n\n{metadata['Abstract']}"
+                self.file_write(file_path=file_path, content=content_with_header, create_dirs=True)
+                return MCPToolResult(success=True, data={
+                    "content": metadata["Abstract"],
+                    "file_path": file_path,
+                    "url": pmc_url,
+                    "source_type": "pubmed_abstract",
+                    "pmid": pmid,
+                    "pmc_id": pmc_id
+                })
+            else:
+                return MCPToolResult(success=False, error=f"Failed to get any content for PMID: {pmid}")
             
-            if "This article is available under a" not in pmc_response.text:
-                logger.info(f"The article doesn't seem to be fully open access.")
-                logger.info(f"You can check the article availability at: {pmc_url}")
-                return f"The article doesn't seem to be fully open access." + "\n" + f"You can check the article availability at: {pmc_url}"
-            
-            # 尝试下载PDF
-            pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf"
-            pdf_response = requests.get(pdf_url, headers=headers,verify=False)
-            
-            if pdf_response.status_code != 200:
-                logger.error(f"Error: Unable to download PDF (status code: {pdf_response.status_code})")
-                logger.info(f"You can try accessing the article directly at: {pmc_url}")
-                return f"Error: Unable to download PDF (status code: {pdf_response.status_code})" + "\n" + f"You can try accessing the article directly at: {pmc_url}"
-            
-            # 保存PDF文件
-            # filename = f"PMID_{pmid}_PMC_{pmc_id}.pdf"
-            # with open(filename, 'wb') as f:
-            #     f.write(pdf_response.content)
-            
-            # print(f"PDF for PMID {pmid} has been downloaded as {filename}")
-            '''
-            return MCPToolResult(success=True, data={"content": article})
         except Exception as e:
-            logger.error(e)
+            logger.error(f"Error in get_pubmed_article: {e}")
             return MCPToolResult(success=False, error=f"获取pubmed论文内容失败!{e}")
 
     def arxiv_search(self, query: str, max_results: int = 10) -> MCPToolResult:
@@ -8858,58 +9235,88 @@ Strictly follow the following format for output:
 
     def medrxiv_search(self, query: str, max_results: int = 10, days: int = 30) -> List[Paper]:
         """
-        Search for papers on medRxiv by category within the last N days.
+        Search for papers on medRxiv within the last N days.
+        Supports keyword matching in title/abstract and category filtering.
 
         Args:
-            query: Category name to search for (e.g., "cardiovascular medicine").
+            query: Search query - can be keywords (e.g., "COVID-19 vaccine") or 
+                   category name (e.g., "infectious diseases").
             max_results: Maximum number of papers to return.
             days: Number of days to look back for papers.
 
         Returns:
-            List of Paper objects matching the category within the specified date range.
+            List of Paper objects matching the query within the specified date range.
         """
         # Calculate date range: last N days
         try:
-            BASE_URL = "https://api.medrxiv.org/pubs"
+            # 正确的API地址: api.biorxiv.org (不是 api.medrxiv.org)
+            BASE_URL = "https://api.biorxiv.org/pubs/medrxiv"
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-            # Format category: lowercase and replace spaces with underscores
-            category = query.lower().replace(' ', '_')
+            # 准备搜索关键词（用于客户端过滤）
+            query_lower = query.lower().strip()
+            query_keywords = [kw.strip() for kw in query_lower.split() if len(kw.strip()) > 2]
+            # 也准备类别格式用于匹配
+            category_format = query_lower.replace(' ', '_')
 
             papers = []
             cursor = 0
-            while len(papers) < max_results:
+            max_api_pages = 10  # 最多请求10页（1000篇）避免无限循环
+            pages_fetched = 0
+            
+            while len(papers) < max_results and pages_fetched < max_api_pages:
+                # API格式: /pubs/medrxiv/{start}/{end}/{cursor}
                 url = f"{BASE_URL}/{start_date}/{end_date}/{cursor}"
-                if category:
-                    url += f"?category={category}"
+                logger.info(f"medRxiv API request: {url}")
 
                 tries = 0
+                fetched_this_page = False
                 while tries < self.max_retries:
                     try:
                         response = self.session.get(url, timeout=self.timeout, verify=False, proxies=proxy)
                         response.raise_for_status()
                         data = response.json()
                         collection = data.get('collection', [])
+                        
                         for item in collection:
-                            date = datetime.strptime(item['date'], '%Y-%m-%d')
-                            papers.append(Paper(
-                                paper_id=item['doi'],
-                                title=item['title'],
-                                authors=item['authors'].split('; '),
-                                abstract=item['abstract'],
-                                url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}",
-                                pdf_url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}.full.pdf",
-                                published_date=date,
-                                updated_date=date,
-                                source="medrxiv",
-                                categories=[item['category']],
-                                keywords=[],
-                                doi=item['doi']
-                            ).to_dict())
+                            # 客户端过滤：匹配类别或关键词
+                            item_category = item.get('category', '').lower().replace(' ', '_')
+                            item_title = item.get('title', '').lower()
+                            item_abstract = item.get('abstract', '').lower()
+                            
+                            # 匹配条件：类别匹配 OR 所有关键词出现在标题/摘要中
+                            category_match = category_format and category_format in item_category
+                            keyword_match = query_keywords and all(
+                                kw in item_title or kw in item_abstract 
+                                for kw in query_keywords
+                            )
+                            
+                            if category_match or keyword_match:
+                                date = datetime.strptime(item['date'], '%Y-%m-%d')
+                                papers.append(Paper(
+                                    paper_id=item['doi'],
+                                    title=item['title'],
+                                    authors=item['authors'].split('; '),
+                                    abstract=item['abstract'],
+                                    url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}",
+                                    pdf_url=f"https://www.medrxiv.org/content/{item['doi']}v{item.get('version', '1')}.full.pdf",
+                                    published_date=date,
+                                    updated_date=date,
+                                    source="medrxiv",
+                                    categories=[item.get('category', '')],
+                                    keywords=[],
+                                    doi=item['doi']
+                                ).to_dict())
+                                
+                                if len(papers) >= max_results:
+                                    break
+                        
+                        fetched_this_page = True
                         if len(collection) < 100:
-                            break  # No more results
-                        cursor += 100
+                            pages_fetched = max_api_pages  # 没有更多结果了
+                        else:
+                            cursor += 100
                         break  # Exit retry loop on success
                     except requests.exceptions.RequestException as e:
                         tries += 1
@@ -8917,23 +9324,26 @@ Strictly follow the following format for output:
                             logger.error(f"Failed to connect to medRxiv API after {self.max_retries} attempts: {e}")
                             break
                         logger.error(f"Attempt {tries} failed, retrying...")
-                else:
-                    continue
-                break
+                
+                pages_fetched += 1
+                if not fetched_this_page:
+                    break  # API请求失败，停止分页
+            
+            logger.info(f"medRxiv search found {len(papers)} papers for query '{query}' in {pages_fetched} pages")
             return MCPToolResult(success=True, data={"paper": papers})
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取medrxiv论文内容失败!{e}")
 
     def medrxiv_download_pdf(self, paper_id: str, save_path: str) -> str:
         """
-        Download a PDF for a given paper ID from medRxiv.
+        Download a PDF for a given paper ID from medRxiv and extract text.
 
         Args:
             paper_id: The DOI of the paper.
-            save_path: Directory to save the PDF.
+            save_path: Directory to save the text file (relative to workspace).
 
         Returns:
-            Path to the downloaded PDF file.
+            Path to the text file (relative to workspace).
         """
         if not paper_id:
             raise ValueError("Invalid paper_id: paper_id is empty")
@@ -8942,17 +9352,36 @@ Strictly follow the following format for output:
         tries = 0
         while tries < self.max_retries:
             try:
-                # Add User-Agent to avoid potential 403 errors
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
                 response = self.session.get(pdf_url, timeout=self.timeout, headers=headers, verify=False, proxies=proxy)
                 response.raise_for_status()
-                os.makedirs(save_path, exist_ok=True)
-                output_file = f"{save_path}/{paper_id.replace('/', '_')}.txt"
-                with open(output_file, 'wb') as f:
+                
+                # 创建目录
+                os.makedirs(self.workspace_path / save_path, exist_ok=True)
+                
+                # 先保存PDF到临时文件
+                temp_pdf_path = self.workspace_path / save_path / f"{paper_id.replace('/', '_')}_temp.pdf"
+                with open(temp_pdf_path, 'wb') as f:
                     f.write(response.content)
-                logger.info(f"已将medrxiv论文 {paper_id} 直接保存为.txt格式")
+                
+                # 提取PDF文本
+                extracted_text = self._read_pdf_text(temp_pdf_path)
+                
+                # 删除临时PDF
+                if temp_pdf_path.exists():
+                    temp_pdf_path.unlink()
+                
+                if not extracted_text or len(extracted_text.strip()) < 100:
+                    raise Exception("PDF text extraction failed or content too short")
+                
+                # 保存为文本文件
+                output_file = f"{save_path}/{paper_id.replace('/', '_')}.txt"
+                with open(self.workspace_path / output_file, 'w', encoding='utf-8') as f:
+                    f.write(extracted_text)
+                    
+                logger.info(f"Successfully extracted text from medRxiv PDF: {paper_id}")
                 return output_file
             except requests.exceptions.RequestException as e:
                 tries += 1
@@ -8966,7 +9395,7 @@ Strictly follow the following format for output:
 
         Args:
             paper_id: medRxiv DOI
-            save_path: Directory where the PDF is/will be saved
+            save_path: Directory where the PDF is/will be saved (relative to workspace)
 
         Returns:
             MCPToolResult: The extracted text content of the paper
@@ -8974,26 +9403,42 @@ Strictly follow the following format for output:
         try:
             txt_path = f"{save_path}/{paper_id.replace('/', '_')}.txt"
             pdf_path = f"{save_path}/{paper_id.replace('/', '_')}.pdf"
+            
+            # 使用workspace_path检查文件
+            full_txt_path = self.workspace_path / txt_path
+            full_pdf_path = self.workspace_path / pdf_path
 
             # 如果已经存在文本文件，直接读取
-            if os.path.exists(txt_path):
-                with open(txt_path, 'rb') as f:
+            if full_txt_path.exists():
+                with open(full_txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": txt_path,
+                    "source_type": "medrxiv"
+                })
 
             # 如果存在旧的PDF文件，重命名为.txt
-            if os.path.exists(pdf_path):
-                os.rename(pdf_path, txt_path)
+            if full_pdf_path.exists():
+                full_pdf_path.rename(full_txt_path)
                 logger.info(f"已将medrxiv论文 {paper_id} 的PDF文件重命名为.txt格式")
-                with open(txt_path, 'rb') as f:
+                with open(full_txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": txt_path,
+                    "source_type": "medrxiv"
+                })
 
-            # 下载文件（medrxiv_download_pdf现在会直接保存为.txt）
+            # 下载文件
             txt_path = self.medrxiv_download_pdf(paper_id, save_path)
-            with open(txt_path, 'rb') as f:
+            with open(self.workspace_path / txt_path, 'rb') as f:
                 content = f.read()
-            return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+            return MCPToolResult(success=True, data={
+                "paper": content.decode('utf-8', errors='ignore'),
+                "file_path": txt_path,
+                "source_type": "medrxiv"
+            })
 
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取medrxiv论文内容失败!{e}")

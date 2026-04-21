@@ -397,7 +397,8 @@ For each function call, return a JSON object placed within the [unused11][unused
         try:
             # 发送进度：开始信息搜集（包含子任务列表）
             subtask_names = [task.get('task_content', '')[:50] for task in tasks]  # 截取前50字符
-            self._send_progress('info_seeking', '正在搜集信息', {
+            _info_msg = '正在搜集信息' if getattr(self, '_is_chinese_query', True) else 'Gathering information'
+            self._send_progress('info_seeking', _info_msg, {
                 'subtasks_count': len(tasks),
                 'task_type': 'objective',
                 'subtask_names': subtask_names
@@ -543,7 +544,8 @@ For each function call, return a JSON object placed within the [unused11][unused
         try:
             # 发送进度：开始信息搜集（主观型，包含子任务列表）
             subtask_names = [task.get('task_content', '')[:100] + ('...' if len(task.get('task_content', '')) > 100 else '') for task in tasks]  # 截取前100字符
-            self._send_progress('info_seeking', '正在搜集信息', {
+            _info_msg = '正在搜集信息' if getattr(self, '_is_chinese_query', True) else 'Gathering information'
+            self._send_progress('info_seeking', _info_msg, {
                 'subtasks_count': len(tasks),
                 'task_type': 'subjective',
                 'subtask_names': subtask_names
@@ -643,7 +645,8 @@ For each function call, return a JSON object placed within the [unused11][unused
             # 信息搜集完成后，发送简单的完成消息
             # 文件列表将在WriterAgent开始写作时推送
             if all_success:
-                self._send_progress('info_seeking_completed', '信息搜集完成')
+                _completed_msg = '信息搜集完成' if getattr(self, '_is_chinese_query', True) else 'Information gathering completed'
+                self._send_progress('info_seeking_completed', _completed_msg)
                 self.logger.info(f"[PROGRESS] 信息搜集完成，文件列表将在写作开始时推送")
 
             return {
@@ -710,6 +713,8 @@ For each function call, return a JSON object placed within the [unused11][unused
             # 传递进度回调给子 Agent
             if self.progress_callback:
                 writer.set_progress_callback(self.progress_callback)
+            # 传递语言标志给子 Agent
+            writer._is_chinese_query = getattr(self, '_is_chinese_query', True)
 
             self.logger.info(f"Assigning task to WriterAgent: {task_content[:800]}...")
 
@@ -1340,8 +1345,14 @@ For each function call, return a JSON object placed within the [unused11][unused
         try:
             self.logger.info(f"Starting planner task: {user_query}")
             
-            # 发送初始进度（统一显示详细进度）
-            self._send_progress('init', '开始分析任务', {'query': user_query[:100]})
+            # 检测用户查询语言
+            import re as _re
+            _zh_count = len(_re.findall(r'[\u4e00-\u9fff]', user_query))
+            self._is_chinese_query = _zh_count > 0
+            
+            # 发送初始进度（根据语言切换）
+            _init_msg = '开始分析任务' if self._is_chinese_query else 'Analyzing task'
+            self._send_progress('init', _init_msg, {'query': user_query[:100]})
 
             # Execute the planning task using ReAct pattern
             result = self._execute_react_loop(
