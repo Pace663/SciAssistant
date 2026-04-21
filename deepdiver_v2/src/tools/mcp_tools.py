@@ -1,5 +1,4 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import os
 import json
 import random
@@ -1106,6 +1105,41 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             wordWrap='CJK'  # 允许自动换行
         )
 
+        # 报告统计信息样式（浅蓝色背景，带边框）
+        style_stats = ParagraphStyle(
+            'StatsInfo',
+            parent=styles['Normal'],
+            fontName='SimSun',
+            fontSize=10,
+            leading=15,
+            alignment=TA_LEFT,
+            spaceBefore=8,
+            spaceAfter=8,
+            leftIndent=12,
+            rightIndent=12,
+            backColor=colors.Color(0.94, 0.97, 1.0),  # 浅蓝色背景 #F0F8FF
+            borderColor=colors.Color(0.7, 0.85, 0.95),  # 蓝色边框
+            borderWidth=1,
+            borderPadding=8
+        )
+
+        # 参考来源样式（改善长URL换行）
+        style_reference = ParagraphStyle(
+            'Reference',
+            parent=styles['Normal'],
+            fontName='SimSun',
+            fontSize=9.5,
+            leading=14,
+            alignment=TA_LEFT,
+            spaceBefore=4,
+            spaceAfter=4,
+            leftIndent=0,
+            firstLineIndent=0,
+            wordWrap='CJK',
+            allowWidows=1,
+            allowOrphans=1
+        )
+
         # 解析 Markdown 并转换为 ReportLab 元素
         story = []
         lines = markdown_content.split('\n')
@@ -1113,6 +1147,8 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         i = 0
         in_code_block = False
         in_math_block = False
+        in_stats_section = False  # 标记是否在报告统计信息区块
+        in_reference_section = False  # 标记是否在参考来源区块
         code_block_lines = []
         math_block_lines = []
         
@@ -1419,19 +1455,44 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                 bookmark_key = f'heading_{len(story)}'
                 
                 story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
-                story.append(Paragraph(f'<b>{text}</b>', style))
+                # 显式指定字体名称，避免 ps2tt 映射错误
+                story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', style))
+                
+                # 检测是否进入"报告统计信息"区块
+                if '报告统计信息' in clean_title or 'Report Statistics' in clean_title:
+                    in_stats_section = True
+                    in_reference_section = False
+                # 检测是否进入"参考来源"区块
+                elif '参考来源' in clean_title or 'References' in clean_title:
+                    in_reference_section = True
+                    in_stats_section = False
+                # 检测是否离开这些特殊区块（遇到其他标题）
+                elif (in_stats_section or in_reference_section) and clean_title not in ['报告统计信息', 'Report Statistics', '参考来源', 'References']:
+                    in_stats_section = False
+                    in_reference_section = False
                 
             elif line.startswith('* ') or line.startswith('- '):
                 # 无序列表
                 text = line[2:].strip()
                 # 处理列表项中的格式
                 text = _process_inline_formatting(text)
-                story.append(Paragraph(f'\u2022 {text}', style_normal))
+                
+                # 如果在统计信息区块内，使用特殊样式
+                if in_stats_section:
+                    story.append(Paragraph(f'<font name="SimSun">• {text}</font>', style_stats))
+                else:
+                    story.append(Paragraph(f'\u2022 {text}', style_normal))
             else:
                 # 处理行内格式
                 line = _process_inline_formatting(line)
-                # 普通段落
-                story.append(Paragraph(line, style_normal))
+                
+                # 检测是否是参考文献条目（以 [数字] 开头）
+                if in_reference_section and re.match(r'^\[\d+\]', line):
+                    # 参考文献条目使用特殊样式，改善长URL换行
+                    story.append(Paragraph(line, style_reference))
+                else:
+                    # 普通段落
+                    story.append(Paragraph(line, style_normal))
 
             i += 1
 
@@ -4022,7 +4083,6 @@ OUTLINE TO ORGANIZE CONTENT:
             # PANGU 模型配置
             PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
-        
             headers = {'Content-Type': 'application/json'}
 
             import requests
@@ -6209,7 +6269,7 @@ Strictly follow the following format for output:
         except Exception as e:
             logger.debug(f"antiword failed for {path}: {e}")
 
-        # 方案2: 使用textract（Python库，跨平台但依赖较多）
+        # 方案4: 使用textract（Python库，依赖较多）
         try:
             import textract
             text = textract.process(str(path)).decode('utf-8')
@@ -6908,7 +6968,6 @@ Strictly follow the following format for output:
             # Execute command
             result = subprocess.run(
                 command,
-                # 标记1 原始：shell=True,
                 shell=True,
                 cwd=str(cwd),
                 capture_output=capture_output,

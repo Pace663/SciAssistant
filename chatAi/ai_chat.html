@@ -3332,8 +3332,22 @@ ${contextText.trim()}
 
             // 2. 创建消息内容区域
             const messageContent = document.createElement('div');
+            const rawText = text;
             let formattedText = text;
-			            
+
+            // 报告消息：正文不展示末尾"报告统计信息"区块，避免与底部stats重复
+            // 注意：统计信息仍保留在 rawText 中用于提取展示
+            if (sender === 'ai' && hasReport === 1) {
+                try {
+                    // 匹配带换页符的新格式：<div style="page-break-before: always;"></div>
+                    formattedText = formattedText.replace(/\n*<div style="page-break-before: always;"><\/div>\s*\n*##\s*报告统计信息[\s\S]*$/g, '');
+                    // 匹配标题格式（无换页符）：## 报告统计信息
+                    formattedText = formattedText.replace(/\n*---\s*\n\s*##\s*报告统计信息[\s\S]*$/g, '');
+                    // 兼容旧的粗体格式：**报告统计信息**
+                    formattedText = formattedText.replace(/\n*---\s*\n\s*\*\*报告统计信息\*\*[\s\S]*$/g, '');
+                } catch (e) {}
+            }
+            
             // 检测是否为 reasoner 模式的消息（包含推理过程）
             // 如果有 thinkMsg 参数，说明是 reasoner 模式的消息
             let hasReasoningProcess = false;
@@ -3421,7 +3435,47 @@ ${contextText.trim()}
                 contentWrapper.appendChild(messageContent);// 先加消息内容
             }
 
-            // 3. 创建按钮组（关键：下载在左，复制在右，水平排列）
+            // 3. 如果是报告消息，从内容中提取并显示统计信息（字数和耗时）
+            if (sender === 'ai' && hasReport === 1) {
+                try {
+                    // 从报告内容末尾提取统计信息
+                    const wordCountMatch = rawText.match(/报告字数[：:]\s*([\d,]+)\s*字/);
+                    const executionTimeMatch = rawText.match(/生成耗时[：:]\s*([\d.]+)\s*秒/);
+                    const webSearchMatch = rawText.match(/网站检索[：:]\s*([\d,]+)\s*次/);
+                    
+                    if (wordCountMatch || executionTimeMatch || webSearchMatch) {
+                        const statsDiv = document.createElement('div');
+                        statsDiv.className = 'flex items-center space-x-4 mt-2 text-xs text-gray-500';
+                        
+                        if (wordCountMatch) {
+                            const wordCount = wordCountMatch[1].replace(/,/g, '');
+                            const wordCountSpan = document.createElement('span');
+                            wordCountSpan.innerHTML = `<i class="fa fa-file-text-o mr-1"></i>字数: ${parseInt(wordCount).toLocaleString()}`;
+                            statsDiv.appendChild(wordCountSpan);
+                        }
+                        
+                        if (executionTimeMatch) {
+                            const executionTime = parseFloat(executionTimeMatch[1]);
+                            const timeSpan = document.createElement('span');
+                            timeSpan.innerHTML = `<i class="fa fa-clock-o mr-1"></i>耗时: ${executionTime.toFixed(2)}秒`;
+                            statsDiv.appendChild(timeSpan);
+                        }
+
+                        if (webSearchMatch) {
+                            const totalSearch = webSearchMatch[1].replace(/,/g, '');
+                            const webSpan = document.createElement('span');
+                            webSpan.innerHTML = `<i class="fa fa-globe mr-1"></i>检索: ${parseInt(totalSearch).toLocaleString()}次`;
+                            statsDiv.appendChild(webSpan);
+                        }
+                        
+                        contentWrapper.appendChild(statsDiv);
+                    }
+                } catch (e) {
+                    console.warn('提取报告统计信息失败:', e);
+                }
+            }
+
+            // 4. 创建按钮组（关键：下载在左，复制在右，水平排列）
             const btnGroup = document.createElement('div');
             btnGroup.className = 'flex items-center space-x-2 mt-2'; // flex水平排列，间距2px
 
@@ -3429,22 +3483,24 @@ ${contextText.trim()}
             const copyButton = document.createElement('button');
             copyButton.className = 'copy-btn p-2 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs';
             copyButton.innerHTML = '<i class="fa fa-copy" style="font-size: 0.875rem;"></i>';
-            
-            // 用户消息：复制到输入框；AI消息：复制到剪贴板
+
+            // 用户消息：复制到剪贴板 + 填充到输入框；AI消息：复制到剪贴板
             if (sender === 'user') {
-                copyButton.title = '复制到输入框';
+                copyButton.title = '复制并填充到输入框';
                 copyButton.addEventListener('click', function (e) {
                     e.stopPropagation();
-                    // 将内容填充到输入框
+                    // 复制到剪贴板，确保可以粘贴到其它地方
+                    copyToClipboard(text, copyButton);
+                    // 同时填充到输入框
                     const userInput = document.getElementById('user-input');
                     if (userInput) {
                         userInput.value = text;
                         userInput.focus();
+                        // 触发input事件，刷新发送按钮的disabled状态
+                        userInput.dispatchEvent(new Event('input', { bubbles: true }));
                         // 自动调整输入框高度
                         userInput.style.height = 'auto';
                         userInput.style.height = userInput.scrollHeight + 'px';
-                        // 显示提示
-                        showCopyToast(copyButton, '已填充到输入框');
                     }
                 });
             } else {
@@ -3454,7 +3510,8 @@ ${contextText.trim()}
                     copyToClipboard(text, copyButton);
                 });
             }
-            btnGroup.appendChild(copyButton); // 复制按钮先加入 → 左侧
+            btnGroup.appendChild(copyButton);
+
             // 下载按钮（仅AI消息显示）- 使用下拉菜单选择格式
             if (sender === 'ai' && sessionId && hasReport==1) {
                 // 创建下载按钮容器（相对定位，用于下拉菜单定位）

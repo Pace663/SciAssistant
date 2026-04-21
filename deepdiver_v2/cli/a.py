@@ -1,4 +1,3 @@
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 """
 PlannerAgent HTTP Server
 基于FastAPI实现的PlannerAgent服务器，提供RESTful API接口
@@ -404,6 +403,101 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                     final_report_content = f.read()
                 report_relative_path = "report/final_report.md"
                 logger.info(f"成功读取最终报告: {final_report_path} (大小: {len(final_report_content)} 字符)")
+                
+                # 计算报告字数（中文字符+英文单词数）
+                word_count = 0
+                try:
+                    import re
+                    # 统计中文字符数
+                    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', final_report_content))
+                    # 统计英文单词数
+                    english_words = len(re.findall(r'\b[a-zA-Z]+\b', final_report_content))
+                    word_count = chinese_chars + english_words
+                    logger.info(f"报告字数统计: 中文字符={chinese_chars}, 英文单词={english_words}, 总计={word_count}")
+                except Exception as e:
+                    logger.warning(f"计算报告字数失败: {e}")
+
+                # 统计 InfoSeeker 全部检索次数（网页搜索 + 学术搜索 + 网页抓取，失败的也算）
+                total_search_count = 0
+                try:
+                    import json
+                    tool_call_logs_dir = workspace_path / "tool_call_logs"
+                    if tool_call_logs_dir.is_dir():
+                        for log_file in tool_call_logs_dir.glob("tool_calls_*.jsonl"):
+                            try:
+                                with open(log_file, 'r', encoding='utf-8') as lf:
+                                    for line in lf:
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        try:
+                                            rec = json.loads(line)
+                                        except Exception:
+                                            continue
+
+                                        tool_name = rec.get('tool_name')
+                                        
+                                        # 统计 batch_web_search 的查询次数
+                                        if tool_name == 'batch_web_search':
+                                            input_args = rec.get('input_args') or {}
+                                            queries = input_args.get('queries') or []
+                                            if isinstance(queries, list):
+                                                total_search_count += len(queries)
+                                        
+                                        # 统计 url_crawler 的抓取次数
+                                        elif tool_name == 'url_crawler':
+                                            input_args = rec.get('input_args') or {}
+                                            documents = input_args.get('documents') or []
+                                            if isinstance(documents, list):
+                                                total_search_count += len(documents)
+                                        
+                                        # 统计学术搜索工具（每次调用计1次）
+                                        elif tool_name in ['arxiv_search', 'search_pubmed_key_words', 'search_pubmed_advanced', 
+                                                          'medrxiv_search', 'springer_search', 'get_pubmed_article', 
+                                                          'arxiv_read_paper', 'medrxiv_read_paper', 'springer_get_article']:
+                                            total_search_count += 1
+                            except Exception as e:
+                                logger.warning(f"解析tool_call_logs失败: {log_file} - {e}")
+
+                    logger.info(f"InfoSeeker检索统计: 总检索次数={total_search_count} (网页搜索+学术搜索+网页抓取)")
+                except Exception as e:
+                    logger.warning(f"统计InfoSeeker检索次数失败: {e}")
+                
+                # 在报告末尾添加统计信息
+                try:
+                    # 添加换页符，使统计信息显示在新的一页
+                    stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
+                    stats_section += f"- 报告字数: {word_count:,} 字\n"
+                    stats_section += f"- 生成耗时: {execution_time:.2f} 秒 ({execution_time/60:.1f} 分钟)\n"
+                    stats_section += f"- 网站检索: {total_search_count:,} 次\n"
+                    
+                    # 将统计信息追加到报告内容
+                    final_report_content_with_stats = final_report_content + stats_section
+                    
+                    # 写回文件
+                    with open(final_report_path, 'w', encoding='utf-8') as f:
+                        f.write(final_report_content_with_stats)
+                    
+                    # 更新final_report_content为包含统计信息的版本
+                    final_report_content = final_report_content_with_stats
+                    logger.info(f"已在报告末尾添加统计信息")
+                    
+                    # 重新生成PDF文件（包含统计信息）
+                    try:
+                        from src.tools.mcp_tools import generate_pdf_with_reportlab
+                        
+                        pdf_path = Path(final_report_path).parent.parent / "final_report.pdf"
+                        success = generate_pdf_with_reportlab(final_report_content_with_stats, pdf_path)
+                        
+                        if success:
+                            logger.info(f"成功重新生成PDF文件（包含统计信息）: {pdf_path}")
+                        else:
+                            logger.warning(f"PDF重新生成失败")
+                    except Exception as pdf_error:
+                        logger.warning(f"重新生成PDF失败: {pdf_error}")
+                        
+                except Exception as e:
+                    logger.warning(f"添加统计信息到报告失败: {e}")
                 
                 # 自动存储报告到数据库
                 try:
