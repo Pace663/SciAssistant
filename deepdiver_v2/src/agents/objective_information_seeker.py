@@ -35,6 +35,7 @@ class InformationSeekerAgent(BaseAgent):
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
         use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
+        use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
         # Get all available tools from MCP
@@ -53,6 +54,7 @@ class InformationSeekerAgent(BaseAgent):
             'pubmed': ['pubmed', 'medrxiv'],
             'arxiv': ['arxiv'],
             'google_scholar': ['google_scholar', 'scholar'],
+            'scihub': ['scihub'],
             # 'springer': ['springer']  # DISABLED
         }
         
@@ -73,11 +75,13 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_google_scholar and any(pattern in tool_lower for pattern in tool_category_patterns['google_scholar']):
                 is_enabled = True
+            elif use_scihub and any(pattern in tool_lower for pattern in tool_category_patterns['scihub']):
+                is_enabled = True
             # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
             #     is_enabled = True
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar'] + tool_category_patterns['scihub']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:
@@ -132,6 +136,7 @@ When searching for recent information or papers, be aware that the current date 
                 a) Extract full content from the webpage
                 b) Save the content to a file in the workspace
            - For Google Scholar results, use `google_scholar_get_paper` to download and analyze papers
+           - For Sci-Hub results, use `scihub_get_paper` with DOI to download and analyze papers (especially useful for paywalled content)
            - Store results with meaningful file paths (e.g., \"research/ai_trends_2024.txt\")
         
         3. CONTENT ANALYSIS:

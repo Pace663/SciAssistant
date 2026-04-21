@@ -60,6 +60,7 @@ class InformationSeekerAgent(BaseAgent):
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
         use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
+        use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
         # Get all available tools from MCP
@@ -78,6 +79,7 @@ class InformationSeekerAgent(BaseAgent):
             'pubmed': ['pubmed', 'medrxiv'],
             'arxiv': ['arxiv'],
             'google_scholar': ['google_scholar', 'scholar'],
+            'scihub': ['scihub'],
             # 'springer': ['springer']  # DISABLED
         }
         
@@ -86,7 +88,7 @@ class InformationSeekerAgent(BaseAgent):
         disabled_tools = []
         
         # Log environment variable values for debugging
-        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}, GoogleScholar={use_google_scholar}")
+        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}, GoogleScholar={use_google_scholar}, SciHub={use_scihub}")
         logger.info(f"[SEARCH_SOURCE_DEBUG] Available tools from MCP: {available_tools}")
         
         for tool_name in available_tools:
@@ -102,12 +104,14 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_google_scholar and any(pattern in tool_lower for pattern in tool_category_patterns['google_scholar']):
                 is_enabled = True
+            elif use_scihub and any(pattern in tool_lower for pattern in tool_category_patterns['scihub']):
+                is_enabled = True
             # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
             #     is_enabled = True
             #     logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched Springer pattern and is_enabled={is_enabled}")
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar'] + tool_category_patterns['scihub']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:
@@ -120,7 +124,7 @@ class InformationSeekerAgent(BaseAgent):
         search_source_guidance = ""
         if enabled_tools:
             # Categorize tools by type
-            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv', 'google_scholar', 'scholar'])]
+            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv', 'google_scholar', 'scholar', 'scihub'])]
             web_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['web_search', 'batch_web'])]
             other_tools = [t for t in enabled_tools if t not in api_tools and t not in web_tools]
             
@@ -295,7 +299,6 @@ For each function call, return a JSON object placed within the [unused11][unused
                                 timeout=model_config.get("timeout", 180)
                             )
                             response = response.json()
-
                             self.logger.debug(f"API response received")
                             break
                         except Exception as e:
@@ -511,6 +514,7 @@ For each function call, return a JSON object placed within the [unused11][unused
                     }
                 }
             },
+
         ]
 
         schemas.extend(builtin_assignment_schemas)

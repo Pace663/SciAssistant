@@ -361,6 +361,11 @@ def get_tool_function(tool_name: str):
         "advanced_google_scholar_search": lambda tools, **kwargs: tools.advanced_google_scholar_search(**kwargs),
         "google_scholar_get_paper": lambda tools, **kwargs: tools.google_scholar_get_paper(**kwargs),
         
+        # Resource Library - Sci-Hub tools
+        "scihub_search": lambda tools, **kwargs: tools.scihub_search(**kwargs),
+        "scihub_search_by_title": lambda tools, **kwargs: tools.scihub_search_by_title(**kwargs),
+        "scihub_get_paper": lambda tools, **kwargs: tools.scihub_get_paper(**kwargs),
+        
         # Resource Library - Springer Nature tools
         "springer_search": lambda tools, **kwargs: tools.springer_search(**kwargs),
         "springer_get_article": lambda tools, **kwargs: tools.springer_get_article(**kwargs),

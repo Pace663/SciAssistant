@@ -188,6 +188,9 @@
                    /onlinelibrary\.wiley\.com\/doi\//i.test(url) ||
                    /(?:www\.)?bmj\.com\/content\//i.test(url) ||
                    /jamanetwork\.com\/journals\//i.test(url) ||
+                   /sci-hub\.(se|st|ru|tw|ren)\//i.test(url) ||  // Sci-Hub 所有镜像站
+                   /scholar\.google\.com\//i.test(url) ||  // Google Scholar
+                   /doi\.org\//i.test(url) ||  // DOI 解析服务
                    /openreview\.net\/(forum|pdf)\?id=/i.test(url);  // OpenReview 学术网站
         }
         
@@ -249,7 +252,7 @@
         });
         
         // 6.2 引用格式（只有标题）- 使用回形针图标表示文档引用
-        html = html.replace(/\[(\d+)\]\s+([^\n\[\],，|]+?)(?=\s*\n|\s*$|\s*\[)/gi, function(match, num, title) {
+        html = html.replace(/(?:^|\n)\s*(\[(\d+)\])\s+([^\n\[\],，|]+?)(?=\s*\n|\s*$|\s*\[)/gim, function(match, fullRef, num, title) {
             if (title.includes('http') || title.includes('](')) {
                 return match;
             }
@@ -259,7 +262,9 @@
             }
             // 没有URL的引用默认使用回形针图标（表示本地文档）
             const { cleanTitle, icon } = processReferenceIcon(title, ICON_PAPERCLIP);
-            const rendered = `[${num}] ${icon}${cleanTitle}`;
+            // 保留原始的换行符和空白
+            const leadingWhitespace = match.match(/^(\s*)/)[0];
+            const rendered = `${leadingWhitespace}[${num}] ${icon}${cleanTitle}`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
@@ -277,7 +282,7 @@
         // 6.3b 正文中的引用标注 [数字] -> 与文字同行显示，可点击跳转到搜索来源
         // 匹配正文中的 [数字] 格式（非行首，前面是中文/英文/标点），转为行内链接
         html = html.replace(/(?<=[^\n\[])(\[(\d+)\])/g, function(match, full, num) {
-            const rendered = `<sup><a class="citation-ref" data-ref="${num}" href="javascript:void(0)" style="text-decoration:none;cursor:pointer;color:#3b82f6;" onclick="event.preventDefault();scrollToCitation(${num});event.stopPropagation();">[${num}]</a></sup>`;
+            const rendered = `<span class="citation-ref" data-ref="${num}" style="cursor:pointer;color:#3b82f6;font-size:1em;padding:0 1px;border-radius:2px;background:#eff6ff;font-weight:500;display:inline;" onclick="(function(e){var src=document.getElementById('search-source-'+${num});if(src){src.scrollIntoView({behavior:'smooth',block:'center'});src.style.transition='background 0.3s';src.style.background='#fef3c7';setTimeout(function(){src.style.background='';},2000);}e.stopPropagation();})(event)">[${num}]</span>`;
             codeBlocks.push(rendered);
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
@@ -1050,6 +1055,11 @@
                                 <i class="fa fa-graduation-cap text-blue-600" style="width: 16px; text-align: center;"></i>
                                 <span class="text-sm text-gray-700">Google Scholar</span>
                             </label>
+                            <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
+                                <input type="checkbox" value="scihub" class="search-source-checkbox search-source-item" checked style="width: 16px; height: 16px; margin: 0;">
+                                <i class="fa fa-unlock-alt text-purple-500" style="width: 16px; text-align: center;"></i>
+                                <span class="text-sm text-gray-700">Sci-Hub</span>
+                            </label>
                         </div>
                     </div>
                 </div>
@@ -1309,12 +1319,55 @@
                             <!-- 移除取消处理按钮 -->
                         </div>
                     </div>
-                </div>
             </div>
         </div>
     </div>
 
     <script>
+        // 【多窗口协调】为每个窗口生成唯一ID，用于检测是否有其他窗口已在运行
+        window._windowId = 'win_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        (function registerWindow() {
+            try {
+                const windows = JSON.parse(localStorage.getItem('_activeWindows') || '{}');
+                // 清理超过30秒未心跳的窗口（视为已关闭）
+                const now = Date.now();
+                Object.keys(windows).forEach(id => {
+                    if (now - windows[id] > 30000) delete windows[id];
+                });
+                windows[window._windowId] = now;
+                localStorage.setItem('_activeWindows', JSON.stringify(windows));
+            } catch(e) { console.warn('[多窗口] 注册窗口失败:', e); }
+        })();
+        // 定期心跳，保持窗口活跃状态
+        setInterval(function() {
+            try {
+                const windows = JSON.parse(localStorage.getItem('_activeWindows') || '{}');
+                const now = Date.now();
+                Object.keys(windows).forEach(id => {
+                    if (now - windows[id] > 30000) delete windows[id];
+                });
+                windows[window._windowId] = now;
+                localStorage.setItem('_activeWindows', JSON.stringify(windows));
+            } catch(e) {}
+        }, 10000);
+        // 页面关闭时注销窗口
+        window.addEventListener('beforeunload', function() {
+            try {
+                const windows = JSON.parse(localStorage.getItem('_activeWindows') || '{}');
+                delete windows[window._windowId];
+                localStorage.setItem('_activeWindows', JSON.stringify(windows));
+            } catch(e) {}
+        });
+        // 辅助函数：检查是否有其他活跃窗口
+        function hasOtherActiveWindows() {
+            try {
+                const windows = JSON.parse(localStorage.getItem('_activeWindows') || '{}');
+                const now = Date.now();
+                const activeOthers = Object.keys(windows).filter(id => id !== window._windowId && (now - windows[id]) < 30000);
+                return activeOthers.length > 0;
+            } catch(e) { return false; }
+        }
+
         // 页面加载时自动检查登录状态
         window.addEventListener('DOMContentLoaded', function() {
             // 初始化快速回到底部按钮功能
@@ -1366,7 +1419,7 @@
                 userLogin.classList.add('hidden');
                 userProfile.classList.remove('hidden');
                 fileLibraryBtn.classList.remove('hidden');
-                getList(userId);
+                getList(userId, { autoLoadPendingSession: true });
                 // 更新用户信息
                 userAvatar.src = `./images/user.png`;
                 userAvatar.alt = `${username}的头像`;
@@ -1544,7 +1597,8 @@ function copyToClipboard(text, button) {
             }, 2000);
         }
 
-        const getList =  function(userId){
+        const getList =  function(userId, options = {}){
+            const autoLoadPendingSession = options.autoLoadPendingSession === true;
             // 清空会话列表容器
             chatHistory.innerHTML = '';
             // 顶部历史会话标题
@@ -1610,6 +1664,15 @@ function copyToClipboard(text, button) {
                                     </div>
                                 </div>
                             `;
+                            // 保持当前会话的选中态，避免刷新列表后会话焦点漂移
+                            if (window.currentSessionId && String(window.currentSessionId) === String(item.session_id)) {
+                                newSession.classList.add('active', 'bg-primary/10', 'text-primary');
+                                const icon = newSession.querySelector('i.fa-comments-o');
+                                if (icon) {
+                                    icon.classList.remove('text-gray-500');
+                                    icon.classList.add('text-primary');
+                                }
+                            }
                             chatHistory.appendChild(newSession);
 
                             // 添加这行代码来绑定点击事件
@@ -1696,51 +1759,94 @@ function copyToClipboard(text, button) {
                              
                              // 批量删除
                              if (batchDeleteBtn) {
-                                 batchDeleteBtn.addEventListener('click', async function() {
-                                     const checkedBoxes = document.querySelectorAll('.session-checkbox:checked');
-                                     if (checkedBoxes.length === 0) return;
-                                     
-                                     if (!confirm(`确定要删除选中的 ${checkedBoxes.length} 个会话吗？此操作不可恢复。`)) {
-                                         return;
-                                     }
-                                     
-                                     const sessionIds = Array.from(checkedBoxes).map(cb => {
-                                         return cb.closest('.chat-session').getAttribute('data-id');
-                                     });
-                                     
-                                     try {
-                                         // 调用批量删除API
-                                         const response = await fetch('/5000/api/chat/sessions/batch-delete', {
-                                             method: 'POST',
-                                             headers: {
-                                                 'Content-Type': 'application/json',
-                                                 'Authorization': `Bearer ${window.userToken}`
-                                             },
-                                             body: JSON.stringify({ session_ids: sessionIds })
-                                         });
-                                         
-                                         if (!response.ok) {
-                                             throw new Error(`批量删除失败: ${response.status}`);
-                                         }
-                                         
-                                         const data = await response.json();
-                                         console.log('批量删除成功:', data);
-                                         showToast(`成功删除 ${sessionIds.length} 个会话`, 'success');
-                                         
-                                         // 刷新会话列表
-                                         getList(getUserId());
-                                     } catch (error) {
-                                         console.error('批量删除失败:', error);
-                                         showToast(`批量删除失败: ${error.message}`, 'error');
-                                     }
-                                 });
-                             }
-                         }
-                         
+                            batchDeleteBtn.addEventListener('click', async function() {
+                                const checkedBoxes = document.querySelectorAll('.session-checkbox:checked');
+                                if (checkedBoxes.length === 0) return;
+
+                                if (!confirm(`确定要删除选中的 ${checkedBoxes.length} 个会话吗？此操作不可恢复。`)) {
+                                    return;
+                                }
+
+                                const sessionIds = Array.from(checkedBoxes).map(cb => {
+                                    return cb.closest('.chat-session').getAttribute('data-id');
+                                });
+
+                                try {
+                                    // 调用批量删除API
+                                    const response = await fetch('/5000/api/chat/sessions/batch-delete', {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json',
+                                            'Authorization': `Bearer ${window.userToken}`
+                                        },
+                                        body: JSON.stringify({ session_ids: sessionIds })
+                                    });
+
+                                    if (!response.ok) {
+                                        throw new Error(`删除失败: ${response.status}`);
+                                    }
+
+                                    const data = await response.json();
+                                    console.log('批量删除成功:', data);
+                                    showToast(`成功删除 ${sessionIds.length} 个会话`, 'success');
+
+                                    // 【关键修复】批量删除成功后，清空聊天区域显示欢迎页
+                                    // 注意：必须使用外层全局变量chatMessages和initialPrompt
+                                    // 因为切换会话时innerHTML=''会将initialPrompt从DOM移除，
+                                    // 此时getElementById返回null，但全局变量仍保持引用
+                                    console.log('[批量删除] 清空聊天区域，显示欢迎页');
+                                    chatMessages.innerHTML = '';
+                                    chatMessages.appendChild(initialPrompt);
+                                    initialPrompt.classList.remove('hidden');
+                                    initialPrompt.style.display = '';
+                                    // 重置当前会话ID（如果当前会话被删除）
+                                    if (window.currentSessionId && sessionIds.includes(window.currentSessionId)) {
+                                        console.log('[批量删除] 当前会话被删除，重置会话ID');
+                                        window.currentSessionId = null;
+                                        window.taskId = null;
+                                    }
+
+                                    // 【关键修复】设置标志，阻止checkPendingSessions自动加载会话
+                                    window.skipPendingSessionCheck = true;
+                                    // 刷新会话列表
+                                    getList(getUserId());
+                                } catch (error) {
+                                    console.error('批量删除失败:', error);
+                                    showToast(`删除失败: ${error.message}`, 'error');
+                                }
+                            });
+                        }
+                    }
+
                          // 检查是否有 pending 任务的会话，并自动加载
                          const checkPendingSessions = async () => {
                              // 在检测期间隐藏欢迎页面，避免闪烁
                              const initialPrompt = document.getElementById('initial-prompt');
+
+                             // 【关键修复】如果设置了跳过标志，则不自动加载会话，但要显示欢迎页
+                             if (window.skipPendingSessionCheck) {
+                                 console.log('[checkPendingSessions] 跳过自动加载（批量删除后），显示欢迎页');
+                                 window.skipPendingSessionCheck = false;
+                                 // 显示欢迎页
+                                 if (initialPrompt) {
+                                     initialPrompt.style.display = '';
+                                     initialPrompt.classList.remove('hidden');
+                                 }
+                                 return;
+                             }
+
+                             // 【关键修复】多窗口检测：如果有其他窗口已在运行，不自动加载pending会话
+                             // 避免第二个窗口打开时自动跳转到第一个窗口正在处理的会话
+                             if (hasOtherActiveWindows()) {
+                                 console.log('[checkPendingSessions] 检测到其他活跃窗口，跳过自动加载pending会话，显示欢迎页');
+                                 if (initialPrompt) {
+                                     initialPrompt.style.display = '';
+                                     initialPrompt.classList.remove('hidden');
+                                 }
+                                 return;
+                             }
+
+                             // 在检测期间隐藏欢迎页面，避免闪烁
                              if (initialPrompt) {
                                  initialPrompt.style.display = 'none';
                              }
@@ -1782,8 +1888,10 @@ function copyToClipboard(text, button) {
                              }
                          };
                          
-                         // 执行检查
-                         checkPendingSessions();
+                         // 仅在页面初始化时自动检查并加载pending会话，避免刷新列表时抢占当前会话
+                         if (autoLoadPendingSession) {
+                             checkPendingSessions();
+                         }
                     }
                 })
                 .catch(error => {
@@ -2499,8 +2607,10 @@ function copyToClipboard(text, button) {
                     return response.json();
                 })
                 .then(data => {
+                    // 先设置当前会话，确保列表刷新后不会错误选中其它会话
+                    window.currentSessionId = data.session_id;
                     // 创建成功后刷新会话列表
-                    // getList(userId)  // 【修复】注释掉，避免会话被重新排序到底部
+                    getList(userId, { autoLoadPendingSession: false })
                     resolve(data.session_id);
                 })
                 .catch(error => {
@@ -2626,7 +2736,8 @@ function copyToClipboard(text, button) {
             loadingDiv.className = 'mb-6 flex justify-start message-animation';
             // 使用30%阈值判断语言
             const _zhCount = (message.match(/[\u4e00-\u9fff]/g) || []).length;
-            const _hasChinese = _zhCount / Math.max(message.length, 1) > 0.3;
+            const _totalChars = message.trim().length;
+            const _hasChinese = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
             // 记录当前会话的占位引用，便于切回时重建
             window.pendingSessions = window.pendingSessions || {};
             window.pendingSessions[sessionId] = window.pendingSessions[sessionId] || { loading: true };
@@ -2980,16 +3091,23 @@ function copyToClipboard(text, button) {
                                                 if (chatFullResponse.trim()) {
                                                     document.querySelectorAll('[data-streaming="true"]').forEach(el => el.remove());
                                                     addMessage(chatFullResponse, 'ai');
-                                                    // 为搜索来源链接添加锚点ID
+                                                    // 为搜索来源链接添加锚点ID（通过DOM位置精确定位）
                                                     if (chatSearchResults.length > 0) {
                                                         const lastMsg = chatMessages.querySelector('.mb-6:last-child');
                                                         if (lastMsg) {
-                                                            const links = lastMsg.querySelectorAll('a[target="_blank"]');
-                                                            const sourceLinks = Array.from(links).slice(-chatSearchResults.length);
-                                                            sourceLinks.forEach((link, idx) => {
-                                                                const parentDiv = link.closest('div') || link.parentElement;
-                                                                if (parentDiv) parentDiv.id = `search-source-${idx + 1}`;
-                                                            });
+                                                            const headerStrong = Array.from(lastMsg.querySelectorAll('strong')).find(el => el.textContent.includes('搜索来源'));
+                                                            if (headerStrong) {
+                                                                let sourceIdx = 0;
+                                                                lastMsg.querySelectorAll('div.flex.items-start').forEach(div => {
+                                                                    if (headerStrong.compareDocumentPosition(div) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                                                        const link = div.querySelector('a[target="_blank"]');
+                                                                        if (link) {
+                                                                            sourceIdx++;
+                                                                            div.id = `search-source-${sourceIdx}`;
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 } else {
@@ -3012,8 +3130,9 @@ function copyToClipboard(text, button) {
                                         if (line.startsWith('data:')) {
                                             const data = line.slice(5).trim();
                                             if (data === '[DONE]') {
+                                                // [DONE] 信号表示流结束，调用 processChatStream 将会读取到 done: true
                                                 processChatStream();
-                                                return;
+                                                return; // 立即返回，不再处理此chunk中的其他行
                                             }
                                             
                                             try {
@@ -3051,7 +3170,6 @@ function copyToClipboard(text, button) {
                                             }
                                         }
                                     }
-                                    processChatStream();
                                 }).catch(error => {
                                     console.error('[Chat流式] 处理错误:', error);
                                     
@@ -3179,8 +3297,18 @@ function copyToClipboard(text, button) {
                             window.pendingSessions[window.currentSessionId].loading = false;
                             window.pendingSessions[window.currentSessionId].spinner = null;
                         }
+                        // 清除排队状态（如果有）
+                        if (window.sessionQueueStatus && window.sessionQueueStatus[currentSessionId]) {
+                            if (window.sessionQueueStatus[currentSessionId].pollInterval) {
+                                clearInterval(window.sessionQueueStatus[currentSessionId].pollInterval);
+                            }
+                            delete window.sessionQueueStatus[currentSessionId];
+                        }
                         // 2. 关闭SSE连接
                         if (window.sessionEventSources && window.sessionEventSources[currentSessionId]) {
+                            // 【关键修复】标记为主动关闭，防止onerror处理器误报"连接已断开"
+                            window.intentionallyClosedSSE = window.intentionallyClosedSSE || new Set();
+                            window.intentionallyClosedSSE.add(currentSessionId);
                             window.sessionEventSources[currentSessionId].close();
                             delete window.sessionEventSources[currentSessionId];
                             console.log('[Cancel] SSE连接已关闭:', currentSessionId);
@@ -3202,33 +3330,36 @@ function copyToClipboard(text, button) {
                                 submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
                             }
                         }
-                        // 5. 移除loading元素和队列状态UI
+                        // 5. 移除loading元素和显示中断提示（仅当当前会话仍是被取消的会话时）
                         const chatMessages = document.getElementById('chat-messages');
-                        try { 
-                            document.querySelectorAll('.pending-spinner').forEach(el => el.remove());
-                            // 也移除可能存在的其他loading元素
-                            chatMessages.querySelectorAll('.message-animation').forEach(el => {
-                                if(el.querySelector('.fa-spinner')) {
-                                    el.remove();
-                                }
-                            });
-                            // 移除队列状态显示（如果有）
-                            const queueStatusEl = document.getElementById(`queue-status-${taskId}`);
-                            if (queueStatusEl) queueStatusEl.remove();
-                        } catch (e) { 
-                            console.warn('移除loading元素失败', e); 
+                        if (currentSessionId == window.currentSessionId) {
+                            try {
+                                document.querySelectorAll('.pending-spinner').forEach(el => el.remove());
+                                chatMessages.querySelectorAll('.message-animation').forEach(el => {
+                                    if(el.querySelector('.fa-spinner')) {
+                                        el.remove();
+                                    }
+                                });
+                                // 移除队列状态显示（如果有）
+                                const queueStatusEl = document.getElementById(`queue-status-${taskId}`);
+                                if (queueStatusEl) queueStatusEl.remove();
+                            } catch (e) {
+                                console.warn('移除loading元素失败', e);
+                            }
+
+                            // 在聊天区域显示中断提示
+                            const interruptMessage = document.createElement('div');
+                            interruptMessage.className = 'message-container flex items-start mb-6 message-animation';
+                            interruptMessage.innerHTML = `
+                                <div class="bg-gray-200 p-3 rounded-lg rounded-tl-none max-w-3xl">
+                                    <p class="text-gray-600 text-sm italic">${data.message}</p>
+                                </div>
+                            `;
+                            chatMessages.appendChild(interruptMessage);
+                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                        } else {
+                            console.log('[Cancel] 会话已切换，跳过DOM更新，被取消会话:', currentSessionId, '当前会话:', window.currentSessionId);
                         }
-                        
-                        // 5. 在聊天区域显示中断提示
-                        const interruptMessage = document.createElement('div');
-                        interruptMessage.className = 'message-container flex items-start mb-6 message-animation';
-                        interruptMessage.innerHTML = `
-                            <div class="bg-gray-200 p-3 rounded-lg rounded-tl-none max-w-3xl">
-                                <p class="text-gray-600 text-sm italic">${data.message}</p>
-                            </div>
-                        `;
-                        chatMessages.appendChild(interruptMessage);
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
                         
                         // 6. 将中断消息保存到数据库，确保切换会话后仍能显示
                         saveResultToDB(data.message, currentSessionId, 'ai');
@@ -3238,10 +3369,10 @@ function copyToClipboard(text, button) {
                         showToast(`操作失败: ${error.message}`, 'error', 3000);
                     })
                     .finally(() => {
-                                        // 恢复按钮状态（无论成功还是失败）
-                                        cancelButton.disabled = false;
-                                        cancelButton.innerHTML = originalHTML;
-                                    });
+                        // 恢复按钮状态（无论成功还是失败）
+                        cancelButton.disabled = false;
+                        cancelButton.innerHTML = originalHTML;
+                    });
             };
             
             // 添加事件监听器
@@ -3470,18 +3601,32 @@ function copyToClipboard(text, button) {
                                         chatMessages.appendChild(messageDiv);
                                         chatMessages.scrollTop = chatMessages.scrollHeight;
                                         
-                                        // 为搜索来源链接添加锚点ID
+                                        // 为搜索来源链接添加锚点ID（使用 setTimeout 确保 DOM 完全渲染）
                                         if (reasonerSearchResults.length > 0) {
-                                            const links = messageDiv.querySelectorAll('a[target="_blank"]');
-                                            const sourceLinks = Array.from(links).slice(-reasonerSearchResults.length);
-                                            sourceLinks.forEach((link, idx) => {
-                                                const parentDiv = link.closest('div') || link.parentElement;
-                                                if (parentDiv) parentDiv.id = `search-source-${idx + 1}`;
-                                            });
+                                            setTimeout(() => {
+                                                // 通过"搜索来源"标题的DOM位置精确定位搜索来源链接（避免主内容中的链接干扰）
+                                                const headerStrong = Array.from(messageDiv.querySelectorAll('strong')).find(el => el.textContent.includes('搜索来源'));
+                                                if (headerStrong) {
+                                                    let sourceIdx = 0;
+                                                    messageDiv.querySelectorAll('div.flex.items-start').forEach(div => {
+                                                        // 只处理在"搜索来源"标题之后的列表项
+                                                        if (headerStrong.compareDocumentPosition(div) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                                            const link = div.querySelector('a[target="_blank"]');
+                                                            if (link) {
+                                                                sourceIdx++;
+                                                                div.id = `search-source-${sourceIdx}`;
+                                                                console.log(`[Reasoner锚点] 设置锚点ID: search-source-${sourceIdx} (在列表项div上)`);
+                                                            }
+                                                        }
+                                                    });
+                                                    console.log('[Reasoner锚点] 共设置', sourceIdx, '个搜索来源锚点');
+                                                } else {
+                                                    console.warn('[Reasoner锚点] 未找到"搜索来源"标题');
+                                                }
+                                            }, 100);
                                         }
                                         
-                                        // AI消息入库 - reasoner 模式分别保存推理过程和主要内容
-                                        saveResultToDB(fullResponse || '', sessionId, 'ai', '', 0, reasoningContent);
+                                        // 后端已自动保存AI回复，前端不再重复保存（与chat模式一致）
                                     } else {
                                         addMessage('抱歉，未能获取有效的回复。', 'ai');
                                     }
@@ -3692,7 +3837,8 @@ function copyToClipboard(text, button) {
                     websearch: selectedValues.includes('websearch'),
                     pubmed: selectedValues.includes('pubmed'),
                     arxiv: selectedValues.includes('arxiv'),
-                    google_scholar: selectedValues.includes('google_scholar')
+                    google_scholar: selectedValues.includes('google_scholar'),
+                    scihub: selectedValues.includes('scihub')
                 };
                 
                 const requestBody = {
@@ -3740,6 +3886,11 @@ function copyToClipboard(text, button) {
                     window.sessionEventSources[sessionId] = eventSource;
                     eventSource.onopen = () => {
                         console.log('[DeepDiver] SSE连接已建立, timestamp:', Date.now());
+                        // 检查任务是否已被取消，如果已取消则不显示等待消息
+                        if (!window.sessionEventSources || !window.sessionEventSources[sessionId]) {
+                            console.log('[DeepDiver] SSE连接已建立但任务已取消，跳过显示等待消息');
+                            return;
+                        }
                         const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
                         if (statusSpan) {
                             // 使用30%阈值判断语言
@@ -3754,13 +3905,13 @@ function copyToClipboard(text, button) {
                     try {
                         const data = JSON.parse(event.data);
                         console.log('[SSE] 接收到进度消息:', data);
-                        
+
                         // 【关键修复】验证当前会话ID，防止切换会话时进度消息插入到错误的会话中
                         if (window.currentSessionId !== sessionId) {
                             console.log(`[SSE] 会话ID不匹配，忽略消息。当前会话: ${window.currentSessionId}, 消息来源会话: ${sessionId}`);
                             return;
                         }
-                        
+
                         if (data.type === 'progress') {
                             const timeline = document.getElementById(`progress-timeline-${taskId}`);
                             if (!timeline) return;
@@ -3790,40 +3941,52 @@ function copyToClipboard(text, button) {
                             console.log('[SSE] 任务完成');
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
-                            if (progressContainer && progressContainer.parentNode) {
-                                progressContainer.remove();
+                            // 【关键修复】清理SessionList和sessionTasks，防止切换会话时误判任务仍在运行
+                            window.SessionList = (window.SessionList || []).filter(item => item.id !== sessionId);
+                            if (window.sessionTasks) delete window.sessionTasks[sessionId];
+                            // 【关键修复】只有当前显示的会话才更新UI，防止后台会话SSE事件污染当前显示
+                            if (window.currentSessionId === sessionId) {
+                                if (progressContainer && progressContainer.parentNode) {
+                                    progressContainer.remove();
+                                }
+                                submitButton.disabled = false;
+                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                document.getElementById('cancel-button').classList.add('hidden');
+                                loadSessionMessages(sessionId).catch(error => {
+                                    console.error('[SSE] 加载消息失败:', error);
+                                });
                             }
-                            // 重置UI状态
-                            submitButton.disabled = false;
-                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                            document.getElementById('cancel-button').classList.add('hidden');
-                            loadSessionMessages(sessionId).catch(error => {
-                                console.error('[SSE] 加载消息失败:', error);
-                            });
                         } else if (data.type === 'error') {
-                            const timeline = document.getElementById(`progress-timeline-${taskId}`);
-                            const errorItem = document.createElement('div');
-                            errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
-                            errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '错误' : 'Error'}: ${data.message}</span>`;
-                            if (timeline) timeline.appendChild(errorItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
-                            // 重置UI状态
-                            submitButton.disabled = false;
-                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                            document.getElementById('cancel-button').classList.add('hidden');
+                            // 【关键修复】只有当前显示的会话才更新UI
+                            if (window.currentSessionId === sessionId) {
+                                const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                                const errorItem = document.createElement('div');
+                                errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
+                                errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '错误' : 'Error'}: ${data.message}</span>`;
+                                if (timeline) timeline.appendChild(errorItem);
+                                submitButton.disabled = false;
+                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                document.getElementById('cancel-button').classList.add('hidden');
+                            }
                         } else if (data.type === 'cancelled') {
-                            const timeline = document.getElementById(`progress-timeline-${taskId}`);
-                            const cancelledItem = document.createElement('div');
-                            cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
-                            cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '任务已取消' : 'Task cancelled'}</span>`;
-                            if (timeline) timeline.appendChild(cancelledItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
-                            // 重置UI状态
-                            submitButton.disabled = false;
-                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                            document.getElementById('cancel-button').classList.add('hidden');
+                            // 【关键修复】清理SessionList和sessionTasks
+                            window.SessionList = (window.SessionList || []).filter(item => item.id !== sessionId);
+                            if (window.sessionTasks) delete window.sessionTasks[sessionId];
+                            // 【关键修复】只有当前显示的会话才更新UI
+                            if (window.currentSessionId === sessionId) {
+                                const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                                const cancelledItem = document.createElement('div');
+                                cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
+                                cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '任务已取消' : 'Task cancelled'}</span>`;
+                                if (timeline) timeline.appendChild(cancelledItem);
+                                submitButton.disabled = false;
+                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                document.getElementById('cancel-button').classList.add('hidden');
+                            }
                         }
                     } catch (e) {
                         console.error('[SSE] 解析进度消息失败:', e, event.data);
@@ -3922,122 +4085,8 @@ function copyToClipboard(text, button) {
                             if (progressContainer && progressContainer.parentNode) {
                                 progressContainer.remove();
                             }
-                            // 创建队列状态显示
-                            const queueDiv = document.createElement('div');
-                            queueDiv.className = 'mb-6 flex justify-start message-animation';
-                            queueDiv.id = `queue-status-${taskId}`;
-                            queueDiv.innerHTML = `
-                                <div class="flex items-start max-w-[80%]">
-                                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                    <div class="bg-blue-50 border-l-4 border-blue-500 text-gray-800 p-4 rounded-lg shadow-sm w-full">
-                                        <div class="flex items-center justify-between mb-2">
-                                            <div class="flex items-center">
-                                                <i class="fa fa-clock-o mr-2 text-blue-500"></i>
-                                                <span class="font-semibold text-blue-700">任务队列状态</span>
-                                            </div>
-                                            <button id="cancel-queue-${taskId}" class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200">
-                                                <i class="fa fa-times mr-1"></i>取消任务
-                                            </button>
-                                        </div>
-                                        <div class="text-sm space-y-1">
-                                            <div class="flex items-center">
-                                                <span class="text-gray-600">队列状态：</span>
-                                                <span class="ml-2 px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">运行中 <span id="running-${taskId}">-</span></span>
-                                                <span class="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">处理中 <span id="queued-${taskId}">-</span></span>
-                                            </div>
-                                            <div class="flex items-center mt-2">
-                                                <span class="text-gray-600">当前位置：第</span>
-                                                <span class="ml-1 text-lg font-bold text-blue-600" id="position-${taskId}">-</span>
-                                                <span class="text-gray-600">位</span>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            `;
-                            chatMessages.appendChild(queueDiv);
-                            chatMessages.scrollTop = chatMessages.scrollHeight;
-                            // 提前声明轮询变量和取消标志
-                            let queuePollInterval = null;
-                            let isQueueCancelled = false;
-                            // 队列取消按钮
-                            const queueCancelBtn = document.getElementById(`cancel-queue-${taskId}`);
-                            queueCancelBtn.addEventListener('click', async () => {
-                                try {
-                                    // 立即标记为已取消，防止轮询触发reconnectSSE
-                                    isQueueCancelled = true;
-                                    // 【关键修复】标记会话为已取消，防止has_pending_task竞态
-                                    window.cancelledSessions = window.cancelledSessions || {};
-                                    window.cancelledSessions[sessionId] = Date.now();
-                                    const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ reason: '用户主动取消排队任务' })
-                                    });
-                                    const cancelData = await cancelResponse.json();
-                                    console.log('队列任务取消成功:', cancelData);
-                                    // 停止轮询
-                                    if (queuePollInterval) {
-                                        clearInterval(queuePollInterval);
-                                        queuePollInterval = null;
-                                    }
-                                    queueDiv.remove();
-                                    if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) delete window.sessionTasks[sessionId];
-                                    const cancelMsgDiv = document.createElement('div');
-                                    cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
-                                    cancelMsgDiv.innerHTML = `<div class="flex items-start max-w-[80%]"><img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover"><div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm"><p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p></div></div>`;
-                                    chatMessages.appendChild(cancelMsgDiv);
-                                    chatMessages.scrollTop = chatMessages.scrollHeight;
-                                    saveResultToDB(cancelData.message, sessionId, 'ai');
-                                    submitButton.disabled = false;
-                                    submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                                    document.getElementById('cancel-button').classList.add('hidden');
-                                } catch (error) {
-                                    console.error('取消队列任务失败:', error);
-                                    showToast('取消任务失败，请重试', 'error');
-                                }
-                            });
-                            // 轮询队列状态
-                            queuePollInterval = setInterval(async () => {
-                                // 如果任务已被取消，停止轮询
-                                if (isQueueCancelled) {
-                                    clearInterval(queuePollInterval);
-                                    return;
-                                }
-                                try {
-                                    const queueResp = await fetch('/8000/api/queue/status');
-                                    const queueData = await queueResp.json();
-                                    // 再次检查取消标志（fetch期间可能已取消）
-                                    if (isQueueCancelled) {
-                                        clearInterval(queuePollInterval);
-                                        return;
-                                    }
-                                    const runningEl = document.getElementById(`running-${taskId}`);
-                                    const queuedEl = document.getElementById(`queued-${taskId}`);
-                                    if (runningEl) runningEl.textContent = queueData.running_count;
-                                    if (queuedEl) queuedEl.textContent = queueData.queued_count;
-                                    const myTask = queueData.queued_tasks.find(t => t.task_id === taskId);
-                                    if (myTask) {
-                                        const posEl = document.getElementById(`position-${taskId}`);
-                                        if (posEl) posEl.textContent = myTask.position;
-                                    } else {
-                                        // 任务不在队列中，检查是否已被取消
-                                        const _queueCancelledByUser = window.cancelledSessions && window.cancelledSessions[sessionId]
-                                            && (Date.now() - window.cancelledSessions[sessionId]) < 120000;
-                                        if (isQueueCancelled || _queueCancelledByUser) {
-                                            console.log('[队列轮询] 任务已取消，停止轮询:', taskId);
-                                            clearInterval(queuePollInterval);
-                                            return;
-                                        }
-                                        // 任务已开始执行，停止队列轮询，重新建立SSE连接
-                                        clearInterval(queuePollInterval);
-                                        queueDiv.remove();
-                                        // 重新建立SSE连接监听进度
-                                        reconnectSSE(taskId, sessionId);
-                                    }
-                                } catch (err) {
-                                    console.error('队列状态轮询失败:', err);
-                                }
-                            }, 3000);
+                            // 统一使用全局排队状态管理，确保切换会话后可恢复排队UI
+                            showQueueStatus(taskId, sessionId);
                             return;
                         }
                         // 检查是否为任务已接受响应（异步模式，POST立即返回）
@@ -4837,6 +4886,63 @@ function copyToClipboard(text, button) {
             messageDiv.appendChild(messageBubble);
             chatMessages.appendChild(messageDiv);
             
+            // 为搜索来源链接添加锚点ID（AI消息且包含"搜索来源："标题）
+            if (sender === 'ai' && text.includes('**搜索来源：**')) {
+                setTimeout(() => {
+                    // 生成唯一的消息ID前缀（使用消息在页面中的索引）
+                    const allAiMessages = chatMessages.querySelectorAll('.mb-6.flex.justify-start');
+                    const messageIndex = Array.from(allAiMessages).indexOf(messageDiv);
+                    const uniquePrefix = `msg${messageIndex}`;
+
+                    // 查找所有链接
+                    const allLinks = messageDiv.querySelectorAll('a[target="_blank"]');
+                    if (allLinks.length > 0) {
+                        // 查找"搜索来源："标题的位置
+                        const searchSourceHeader = Array.from(messageDiv.querySelectorAll('strong')).find(el => el.textContent.includes('搜索来源'));
+                        if (searchSourceHeader) {
+                            // 找到"搜索来源："之后的所有链接（通过DOM位置精确定位）
+                            const sourceLinks = [];
+                            messageDiv.querySelectorAll('div.flex.items-start').forEach(div => {
+                                // 只处理在"搜索来源"标题之后的列表项
+                                if (searchSourceHeader.compareDocumentPosition(div) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                    const link = div.querySelector('a[target="_blank"]');
+                                    if (link) sourceLinks.push(link);
+                                }
+                            });
+
+                            console.log(`[addMessage锚点] 消息${messageIndex}找到 ${sourceLinks.length} 个搜索来源链接`);
+
+                            // 为搜索来源链接设置唯一的锚点ID
+                            sourceLinks.forEach((link, idx) => {
+                                const listItemDiv = link.closest('div.flex.items-start');
+                                if (listItemDiv) {
+                                    listItemDiv.id = `search-source-${uniquePrefix}-${idx + 1}`;
+                                    console.log(`[addMessage锚点] 设置锚点ID: search-source-${uniquePrefix}-${idx + 1}`);
+                                }
+                            });
+
+                            // 更新该消息中所有引用标注的跳转目标
+                            messageDiv.querySelectorAll('.citation-ref').forEach(citation => {
+                                const refNum = citation.getAttribute('data-ref');
+                                if (refNum) {
+                                    // 更新onclick事件，使用新的锚点ID
+                                    citation.onclick = function(e) {
+                                        const src = document.getElementById(`search-source-${uniquePrefix}-${refNum}`);
+                                        if (src) {
+                                            src.scrollIntoView({behavior:'smooth',block:'center'});
+                                            src.style.transition='background 0.3s';
+                                            src.style.background='#fef3c7';
+                                            setTimeout(function(){src.style.background='';},2000);
+                                        }
+                                        e.stopPropagation();
+                                    };
+                                }
+                            });
+                        }
+                    }
+                }, 100);
+            }
+
             // 滚动到底部
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
@@ -4862,6 +4968,11 @@ function copyToClipboard(text, button) {
             })
             .then(response => response.json())
             .then(data => {
+                // 【关键修复】过期检查：如果用户已切换到其他会话，丢弃此响应
+                if (window.currentSessionId !== sessionId) {
+                    console.log('[重新加载] 响应已过期，丢弃. 请求会话:', sessionId, '当前会话:', window.currentSessionId);
+                    return;
+                }
                 // 只保存有活跃SSE连接的进度容器
                 const progressContainers = chatMessages.querySelectorAll('[data-progress-container]');
                 const savedContainers = [];
@@ -4880,7 +4991,19 @@ function copyToClipboard(text, button) {
                 chatMessages.innerHTML = '';
                 if (data.messages && data.messages.length > 0) {
                     data.messages.forEach(item => {
-                        const thinkMsg = (item.has_report === 0 && item.think_msg) ? item.think_msg : '';
+                        // 只对 AI 消息传递 think_msg，并过滤掉模式名称
+                        let thinkMsg = '';
+                        console.log('[loadSessionMessages] 原始数据:', item.from_who, 'has_report:', item.has_report, 'think_msg类型:', typeof item.think_msg, 'think_msg长度:', item.think_msg ? String(item.think_msg).length : 0, 'think_msg前50字:', item.think_msg ? String(item.think_msg).substring(0, 50) : 'null/empty');
+                        if (item.from_who === 'ai' && item.has_report === 0 && item.think_msg && typeof item.think_msg === 'string') {
+                            // 过滤掉模式名称（chat, reasoner, deepdiver）
+                            const modeNames = ['chat', 'reasoner', 'deepdiver'];
+                            if (!modeNames.includes(item.think_msg.trim().toLowerCase())) {
+                                thinkMsg = item.think_msg;
+                                console.log('[loadSessionMessages] 传递thinkMsg, 长度:', thinkMsg.length);
+                            } else {
+                                console.log('[loadSessionMessages] 被模式名称过滤:', item.think_msg.trim());
+                            }
+                        }
                         addMessage(item.content, item.from_who, item.uuid, item.has_report, thinkMsg);
                     });
                 }
@@ -4959,9 +5082,16 @@ function copyToClipboard(text, button) {
                     </div>
                 `;
 
-                // 添加到会话列表顶部（标题之后）
+                // 添加到会话列表之首
+                // 【修复】多选模式下要考虑batch-toolbar的存在
                 const headerEl = chatHistory.querySelector('.chat-history-header');
-                if (headerEl && headerEl.nextSibling) {
+                const batchToolbar = document.getElementById('batch-toolbar');
+
+                if (batchToolbar && !batchToolbar.classList.contains('hidden')) {
+                    // 多选模式激活：插入到batch-toolbar之后
+                    chatHistory.insertBefore(newSession, batchToolbar.nextSibling);
+                } else if (headerEl && headerEl.nextSibling) {
+                    // 正常模式：插入到header之后（跳过batch-toolbar即使存在但隐藏）
                     chatHistory.insertBefore(newSession, headerEl.nextSibling);
                 } else if (headerEl) {
                     chatHistory.appendChild(newSession);
@@ -5038,6 +5168,7 @@ function copyToClipboard(text, button) {
 
                 // 检查该会话是否有正在进行的任务
                 let hasPendingTask = false;
+                window.taskId = null;
                 window.SessionList.forEach((item,index)=>{
                     console.log(item)
                     if(sessionId==item.id&&item.type==false){
@@ -5047,6 +5178,10 @@ function copyToClipboard(text, button) {
                         hasPendingTask = true;
                     }
                 })
+                if (!hasPendingTask && window.sessionTasks && window.sessionTasks[sessionId]) {
+                    window.taskId = window.sessionTasks[sessionId];
+                    hasPendingTask = true;
+                }
 
                 // 【修复】先重置UI状态为正常，等后端返回实际状态后再更新
                 // 这样可以避免简单问题已完成但仍显示加载状态的问题
@@ -5069,7 +5204,29 @@ function copyToClipboard(text, button) {
                             return response.json();
                         })
                         .then(data => {
-                            // 隐藏初始提示
+                            // 【核心修复】过期检查：如果用户已切换到其他会话，丢弃此响应
+                            // 这是导致跨会话内容污染的根本原因——快速切换会话时，
+                            // 旧会话的fetch可能后完成，覆盖当前会话的显示内容
+                            if (window.currentSessionId !== sessionId) {
+                                console.log('[切换会话] 响应已过期，丢弃. 请求会话:', sessionId, '当前会话:', window.currentSessionId);
+                                return;
+                            }
+                            // 只保存有活跃SSE连接的进度容器
+                            const progressContainers = chatMessages.querySelectorAll('[data-progress-container]');
+                            const savedContainers = [];
+                            const hasActiveSSE = window.sessionEventSources && window.sessionEventSources[sessionId];
+                            if (hasActiveSSE) {
+                                progressContainers.forEach(container => {
+                                    savedContainers.push({
+                                        element: container.cloneNode(true),
+                                        taskId: container.getAttribute('data-progress-container')
+                                    });
+                                });
+                                console.log(`[切换会话] 保存了会话 ${sessionId} 的 ${progressContainers.length} 个进度容器`);
+                            } else {
+                                console.log(`[切换会话] 跳过保存进度容器（无活跃SSE）`);
+                            }
+                            chatMessages.innerHTML = '';
                             if (data.messages && data.messages.length > 0) {
                                 initialPrompt.classList.add('hidden');
                                 
@@ -5078,8 +5235,19 @@ function copyToClipboard(text, button) {
                                 const totalMessages = data.messages.length;
                                 
                                 data.messages.forEach(item => {
-                                    // 如果有 think_msg 字段，传递给 addMessage 显示推理过程
-                                    const thinkMsg = (item.has_report === 0 && item.think_msg) ? item.think_msg : '';
+                                    // 只对 AI 消息传递 think_msg，并过滤掉模式名称
+                                    let thinkMsg = '';
+                                    console.log('[切换会话] 原始数据:', item.from_who, 'has_report:', item.has_report, 'think_msg类型:', typeof item.think_msg, 'think_msg长度:', item.think_msg ? String(item.think_msg).length : 0, 'think_msg前50字:', item.think_msg ? String(item.think_msg).substring(0, 50) : 'null/empty');
+                                    if (item.from_who === 'ai' && item.has_report === 0 && item.think_msg && typeof item.think_msg === 'string') {
+                                        // 过滤掉模式名称（chat, reasoner, deepdiver）
+                                        const modeNames = ['chat', 'reasoner', 'deepdiver'];
+                                        if (!modeNames.includes(item.think_msg.trim().toLowerCase())) {
+                                            thinkMsg = item.think_msg;
+                                            console.log('[切换会话] 传递thinkMsg, 长度:', thinkMsg.length);
+                                        } else {
+                                            console.log('[切换会话] 被模式名称过滤:', item.think_msg.trim());
+                                        }
+                                    }
                                     addMessage(item.content, item.from_who, item.uuid, item.has_report, thinkMsg);
                                     messagesLoaded++;
                                     
@@ -5087,6 +5255,11 @@ function copyToClipboard(text, button) {
                                     if (messagesLoaded === totalMessages) {
                                         // 使用setTimeout确保DOM已更新
                                         setTimeout(() => {
+                                            // 【关键修复】setTimeout中再次检查会话是否已切换
+                                            if (window.currentSessionId !== sessionId) {
+                                                console.log('[切换会话] setTimeout执行时会话已切换，跳过. 请求会话:', sessionId, '当前会话:', window.currentSessionId);
+                                                return;
+                                            }
                                             chatMessages.scrollTop = chatMessages.scrollHeight;
                                             scrollToBottomBtn.classList.remove('visible');
                                             
@@ -5097,8 +5270,34 @@ function copyToClipboard(text, button) {
                                                 const _isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId]
                                                     && (Date.now() - window.cancelledSessions[sessionId]) < 120000;
                                                 console.log('[诊断-路径3] loadSessionMessages检查pending:', 'has_pending_task=', data.has_pending_task, 'has_spinner=', !!chatMessages.querySelector('.pending-spinner'), 'isCancelled=', !!_isCancelledSession, 'sessionId:', sessionId, 'cancelledSessions:', JSON.stringify(window.cancelledSessions || {}));
+                                                // 【关键修复】同步后端任务状态：如果后端说没有pending task，清除前端的sessionTasks
+                                                if (!data.has_pending_task && window.sessionTasks && window.sessionTasks[sessionId]) {
+                                                    console.log(`[任务状态同步] 后端返回无待处理任务，清除前端sessionTasks[${sessionId}]`);
+                                                    delete window.sessionTasks[sessionId];
+                                                }
+                                                // 【关键修复】后端确认无待处理任务时，同步清理SessionList和UI状态
+                                                if (!data.has_pending_task) {
+                                                    window.SessionList = (window.SessionList || []).filter(item => item.id !== sessionId);
+                                                    document.getElementById('cancel-button').classList.add('hidden');
+                                                    submitButton.disabled = false;
+                                                    submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                                }
+
                                                 if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner') && !_isCancelledSession) {
                                                     const queryModel = data.pending_mode || 'chat';
+                                                    // 【关键修复】使用sessionTasks而不是全局taskId，避免误判任务状态
+                                                    const currentTaskId = (window.sessionTasks && window.sessionTasks[sessionId]) || window.taskId;
+
+                                                    // 【关键修复】优先检查该会话是否在排队中（不论是否有currentTaskId）
+                                                    if (window.sessionQueueStatus && window.sessionQueueStatus[sessionId] && window.sessionQueueStatus[sessionId].queued) {
+                                                        const queueTaskId = currentTaskId || window.sessionQueueStatus[sessionId].taskId;
+                                                        if (queueTaskId) {
+                                                            console.log('[切换会话] 检测到会话在排队中，恢复排队状态UI, taskId:', queueTaskId);
+                                                            showQueueStatus(queueTaskId, sessionId);
+                                                            return;
+                                                        }
+                                                    }
+
                                                     // 如果有 taskID 且是 DeepDiver 模式，直接使用 SSE，跳过静态提示和轮询
                                                     if (window.taskId && queryModel === 'deepdiver') {
                                                         // 检查是否需要重连SSE（切换会话时设置的标志）
@@ -5283,13 +5482,13 @@ function copyToClipboard(text, button) {
                             console.error('加载会话消息失败：', error);
                             // 网络错误或加载失败时，只在界面显示临时提示，不写入数据库
                             // 避免将错误信息污染会话历史
-                            const errorMsg = error.message === 'Failed to fetch' 
+                            const errorMsg = error.message === 'Failed to fetch'
                                 ? '网络连接失败，无法加载会话历史。请检查网络连接后刷新页面重试。'
                                 : `加载会话消息失败：${error.message || error}`;
-                            
+
                             // 只显示在界面，不保存到数据库
                             addMessage(errorMsg, 'ai');
-                            
+
                             // 可选：显示重试按钮
                             console.warn('会话加载失败，用户可刷新页面重试');
                         });
@@ -7131,9 +7330,197 @@ function copyToClipboard(text, button) {
                 notification.remove();
             });
         }
+        // 全局排队状态管理
+        window.sessionQueueStatus = window.sessionQueueStatus || {};
+
+        // 显示排队状态UI并启动轮询（可复用函数）
+        function showQueueStatus(taskId, sessionId) {
+            console.log('[排队状态] 显示排队UI, taskId:', taskId, 'sessionId:', sessionId);
+
+            // 清除该会话之前的排队轮询（如果有）
+            if (window.sessionQueueStatus[sessionId] && window.sessionQueueStatus[sessionId].pollInterval) {
+                clearInterval(window.sessionQueueStatus[sessionId].pollInterval);
+            }
+
+            // 保存排队状态到全局变量
+            window.sessionQueueStatus[sessionId] = { taskId: taskId, queued: true };
+
+            // 如果已存在同一任务的排队UI，先移除
+            const existingQueueDiv = document.getElementById(`queue-status-${taskId}`);
+            if (existingQueueDiv) existingQueueDiv.remove();
+
+            // 创建队列状态显示
+            const queueDiv = document.createElement('div');
+            queueDiv.className = 'mb-6 flex justify-start message-animation';
+            queueDiv.id = `queue-status-${taskId}`;
+            queueDiv.innerHTML = `
+                <div class="flex items-start max-w-[80%]">
+                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                    <div class="bg-blue-50 border-l-4 border-blue-500 text-gray-800 p-4 rounded-lg shadow-sm w-full">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center">
+                                <i class="fa fa-clock-o mr-2 text-blue-500"></i>
+                                <span class="font-semibold text-blue-700">任务队列状态</span>
+                            </div>
+                            <button id="cancel-queue-${taskId}" class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200">
+                                <i class="fa fa-times mr-1"></i>取消任务
+                            </button>
+                        </div>
+                        <div class="text-sm space-y-1">
+                            <div class="flex items-center">
+                                <span class="text-gray-600">队列状态：</span>
+                                <span class="ml-2 px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">运行中 <span id="running-${taskId}">-</span></span>
+                                <span class="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">处理中 <span id="queued-${taskId}">-</span></span>
+                            </div>
+                            <div class="flex items-center mt-2">
+                                <span class="text-gray-600">当前位置：第</span>
+                                <span class="ml-1 text-lg font-bold text-blue-600" id="position-${taskId}">-</span>
+                                <span class="text-gray-600">位</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            chatMessages.appendChild(queueDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+
+            // 取消标志
+            let isQueueCancelled = false;
+
+            // 队列取消按钮
+            const queueCancelBtn = document.getElementById(`cancel-queue-${taskId}`);
+            if (queueCancelBtn) {
+                queueCancelBtn.addEventListener('click', async () => {
+                    try {
+                        isQueueCancelled = true;
+                        // 标记会话为已取消，避免后端状态尚未落库时切换会话重新展示pending
+                        window.cancelledSessions = window.cancelledSessions || {};
+                        window.cancelledSessions[sessionId] = Date.now();
+                        const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ reason: '用户主动取消排队任务' })
+                        });
+                        const cancelData = await cancelResponse.json();
+                        console.log('队列任务取消成功:', cancelData);
+                        // 停止轮询
+                        if (window.sessionQueueStatus[sessionId] && window.sessionQueueStatus[sessionId].pollInterval) {
+                            clearInterval(window.sessionQueueStatus[sessionId].pollInterval);
+                        }
+                        // 清除排队状态
+                        delete window.sessionQueueStatus[sessionId];
+                        if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) delete window.sessionTasks[sessionId];
+                        // 从SessionList中移除该会话的pending标记
+                        if (window.SessionList) {
+                            for (var si = window.SessionList.length - 1; si >= 0; si--) {
+                                if (window.SessionList[si].id == sessionId) { window.SessionList.splice(si, 1); break; }
+                            }
+                        }
+                        // DOM操作：仅当当前可见会话是该会话时才更新UI
+                        if (window.currentSessionId == sessionId) {
+                            queueDiv.remove();
+                            var cancelMsgDiv = document.createElement('div');
+                            cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                            cancelMsgDiv.innerHTML = '<div class="flex items-start max-w-[80%]"><img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover"><div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm"><p class="text-sm"><i class="fa fa-info-circle mr-1"></i>' + cancelData.message + '</p></div></div>';
+                            chatMessages.appendChild(cancelMsgDiv);
+                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                            submitButton.disabled = false;
+                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            document.getElementById('cancel-button').classList.add('hidden');
+                        } else {
+                            console.log('[排队取消] 会话已切换，跳过DOM更新，被取消会话:', sessionId);
+                        }
+                        saveResultToDB(cancelData.message, sessionId, 'ai');
+                    } catch (error) {
+                        console.error('取消队列任务失败:', error);
+                        showToast('取消任务失败，请重试', 'error');
+                    }
+                });
+            }
+
+            // 轮询队列状态
+            const queuePollInterval = setInterval(async () => {
+                if (isQueueCancelled) {
+                    clearInterval(queuePollInterval);
+                    return;
+                }
+                try {
+                    const queueResp = await fetch('/8000/api/queue/status');
+                    const queueData = await queueResp.json();
+                    if (isQueueCancelled) {
+                        clearInterval(queuePollInterval);
+                        return;
+                    }
+                    // 更新UI（只有当前会话可见时才更新DOM）
+                    const runningEl = document.getElementById(`running-${taskId}`);
+                    const queuedEl = document.getElementById(`queued-${taskId}`);
+                    if (runningEl) runningEl.textContent = queueData.running_count;
+                    if (queuedEl) queuedEl.textContent = queueData.queued_count;
+                    const myTask = queueData.queued_tasks.find(t => t.task_id === taskId);
+                    if (myTask) {
+                        const posEl = document.getElementById(`position-${taskId}`);
+                        if (posEl) posEl.textContent = myTask.position;
+                    } else {
+                        if (isQueueCancelled) {
+                            clearInterval(queuePollInterval);
+                            return;
+                        }
+                        // 任务已开始执行，停止队列轮询，清除排队状态
+                        clearInterval(queuePollInterval);
+                        delete window.sessionQueueStatus[sessionId];
+                        // 仅当当前可见会话是该会话时才操作DOM和建立SSE
+                        if (window.currentSessionId == sessionId) {
+                            var queueDivToRemove = document.getElementById('queue-status-' + taskId);
+                            if (queueDivToRemove) queueDivToRemove.remove();
+                            reconnectSSE(taskId, sessionId);
+                        } else {
+                            console.log('[排队轮询] 任务已开始但会话不可见，标记需要重连SSE, sessionId:', sessionId);
+                            window.needReconnectSSE = true;
+                        }
+                    }
+                } catch (err) {
+                    console.error('队列状态轮询失败:', err);
+                    clearInterval(queuePollInterval);
+                    delete window.sessionQueueStatus[sessionId];
+                    if (window.currentSessionId == sessionId) {
+                        const queueStatusDiv = document.getElementById(`queue-status-${taskId}`);
+                        if (queueStatusDiv) {
+                            const statusContainer = queueStatusDiv.querySelector('.bg-blue-50');
+                            if (statusContainer) {
+                                statusContainer.className = 'bg-red-50 border-l-4 border-red-500 text-gray-800 p-4 rounded-lg shadow-sm w-full';
+                                statusContainer.innerHTML = `
+                                    <div class="flex items-center justify-between mb-2">
+                                        <div class="flex items-center">
+                                            <i class="fa fa-exclamation-circle mr-2 text-red-500"></i>
+                                            <span class="font-semibold text-red-700">连接已断开</span>
+                                        </div>
+                                    </div>
+                                    <div class="text-sm text-red-600">
+                                        无法连接到后端服务，请检查服务器是否正常运行。
+                                    </div>
+                                `;
+                            }
+                        }
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        document.getElementById('cancel-button').classList.add('hidden');
+                    }
+                }
+            }, 3000);
+
+            // 保存轮询引用到全局状态
+            window.sessionQueueStatus[sessionId].pollInterval = queuePollInterval;
+        }
+
         // 重新连接 SSE 以恢复进度显示（页面刷新后使用）
         function reconnectSSE(taskId, sessionId) {
             console.log('[SSE恢复] 重新连接 SSE，taskId:', taskId, 'sessionId:', sessionId);
+			
+			  // 【关键修复】入口检查：如果当前会话已切换，不应为非当前会话创建DOM元素
+            if (window.currentSessionId !== sessionId) {
+                console.log('[SSE恢复] 会话已切换，跳过重连SSE. 请求会话:', sessionId, '当前会话:', window.currentSessionId);
+                return;
+            }
             // 【关键修复】如果会话已被用户主动取消，不要重新连接SSE和显示spinner
             const _isCancelledSession = window.cancelledSessions && window.cancelledSessions[sessionId]
                 && (Date.now() - window.cancelledSessions[sessionId]) < 120000; // 2分钟内取消的
@@ -7141,6 +7528,7 @@ function copyToClipboard(text, button) {
                 console.log('[SSE恢复] 会话已被用户取消，跳过reconnectSSE:', sessionId);
                 return;
             }
+
             // 先关闭该会话已有的SSE连接，避免重复
             if (window.sessionEventSources && window.sessionEventSources[sessionId]) {
                 console.log('[SSE恢复] 关闭已有的SSE连接:', sessionId);
@@ -7250,13 +7638,13 @@ function copyToClipboard(text, button) {
                 try {
                     const data = JSON.parse(event.data);
                     console.log('[SSE恢复] 接收到进度消息:', data);
-                    
+
                     // 【关键修复】验证当前会话ID，防止切换会话时进度消息插入到错误的会话中
                     if (window.currentSessionId !== sessionId) {
                         console.log(`[SSE恢复] 会话ID不匹配，忽略消息。当前会话: ${window.currentSessionId}, 消息来源会话: ${sessionId}`);
                         return;
                     }
-                    
+
                     if (data.type === 'progress') {
                         const timeline = document.getElementById(`progress-timeline-${taskId}`);
                         if (!timeline) return;
@@ -7299,50 +7687,62 @@ function copyToClipboard(text, button) {
                         console.log('[SSE恢复] 任务完成');
                         eventSource.close();
                         delete window.sessionEventSources[sessionId];
-                        const cancelBtn = document.getElementById('cancel-button');
-                        if (cancelBtn) cancelBtn.classList.add('hidden');
-                        const submitBtn = document.querySelector('button[type="submit"]');
-                        if (submitBtn) {
-                            submitBtn.disabled = false;
-                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                        }
-                        if (progressContainer && progressContainer.parentNode) {
-                            progressContainer.remove();
+                        // 清除sessionTasks，避免切换回来时误认为任务还在运行
+                        if (window.sessionTasks && window.sessionTasks[sessionId]) {
+                            delete window.sessionTasks[sessionId];
+                            console.log(`[SSE恢复] 已清除会话 ${sessionId} 的taskId记录`);
                         }
                         window.SessionList = window.SessionList || [];
                         window.SessionList = window.SessionList.filter(item => !(item.id === sessionId && item.taskID === taskId));
+                        // 【关键修复】只有当前显示的会话才更新UI，防止后台会话SSE事件污染当前显示
                         if (window.currentSessionId === sessionId) {
+                            const cancelBtn = document.getElementById('cancel-button');
+                            if (cancelBtn) cancelBtn.classList.add('hidden');
+                            const submitBtn = document.querySelector('button[type="submit"]');
+                            if (submitBtn) {
+                                submitBtn.disabled = false;
+                                submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            }
+                            if (progressContainer && progressContainer.parentNode) {
+                                progressContainer.remove();
+                            }
                             loadSessionMessages(sessionId).catch(err => console.error('[SSE恢复] 加载消息失败:', err));
                         }
                     } else if (data.type === 'error') {
-                        const errorItem = document.createElement('div');
-                        errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
-                        errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message) ? '错误' : 'Error'}: ${data.message}</span>`;
-                        const errTimeline = document.getElementById(`progress-timeline-${taskId}`);
-                        if (errTimeline) errTimeline.appendChild(errorItem);
                         eventSource.close();
                         delete window.sessionEventSources[sessionId];
-                        const cancelBtn = document.getElementById('cancel-button');
-                        if (cancelBtn) cancelBtn.classList.add('hidden');
-                        const submitBtn = document.querySelector('button[type="submit"]');
-                        if (submitBtn) {
-                            submitBtn.disabled = false;
-                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        // 【关键修复】只有当前显示的会话才更新UI
+                        if (window.currentSessionId === sessionId) {
+                            const errorItem = document.createElement('div');
+                            errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
+                            errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message) ? '错误' : 'Error'}: ${data.message}</span>`;
+                            const errTimeline = document.getElementById(`progress-timeline-${taskId}`);
+                            if (errTimeline) errTimeline.appendChild(errorItem);
+                            const cancelBtn = document.getElementById('cancel-button');
+                            if (cancelBtn) cancelBtn.classList.add('hidden');
+                            const submitBtn = document.querySelector('button[type="submit"]');
+                            if (submitBtn) {
+                                submitBtn.disabled = false;
+                                submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            }
                         }
                     } else if (data.type === 'cancelled') {
-                        const cancelledItem = document.createElement('div');
-                        cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
-                        cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message || '') ? '任务已取消' : 'Task cancelled'}</span>`;
-                        const cancelTimeline = document.getElementById(`progress-timeline-${taskId}`);
-                        if (cancelTimeline) cancelTimeline.appendChild(cancelledItem);
                         eventSource.close();
                         delete window.sessionEventSources[sessionId];
-                        const cancelBtn = document.getElementById('cancel-button');
-                        if (cancelBtn) cancelBtn.classList.add('hidden');
-                        const submitBtn = document.querySelector('button[type="submit"]');
-                        if (submitBtn) {
-                            submitBtn.disabled = false;
-                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        // 【关键修复】只有当前显示的会话才更新UI
+                        if (window.currentSessionId === sessionId) {
+                            const cancelledItem = document.createElement('div');
+                            cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
+                            cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message || '') ? '任务已取消' : 'Task cancelled'}</span>`;
+                            const cancelTimeline = document.getElementById(`progress-timeline-${taskId}`);
+                            if (cancelTimeline) cancelTimeline.appendChild(cancelledItem);
+                            const cancelBtn = document.getElementById('cancel-button');
+                            if (cancelBtn) cancelBtn.classList.add('hidden');
+                            const submitBtn = document.querySelector('button[type="submit"]');
+                            if (submitBtn) {
+                                submitBtn.disabled = false;
+                                submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            }
                         }
                     }
                 } catch (e) {
@@ -7359,6 +7759,42 @@ function copyToClipboard(text, button) {
                 if (isCancelledSession) {
                     console.log('[SSE恢复] 会话已被用户取消，跳过onerror处理:', sessionId);
                     return;
+                }
+
+                // SSE恢复连接断开时，显示错误消息并移除加载提示
+                if (window.currentSessionId === sessionId) {
+                    // 移除进度容器
+                    if (progressContainer && progressContainer.parentNode) {
+                        progressContainer.remove();
+                    }
+                    // 移除加载提示
+                    try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                    
+                    // 检测用户消息语言
+                    const _lastUserMsg = document.querySelector('.chat-messages .mb-6:last-child .text-gray-800');
+                    let _isCn = true;
+                    if (_lastUserMsg && _lastUserMsg.textContent) {
+                        const _zhCount = (_lastUserMsg.textContent.match(/[\u4e00-\u9fff]/g) || []).length;
+                        const _totalChars = _lastUserMsg.textContent.trim().length;
+                        _isCn = (_zhCount / Math.max(_totalChars, 1)) > 0.3;
+                    }
+                    const errorMsg = _isCn 
+                        ? '抱歉，与后端服务的连接已断开。\n\n可能原因：\n1. 后端服务已停止\n2. 网络连接中断\n3. 服务器异常\n\n请检查后端服务状态后重试。'
+                        : 'Sorry, connection to backend service was lost.\n\nPossible reasons:\n1. Backend service stopped\n2. Network connection interrupted\n3. Server error\n\nPlease check backend service status and try again.';
+                    
+                    addMessage(errorMsg, 'ai');
+                    saveResultToDB(errorMsg, sessionId, "ai");
+                    
+                    // 重置UI状态
+                    const submitBtn = document.querySelector('button[type="submit"]');
+                    if (submitBtn) {
+                        submitBtn.disabled = false;
+                        submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                    }
+                    const cancelBtn = document.getElementById('cancel-button');
+                    if (cancelBtn) {
+                        cancelBtn.classList.add('hidden');
+                    }
                 }
             };
         }
