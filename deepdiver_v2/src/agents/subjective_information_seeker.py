@@ -59,7 +59,7 @@ class InformationSeekerAgent(BaseAgent):
         use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
-        use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'
+        # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
         # Get all available tools from MCP
         # Tool schemas have structure: {'type': 'function', 'function': {'name': '...', ...}}
@@ -76,7 +76,7 @@ class InformationSeekerAgent(BaseAgent):
             'websearch': ['batch_web_search', 'web_search'],
             'pubmed': ['pubmed', 'medrxiv'],
             'arxiv': ['arxiv'],
-            'springer': ['springer']
+            # 'springer': ['springer']  # DISABLED
         }
         
         # Dynamically filter tools based on environment variables
@@ -84,7 +84,7 @@ class InformationSeekerAgent(BaseAgent):
         disabled_tools = []
         
         # Log environment variable values for debugging
-        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}, Springer={use_springer}")
+        logger.info(f"[SEARCH_SOURCE_DEBUG] WebSearch={use_websearch}, PubMed={use_pubmed}, arXiv={use_arxiv}")
         logger.info(f"[SEARCH_SOURCE_DEBUG] Available tools from MCP: {available_tools}")
         
         for tool_name in available_tools:
@@ -98,12 +98,12 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
                 is_enabled = True
-            elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
-                is_enabled = True
-                logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched Springer pattern and is_enabled={is_enabled}")
+            # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
+            #     is_enabled = True
+            #     logger.info(f"[SEARCH_SOURCE_DEBUG] Tool '{tool_name}' matched Springer pattern and is_enabled={is_enabled}")
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['springer']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:
@@ -112,14 +112,59 @@ class InformationSeekerAgent(BaseAgent):
         logger.info(f"[SEARCH_SOURCE_DEBUG] Enabled tools: {enabled_tools}")
         logger.info(f"[SEARCH_SOURCE_DEBUG] Disabled tools: {disabled_tools}")
         
-        # Build search source guidance message
+        # Build search source guidance message with priority strategy
         search_source_guidance = ""
         if enabled_tools:
-            search_source_guidance = f"\n\n**📚 AVAILABLE SEARCH TOOLS:**\n"
-            search_source_guidance += f"You have access to the following search tools: **{', '.join(enabled_tools)}**\n"
-            search_source_guidance += f"These tools are fully functional and ready to use. Focus on using these tools effectively to gather comprehensive information.\n"
+            # Categorize tools by type
+            api_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['arxiv', 'pubmed', 'medrxiv'])]
+            web_tools = [t for t in enabled_tools if any(p in t.lower() for p in ['web_search', 'batch_web'])]
+            other_tools = [t for t in enabled_tools if t not in api_tools and t not in web_tools]
+            
+            search_source_guidance = f"\n\n**📚 SEARCH STRATEGY (按优先级使用):**\n\n"
+            
+            # Priority 1: Specialized Academic APIs
+            if api_tools:
+                search_source_guidance += f"**🥇 优先级 1 - 专有学术 API** (强烈推荐优先使用):\n"
+                for tool in api_tools:
+                    if 'arxiv' in tool.lower():
+                        search_source_guidance += f"  • **{tool}**: arXiv 预印本库（计算机科学、物理、数学等）\n"
+                        search_source_guidance += f"    ✅ 完整元数据 | ✅ 直接下载 PDF 全文 | ✅ 无访问限制 | ✅ 100% 学术内容\n"
+                    elif 'pubmed' in tool.lower():
+                        search_source_guidance += f"  • **{tool}**: PubMed 权威医学文献数据库\n"
+                        search_source_guidance += f"    ✅ MeSH 主题词标注 | ✅ 部分 PMC 全文 | ✅ 结构化元数据 | ✅ 医学权威来源\n"
+                    elif 'medrxiv' in tool.lower():
+                        search_source_guidance += f"  • **{tool}**: medRxiv 最新医学预印本\n"
+                        search_source_guidance += f"    ✅ 最新医学研究 | ✅ 直接下载 PDF | ✅ 按类别组织 | ✅ 快速发布\n"
+                    # elif 'springer' in tool.lower():
+                    #     search_source_guidance += f"  • **{tool}**: Springer Nature 期刊文章\n"
+                    #     search_source_guidance += f"    ✅ 高质量期刊 | ✅ 完整元数据 | ✅ DOI 标识\n"
+                search_source_guidance += f"\n"
+            
+            # Priority 2: Web Search
+            if web_tools:
+                search_source_guidance += f"**🥈 优先级 2 - 网页搜索** (补充使用):\n"
+                for tool in web_tools:
+                    search_source_guidance += f"  • **{tool}**: 通用网页搜索（已配置学术网站定向）\n"
+                    search_source_guidance += f"    ✅ 覆盖面广 | ✅ 多领域内容 | ⚠️ 部分内容可能受访问限制（成功率 ~89%）\n"
+                    search_source_guidance += f"    💡 适用场景: 工业应用、技术博客、新闻报道、非学术内容\n"
+                search_source_guidance += f"\n"
+            
+            # Recommended workflow
+            search_source_guidance += f"**💡 推荐工作流程**:\n"
+            if api_tools:
+                search_source_guidance += f"1. **首选**: 使用专有学术 API 获取核心学术文献\n"
+                search_source_guidance += f"   - 优势: 完整元数据、高成功率（99%+）、可直接下载 PDF 全文\n"
+                search_source_guidance += f"   - 示例: arxiv_search → arxiv_read_paper 获取完整论文\n"
+            if web_tools:
+                search_source_guidance += f"2. **补充**: 使用网页搜索获取其他来源内容\n"
+                search_source_guidance += f"   - 用途: 工业应用案例、技术博客、新闻动态、非学术资源\n"
+                search_source_guidance += f"   - 注意: 部分网站可能有反爬虫限制或订阅墙\n"
+            search_source_guidance += f"3. **深入**: 对重要论文使用 read_paper 工具获取完整全文\n"
+            search_source_guidance += f"   - arxiv_read_paper, get_pubmed_article, medrxiv_read_paper 等\n\n"
+            
             if disabled_tools:
-                search_source_guidance += f"\nNote: Some search tools ({', '.join(disabled_tools)}) are not available in this session. If you attempt to use them, you will receive an error - simply use the available tools instead.\n"
+                search_source_guidance += f"⚠️ **不可用工具**: {', '.join(disabled_tools)}\n"
+                search_source_guidance += f"如果尝试使用这些工具会收到错误，请使用上述可用工具。\n\n"
         else:
             search_source_guidance = f"\n\n**⚠️ WARNING: ALL SEARCH TOOLS DISABLED**\n"
             search_source_guidance += f"No external search tools are available in this session. You can only work with existing files in the workspace (user_uploads/, library_refs/, etc.).\n"
@@ -168,18 +213,36 @@ When searching for recent information or papers, be aware that the current date 
         
         1. INITIAL RESEARCH:{search_source_guidance}
            - Generate focused search queries (≤10): Limit to no more than 10 initial search queries to avoid increased failure rates from excessive decomposition.
-           - Analyse and select the appropriate information retrieval tools to get relevant information for your queries, based on the tool description. You can split a query into multiple tool-invoked inputs based on the tool description. Use the professional search tools for biology-related articles("search_pubmed_key_words", "search_pubmed_advanced","medrxiv_search"), professional computer-science-related article search tools for CS knowledge("arxiv_search"), and multi-disciplinary open access article search tools for high-quality peer-reviewed papers across all fields("springer_search"). The web search engine is a general retrieval tool for any query ("batch_web_search"). When calling the web search engine, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese. But for other tools, pay attention to the requests in their descriptions.
+           - **RECOMMENDED TOOL SELECTION STRATEGY**:
+                a) **Prefer specialized academic APIs** when query matches their coverage:
+                   • Biology/Medical topics → "search_pubmed_key_words", "search_pubmed_advanced", "medrxiv_search"
+                   • Computer Science/Math/Physics topics → "arxiv_search"
+                   • Advantages: Complete metadata, direct PDF access, 99%+ success rate
+                b) **Use "batch_web_search"** for:
+                   • Topics outside specialized API coverage (engineering, social sciences, multi-disciplinary, etc.)
+                   • Industry applications, technical blogs, news, case studies
+                   • Supplementary content to complement academic sources
+                   • Non-English academic content
+                   • Note: Web search has academic site targeting enabled (academic sites including arXiv, Nature, IEEE, etc.)
+                c) **Combine both approaches** when appropriate - use specialized APIs for core academic papers and web search for broader context
+           - When calling web search, consider the language of the user's question (e.g., use Chinese for Chinese questions)
            - Analyze the search results (titles, snippets, URLs, paper metadata) to identify promising sources
         
         2. CONTENT EXTRACTION:  
+           - **CRITICAL: Special handling for academic paper URLs**:
+                • If a URL from "batch_web_search" is an arXiv paper (e.g., https://arxiv.org/abs/XXXX.XXXXX):
+                  → Extract the paper_id (e.g., "1206.3218" from "https://arxiv.org/abs/1206.3218")
+                  → Use "arxiv_read_paper" with the paper_id (NOT url_crawler or download_files)
+                  → This ensures you get the full paper content, not just the HTML abstract page
+                • Similarly for other academic sources: PubMed URLs → get_pubmed_article, etc.
            - For important URLs searched by "batch_web_search", use `url_crawler` to:  
                 a) Extract full content from the webpage  
-                b) Save the content to a file in the workspace **under the relative path `./url_crawler_save_files/`**  
-           - For important articles searched with pubmed, medrxiv, arxiv, or springer, use the corresponding retrieval tools:
+                b) Save the content to a file in the workspace **under the relative path `./url_crawler_save_files/`**
+                c) **Exception**: Do NOT use url_crawler for arXiv/PubMed/medRxiv URLs - use their dedicated tools instead
+           - For important articles searched with pubmed, medrxiv, or arxiv, use the corresponding retrieval tools:
                 a) PubMed: "get_pubmed_article" (requires PMID from search results)
                 b) medRxiv: "medrxiv_read_paper" (requires paper_id from search results)
                 c) arXiv: "arxiv_read_paper" (requires paper_id from search results)
-                d) Springer Nature: "springer_get_article" (requires DOI from search results)
            - Store results with meaningful file paths (e.g., `url_crawler_save_files/research/ai_trends_2024.txt`)
         
         3. CONTENT ANALYSIS:

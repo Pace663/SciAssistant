@@ -565,6 +565,12 @@ def _process_inline_formatting(text: str) -> str:
         title = match.group(2)  # 标题或文件名（可以不含.pdf）
         url = match.group(3)  # PDF URL
         date = match.group(4) if len(match.groups()) >= 4 and match.group(4) else ''
+        
+        # 清理和转义 URL
+        url = url.strip()
+        url = re.sub(r'["\'/]+$', '', url)
+        url_escaped = url.replace('&', '&amp;')
+        
         # 使用回形针图标📎 (U+1F4CE) 表示可下载的PDF文档
         # 处理无法确定月份的情况，只显示年份
         if date and date.strip():
@@ -577,46 +583,77 @@ def _process_inline_formatting(text: str) -> str:
             date_part = f', {date_str}'
         else:
             date_part = ''
-        # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        # 转义 URL 中的特殊字符
-        safe_url = _escape_url_for_html_attr(url)
-        return f'[{num}] <font name="EmojiFont">📎</font> {title}, <a href="{safe_url}" color="#04B5BB">{url}</a>{date_part}'
+        
+        # 使用 📎 图标表示PDF文件（已下载完整内容）
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">📎</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
 
-    # 辅助函数：判断URL是否为PDF链接
-    def is_pdf_url(url):
-        if not url:
-            return False
-        url_lower = url.lower()
-        # 1. 以.pdf结尾
-        if url_lower.endswith('.pdf'):
-            return True
-        # 2. arxiv.org/pdf/xxxx 格式（不以.pdf结尾）
-        if 'arxiv.org/pdf/' in url_lower:
-            return True
-        # 3. medrxiv/biorxiv的PDF格式
-        if ('medrxiv.org/content/' in url_lower or 'biorxiv.org/content/' in url_lower) and '.full.pdf' in url_lower:
-            return True
-        return False
-
+    # 改进的正则表达式0：优先匹配标题包含.pdf的引用（不管URL是什么）
+    # 这样可以正确识别标题含.pdf但URL不是PDF的情况，如：[42] 2401.10359v1.pdf, https://arxiv.org/abs/2401.10359
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?\.pdf.+?)，(https?://[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
+                  replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+    
     # 改进的正则表达式1：根据URL是否以.pdf结尾来判断PDF引用（不管标题是什么）
     # 这样可以正确识别标题不含.pdf但URL是PDF的情况，如：[1] BD CD Marker Handbook, https://example.com/file.pdf
-    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?\.pdf)(?:，(.+?))?(?=\s*\n|\s*$)',
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://[^\s，]+?\.pdf)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 改进的正则表达式1.1：匹配arxiv.org/pdf/格式的PDF链接（不以.pdf结尾）
-    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://arxiv\.org/pdf/[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
+    # 使用负向前瞻，跳过已经有图标的引用
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://arxiv\.org/pdf/[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_pdf_reference, text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 格式1.2: [数字] 标题，学术论文URL，日期 - 学术论文引用（使用 📄 图标）
+    def replace_academic_reference(match):
+        num = match.group(1)
+        title = match.group(2)
+        url = match.group(3)
+        date_str = match.group(4) if match.group(4) else None
+        
+        # 清理和转义 URL
+        url = url.strip()
+        url = re.sub(r'["\'/]+$', '', url)
+        url_escaped = url.replace('&', '&amp;')
+        
+        if date_str:
+            # 清理日期字符串
+            if '无法确定月份' in date_str:
+                year_match = re.search(r'(\d{4})年', date_str)
+                if year_match:
+                    date_str = f'{year_match.group(1)}年'
+            date_part = f', {date_str}'
+        else:
+            date_part = ''
+        
+        # 使用 📄 图标表示学术论文（已引用完整内容）
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">📄</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
+    
+    # 匹配学术论文引用：arXiv/PubMed/学术期刊网站（非 PDF 链接）
+    # 使用负向前瞻，跳过已经有图标的引用
+    # 扩展范围：包含 Nature、Lancet、MDPI、Frontiers、Springer、Wiley 等学术期刊
+    # 添加 (?:www\.)? 支持，因为很多学术网站URL包含www前缀（如www.mdpi.com）
+    academic_pattern = r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://(?:(?:www\.)?arxiv\.org/(?:abs|html)/|pubmed\.ncbi\.nlm\.nih\.gov/|pmc\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/|(?:www\.)?medrxiv\.org/content/|(?:www\.)?biorxiv\.org/content/|(?:www\.)?nature\.com/articles/(?!d41586-)|(?:www\.)?thelancet\.com/(?:journals/|article/)|(?:www\.)?science\.org/doi/|(?:www\.)?cell\.com/|(?:www\.)?nejm\.org/doi/|(?:www\.)?mdpi\.com/|(?:www\.)?frontiersin\.org/(?:journals/|articles/)|(?:www\.)?plos\.org/|link\.springer\.com/article/|onlinelibrary\.wiley\.com/doi/|(?:www\.)?bmj\.com/content/|jamanetwork\.com/journals/)[^\s，]+)(?:，(.+?))?(?=\s*\n|\s*$)'
+    text = re.sub(academic_pattern, replace_academic_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 格式2: [数字] 标题，URL，日期 - 网页引用
     def replace_web_reference(match):
         num = match.group(1)
         title = match.group(2)
         url = match.group(3)
-        date = match.group(4) if len(match.groups()) >= 4 and match.group(4) else ''
-        # 使用地球仪图标🌐 (U+1F310) 表示网页链接
-        # 处理无法确定月份的情况，只显示年份
-        if date and date.strip():
-            date_str = date.strip()
+        date_str = match.group(4) if match.group(4) else None
+        
+        # 清理 URL 中可能的特殊字符和 HTML 标签残留
+        url = url.strip()
+        # 移除 URL 末尾可能的引号、斜杠等
+        url = re.sub(r'["\'/]+$', '', url)
+        # 转义 URL 中的特殊字符（如 &）
+        url_escaped = url.replace('&', '&amp;')
+        
+        if date_str:
+            # 清理日期字符串中的"无法确定月份"等文本
             if '无法确定月份' in date_str:
                 # 提取年份（匹配4位数字+年）
                 year_match = re.search(r'(\d{4})年', date_str)
@@ -626,21 +663,20 @@ def _process_inline_formatting(text: str) -> str:
         else:
             date_part = ''
         # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        # 转义 URL 中的特殊字符
-        safe_url = _escape_url_for_html_attr(url)
-        return f'[{num}] <font name="EmojiFont">🌐</font> {title}, <a href="{safe_url}" color="#04B5BB">{url}</a>{date_part}'
+        # 注意：添加style属性确保图标不受父元素斜体样式影响
+        return f'[{num}] <font name="EmojiFont" style="font-style: normal;">🌐</font> {title}, <a href="{url_escaped}" color="#04B5BB">{url_escaped}</a>{date_part}'
 
     # 改进的正则表达式2：匹配非PDF的URL引用（网页引用）
-    text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?)(?:，(.+?))?(?=\s*\n|\s*$)',
+    # 使用负向前瞻，跳过已经有图标的引用（<font name="EmojiFont">）
+    text = re.sub(r'\[(\d+)\]\s(?!<font name="EmojiFont">)(.+?)，(https?://[^\s，]+?)(?:，(.+?))?(?=\s*\n|\s*$)',
                   replace_web_reference, text, flags=re.IGNORECASE | re.MULTILINE)
 
     # 处理 Markdown 链接 [text](url) (必须在其他格式之前处理)
     def replace_markdown_link(match):
         link_text = match.group(1)
         link_url = match.group(2)
-        # ReportLab 的 <a> 标签格式，转义 URL 中的特殊字符
-        safe_url = _escape_url_for_html_attr(link_url)
-        return f'<a href="{safe_url}" color="#04B5BB">{link_text}</a>'
+        # ReportLab 的 <a> 标签格式
+        return f'<a href="{link_url}" color="#04B5BB">{link_text}</a>'
 
     # 处理Markdown链接，支持URL中包含括号（如wiki链接、论文DOI等）
     # 匹配模式：URL可包含一层嵌套括号，如 https://example.com/page(1).html
@@ -1637,6 +1673,15 @@ class MCPTools:
 
         # 初始化 username，尝试从 workspace 配置文件读取，否则使用默认值
         self.username = self._get_username_from_workspace()
+        
+        # medRxiv API configuration
+        self.BASE_URL = "https://api.biorxiv.org/details/medrxiv"
+        self.session = requests.Session()
+        self.timeout = 30
+        self.max_retries = 3
+        
+        # Academic sites configuration for targeted search
+        self.academic_sites_enabled = True  # Enable by default for research tasks
 
     def _get_username_from_workspace(self) -> str:
         """
@@ -1678,8 +1723,312 @@ class MCPTools:
             "session_workspace_path": str(self.session_workspace_path) if self.session_workspace_path else None,
             "workspace_path": str(self.workspace_path)
         }
-
-    def _safe_join(self, path: str) -> Path:
+    
+    def _get_academic_sites_list(self, query: str = "") -> List[str]:
+        """
+        Get list of academic websites for targeted searching.
+        Ordered by open access priority (higher success rate for content crawling).
+        
+        Args:
+            query: Optional search query for dynamic site selection
+        
+        Returns:
+            List of academic website domains, prioritized by accessibility and relevance
+        """
+        return [
+            # ===== TIER 1: Preprint Servers & Full Open Access (Crawl Success Rate: 90%+) =====
+            "arxiv.org",            # arXiv - Physics, Math, CS preprints (fully open)
+            "biorxiv.org",          # bioRxiv - Biology preprints (fully open)
+            "plos.org",             # PLOS - Public Library of Science (fully open)
+            "frontiersin.org",      # Frontiers journals (fully open access)
+            "mdpi.com",             # MDPI journals (fully open access)
+            
+            # ===== TIER 2: AI/ML Conference Proceedings & Open Repositories (Success Rate: 90%+) =====
+            "openreview.net",       # OpenReview - AI/ML conference papers (fully open)
+            "papers.nips.cc",       # NeurIPS papers (fully open)
+            "semanticscholar.org",  # Semantic Scholar (AI-powered search)
+            
+            # ===== TIER 3: Top Journals with Partial Open Access (Success Rate: 50-70%) =====
+            "nature.com",           # Nature Publishing Group (some open articles)
+            "science.org",          # Science/AAAS (some open articles)
+            "pnas.org",             # PNAS (some open articles)
+            
+            # ===== TIER 4: Major Publishers & Discipline-Specific (Success Rate: 30-50%) =====
+            "link.springer.com",    # SpringerLink (Springer articles)
+            "onlinelibrary.wiley.com",  # Wiley Online Library (AGU, Chemistry, etc.)
+            "ieeexplore.ieee.org",  # IEEE Xplore (engineering/CS) - 精确化
+            "agu.org",              # American Geophysical Union (earth science)
+            
+            # ===== Below are NOT used in top-15 site targeting =====
+            "pubscholar.cn",        # PubScholar China (Chinese academic search)
+            "cell.com",             # Cell Press (some open articles)
+            "springer.com",         # Springer Nature (mixed access)
+            "academic.oup.com",     # Oxford University Press - 精确化
+            "cambridge.org",        # Cambridge University Press
+            "tandfonline.com",      # Taylor & Francis Online
+            "annualreviews.org",    # Annual Reviews
+            "acm.org",              # ACM Digital Library (CS)
+            "rsc.org",              # Royal Society of Chemistry
+            "asm.org",              # American Society for Microbiology
+            "geoscienceworld.org", # GeoScienceWorld
+            
+            # ===== TIER 6: Medical & Life Sciences (Success Rate: 40-60%) =====
+            "thelancet.com",        # The Lancet
+            "bmj.com",              # BMJ journals
+            "nejm.org",             # New England Journal of Medicine
+            "jamanetwork.com",      # JAMA Network
+            
+            # ===== TIER 7: Scientific Societies (Success Rate: 40-60%) =====
+            "aaas.org",             # AAAS (American Association for the Advancement of Science)
+            "royalsocietypublishing.org",  # Royal Society Publishing
+            "aps.org",              # American Physical Society
+            "acs.org",              # American Chemical Society
+            
+            # ===== TIER 8: Databases & Indexes (Success Rate: 20-40%) =====
+            "scopus.com",           # Scopus (Elsevier database)
+            "proquest.com",         # ProQuest databases
+            "sciencedirect.com"     # ScienceDirect (Elsevier)
+        ]
+    
+    def _get_dynamic_academic_sites(self, query: str, base_count: int = 15) -> List[str]:
+        """
+        Dynamically adjust academic site priority based on query keywords.
+        
+        Args:
+            query: Search query string
+            base_count: Number of sites to return (default 15)
+        
+        Returns:
+            List of academic sites with discipline-specific sites boosted to top
+        """
+        query_lower = query.lower()
+        
+        # Get base list
+        all_sites = self._get_academic_sites_list()
+        
+        # Define discipline-specific sites and their keywords (支持中英文)
+        # 全面覆盖所有主要学科领域，确保任何查询都能匹配到相关专业网站
+        discipline_boosts = {
+            # ===== Engineering & Technology (工程技术) =====
+            "ieee.org": [
+                # 电气电子工程
+                "engineering", "electrical", "electronic", "circuit", "signal processing", "robotics", "automation",
+                "semiconductor", "microelectronics", "power systems", "control systems", "embedded systems",
+                "telecommunications", "wireless", "antenna", "radar", "sensor", "actuator", "mechatronics",
+                "工程", "电气", "电子", "电路", "信号处理", "机器人", "自动化", "控制", "半导体", "微电子",
+                "电力系统", "控制系统", "嵌入式", "通信", "无线", "天线", "雷达", "传感器", "执行器", "机电"
+            ],
+            "acm.org": [
+                # 计算机科学
+                "algorithm", "software", "programming", "computing", "database", "graphics", "computer science",
+                "artificial intelligence", "machine learning", "deep learning", "neural network", "data mining",
+                "computer vision", "natural language processing", "nlp", "distributed systems", "cloud computing",
+                "cybersecurity", "cryptography", "blockchain", "human-computer interaction", "hci",
+                "算法", "软件", "编程", "程序", "计算", "数据库", "图形", "计算机", "人工智能", "机器学习",
+                "深度学习", "神经网络", "数据挖掘", "计算机视觉", "自然语言处理", "分布式", "云计算",
+                "网络安全", "密码学", "区块链", "人机交互"
+            ],
+            "openreview.net": [
+                # AI/ML 会议论文（ICLR, NeurIPS, ICML 等）
+                "machine learning", "deep learning", "neural network", "artificial intelligence", "reinforcement learning",
+                "transformer", "attention mechanism", "generative model", "gan", "vae", "diffusion model",
+                "computer vision", "natural language processing", "nlp", "representation learning", "meta-learning",
+                "few-shot learning", "transfer learning", "self-supervised learning", "contrastive learning",
+                "graph neural network", "gnn", "optimization", "gradient descent", "backpropagation",
+                "机器学习", "深度学习", "神经网络", "人工智能", "强化学习", "生成模型", "对比学习"
+            ],
+            "papers.nips.cc": [
+                # NeurIPS 会议论文（神经信息处理系统）
+                "neural", "learning", "optimization", "bayesian", "probabilistic", "inference", "statistical learning",
+                "deep learning", "machine learning", "reinforcement learning", "supervised learning", "unsupervised learning",
+                "semi-supervised", "active learning", "online learning", "bandit", "kernel method", "svm",
+                "neural network", "cnn", "rnn", "lstm", "transformer", "attention", "autoencoder",
+                "神经", "学习", "优化", "贝叶斯", "概率", "推理", "统计学习"
+            ],
+            
+            # ===== Earth & Environmental Science (地球与环境科学) =====
+            "agu.org": [
+                # 地球科学
+                "climate", "earth", "geology", "geophysics", "atmosphere", "ocean", "environmental",
+                "meteorology", "hydrology", "glaciology", "seismology", "volcanology", "tectonics",
+                "climate change", "global warming", "carbon cycle", "water cycle", "ecosystem",
+                "remote sensing", "gis", "paleoclimate", "oceanography", "marine science",
+                "气候", "地球", "地质", "地球物理", "大气", "海洋", "环境", "生态", "气象", "水文",
+                "冰川", "地震", "火山", "构造", "气候变化", "全球变暖", "碳循环", "水循环", "生态系统",
+                "遥感", "海洋学", "海洋科学"
+            ],
+            "geoscienceworld.org": [
+                "mineral", "petroleum", "sediment", "paleontology", "stratigraphy", "geochemistry",
+                "矿物", "石油", "沉积", "古生物", "地层", "地球化学"
+            ],
+            
+            # ===== Chemistry & Materials Science (化学与材料科学) =====
+            "rsc.org": [
+                # 化学与材料
+                "chemistry", "chemical", "molecule", "synthesis", "catalyst", "polymer", "material", "ceramic", "composite",
+                "thermal", "heat resistant", "insulation", "nanomaterial", "nanoparticle", "graphene", "carbon nanotube",
+                "electrochemistry", "photochemistry", "spectroscopy", "chromatography", "crystallography",
+                "superconductor", "semiconductor material", "battery", "fuel cell", "solar cell", "photovoltaic",
+                "coating", "corrosion", "metallurgy", "alloy", "steel", "aluminum", "titanium",
+                "化学", "分子", "合成", "催化", "聚合物", "材料", "陶瓷", "复合材料", "高温", "耐热", "隔热", "绝缘",
+                "纳米材料", "纳米颗粒", "石墨烯", "碳纳米管", "电化学", "光化学", "光谱", "色谱", "晶体",
+                "超导", "半导体材料", "电池", "燃料电池", "太阳能电池", "光伏", "涂层", "腐蚀", "冶金", "合金", "钢", "铝", "钛"
+            ],
+            "acs.org": [
+                "organic chemistry", "inorganic", "analytical chemistry", "biochemistry", "material science",
+                "pharmaceutical chemistry", "medicinal chemistry", "polymer chemistry", "surface chemistry",
+                "有机化学", "无机", "分析化学", "生物化学", "材料科学", "药物化学", "医药化学", "高分子化学", "表面化学"
+            ],
+            
+            # ===== Medical & Life Sciences (医学与生命科学) =====
+            "thelancet.com": [
+                # 临床医学
+                "clinical", "patient", "disease", "treatment", "diagnosis", "medical", "surgery", "therapy",
+                "cancer", "oncology", "cardiology", "neurology", "psychiatry", "pediatrics", "radiology",
+                "pathology", "immunology", "infectious disease", "vaccine", "antibody", "inflammation",
+                "临床", "患者", "疾病", "治疗", "诊断", "医学", "医疗", "手术", "疗法", "癌症", "肿瘤",
+                "心脏病", "神经", "精神", "儿科", "放射", "病理", "免疫", "传染病", "疫苗", "抗体", "炎症"
+            ],
+            "bmj.com": [
+                "health", "medicine", "epidemiology", "public health", "healthcare", "prevention",
+                "健康", "医学", "流行病", "公共卫生", "卫生", "医疗保健", "预防"
+            ],
+            "nejm.org": [
+                "therapy", "drug", "pharmaceutical", "clinical trial", "randomized controlled trial",
+                "疗法", "药物", "制药", "临床试验", "试验", "随机对照"
+            ],
+            "cell.com": [
+                # 生命科学
+                "cell biology", "molecular biology", "genetics", "protein", "gene", "genome", "dna", "rna",
+                "stem cell", "crispr", "gene editing", "transcription", "translation", "enzyme", "metabolism",
+                "signaling pathway", "apoptosis", "autophagy", "epigenetics", "microbiome", "proteomics",
+                "细胞", "分子生物", "遗传", "基因", "蛋白质", "蛋白", "基因组", "突变", "表达", "干细胞",
+                "基因编辑", "转录", "翻译", "酶", "代谢", "信号通路", "凋亡", "自噬", "表观遗传", "微生物组", "蛋白质组"
+            ],
+            
+            # ===== Physics & Astronomy (物理与天文) =====
+            "aps.org": [
+                # 物理
+                "physics", "quantum", "particle", "condensed matter", "optics", "photonics", "laser",
+                "plasma", "nuclear", "atomic", "molecular", "thermodynamics", "statistical mechanics",
+                "relativity", "cosmology", "astrophysics", "gravitational wave", "dark matter", "dark energy",
+                "物理", "量子", "粒子", "凝聚态", "光学", "力学", "光子", "激光", "等离子体", "核", "原子",
+                "分子", "热力学", "统计力学", "相对论", "宇宙学", "天体物理", "引力波", "暗物质", "暗能量"
+            ],
+        }
+        
+        # Calculate boost scores for each site
+        boost_scores = {}
+        for site, keywords in discipline_boosts.items():
+            score = sum(1 for kw in keywords if kw in query_lower)
+            if score > 0:
+                boost_scores[site] = score
+        
+        # If no specific discipline detected, return base list
+        if not boost_scores:
+            return all_sites[:base_count]
+        
+        # Separate boosted sites from base list
+        boosted_sites = sorted(boost_scores.keys(), key=lambda s: boost_scores[s], reverse=True)
+        base_sites = [s for s in all_sites if s not in boosted_sites]
+        
+        # Merge: keep top 5 base sites, insert boosted sites, then fill remaining
+        top_base = base_sites[:5]  # Always keep top 5 (arxiv, biorxiv, etc.)
+        remaining_base = base_sites[5:]
+        
+        # Construct final list
+        final_sites = top_base + boosted_sites + remaining_base
+        
+        return final_sites[:base_count]
+    
+    def _deduplicate_search_results(self, results: List[Dict]) -> List[Dict]:
+        """
+        Deduplicate search results using multiple strategies (方案三实现)
+        
+        Deduplication strategies:
+        1. URL normalization and deduplication (primary)
+        2. Title normalization and hash-based deduplication
+        3. DOI-based deduplication (if available)
+        
+        Args:
+            results: List of search result dictionaries
+            
+        Returns:
+            Deduplicated list of results
+        """
+        from hashlib import md5
+        import re
+        
+        seen_urls = set()
+        seen_title_hashes = set()
+        seen_dois = set()
+        deduplicated = []
+        duplicate_count = 0
+        
+        for result in results:
+            # Extract key information
+            url = result.get('link', '').strip()
+            title = result.get('title', '').strip()
+            
+            # Try to extract DOI from URL or snippet
+            doi = None
+            snippet = result.get('snippet', '')
+            doi_pattern = r'10\.\d{4,}/[^\s]+'
+            doi_match = re.search(doi_pattern, url + ' ' + snippet)
+            if doi_match:
+                doi = doi_match.group(0).lower()
+            
+            # Strategy 1: DOI deduplication (highest priority)
+            if doi and doi in seen_dois:
+                logger.debug(f"[DEDUP] Skipping duplicate DOI: {doi}")
+                duplicate_count += 1
+                continue
+            
+            # Strategy 2: URL deduplication
+            if url:
+                # Normalize URL: remove protocol, www, trailing slash, query parameters
+                normalized_url = url.lower()
+                normalized_url = re.sub(r'^https?://', '', normalized_url)
+                normalized_url = re.sub(r'^www\.', '', normalized_url)
+                normalized_url = re.sub(r'[?#].*$', '', normalized_url)  # Remove query and fragment
+                normalized_url = normalized_url.rstrip('/')
+                
+                if normalized_url in seen_urls:
+                    logger.debug(f"[DEDUP] Skipping duplicate URL: {url}")
+                    duplicate_count += 1
+                    continue
+                
+                seen_urls.add(normalized_url)
+            
+            # Strategy 3: Title hash deduplication
+            if title:
+                # Normalize title: lowercase, remove punctuation, remove extra spaces
+                normalized_title = re.sub(r'[^\w\s]', '', title.lower())
+                normalized_title = ' '.join(normalized_title.split())
+                
+                if len(normalized_title) > 10:  # Only hash meaningful titles
+                    title_hash = md5(normalized_title.encode()).hexdigest()
+                    
+                    if title_hash in seen_title_hashes:
+                        logger.debug(f"[DEDUP] Skipping duplicate title: {title[:50]}...")
+                        duplicate_count += 1
+                        continue
+                    
+                    seen_title_hashes.add(title_hash)
+            
+            # Record DOI
+            if doi:
+                seen_dois.add(doi)
+            
+            deduplicated.append(result)
+        
+        if duplicate_count > 0:
+            logger.info(f"[DEDUP] Removed {duplicate_count} duplicates from {len(results)} results, kept {len(deduplicated)} unique items")
+        
+        return deduplicated
+    
+    def _validate_workspace_path(self, path: str) -> Path:
+        """Validate that a path is within the workspace directory"""
         if os.path.isabs(path):
             raise Exception(f"Path '{path}' is absolute. Only relative paths are allowed.")
         joined_path = os.path.join(self.workspace_path, path)
@@ -1688,16 +2037,26 @@ class MCPTools:
             raise Exception(f"Path '{path}' is outside workspace directory.")
         return Path(full_joined_path)
 
+    def _safe_join(self, path: str) -> Path:
+        """Alias for _validate_workspace_path for backward compatibility"""
+        return self._validate_workspace_path(path)
+
     # ================ WEB SEARCH TOOLS ================
 
     def batch_web_search(
             self,
             queries: List[str],
             max_results_per_query: int = 15,
-            max_workers: int = 5
+            max_workers: int = 5,
+            academic_sites: bool = True,
+            fallback_to_general: bool = True,
+            min_results_threshold: int = 5
     ) -> MCPToolResult:
         """
         Batch web search using configurable search provider with concurrent processing.
+        
+        Supports academic site targeting to prioritize results from professional academic websites
+        such as Nature, Science, IEEE, ACM, Springer, etc.
         
         Users need to implement their own search provider. Below is an example available:
         [
@@ -1720,6 +2079,9 @@ class MCPTools:
             queries: List of search queries
             max_results_per_query: Maximum search results per query
             max_workers: Maximum number of concurrent search requests
+            academic_sites: If True, prioritize academic websites (Nature, Science, IEEE, etc.)
+            fallback_to_general: If True, automatically fallback to general search when academic results are insufficient
+            min_results_threshold: Minimum number of results required before triggering fallback (default: 5)
         """
         try:
             from config.config import get_search_engine_config
@@ -1737,7 +2099,7 @@ class MCPTools:
             def search_single_query(query: str) -> Dict[str, Any]:
                 """Search a single query"""
                 try:
-                    search_results = self._generic_search(query, actual_max_results, search_config)
+                    search_results = self._generic_search(query, actual_max_results, search_config, academic_sites)
 
                     if not search_results.success:
                         return {
@@ -1792,13 +2154,139 @@ class MCPTools:
             query_order = {query: i for i, query in enumerate(queries)}
             all_results.sort(key=lambda x: query_order.get(x['query'], float('inf')))
 
+            # Fallback strategy: supplement with general search if results are insufficient
+            fallback_queries = []
+            fallback_triggered = False
+            
+            if academic_sites and fallback_to_general:
+                for result in all_results:
+                    if result.get('success', False):
+                        organic_count = len(result.get('results', {}).get('organic', []))
+                        if organic_count < min_results_threshold:
+                            fallback_queries.append(result['query'])
+                            logger.warning(
+                                f"[SEARCH_FALLBACK] Query '{result['query'][:50]}...' has only {organic_count} results, "
+                                f"triggering general search fallback"
+                            )
+                
+                if fallback_queries:
+                    fallback_triggered = True
+                    logger.warning(
+                        f"[SEARCH_FALLBACK] {len(fallback_queries)} queries need supplemental general search"
+                    )
+                    
+                    # Execute general search for insufficient queries
+                    def search_general_query(query: str) -> Dict[str, Any]:
+                        try:
+                            # Use general search (academic_sites=False)
+                            search_results = self._generic_search(query, actual_max_results, search_config, academic_sites=False)
+                            if not search_results.success:
+                                return {'query': query, 'success': False, 'error': search_results.error, 'results': []}
+                            
+                            search_data = search_results.data
+                            search_data["organic"] = search_data["organic"][:actual_max_results]
+                            return {'query': query, 'success': True, 'results': search_data, 'timestamp': time.time()}
+                        except Exception as e:
+                            logger.error(f"Error in general search for '{query}': {e}")
+                            return {'query': query, 'success': False, 'error': str(e), 'results': []}
+                    
+                    # Execute fallback searches
+                    fallback_results = []
+                    with ThreadPoolExecutor(max_workers=min(max_workers, len(fallback_queries))) as executor:
+                        future_to_query = {executor.submit(search_general_query, query): query for query in fallback_queries}
+                        for future in as_completed(future_to_query):
+                            try:
+                                result = future.result()
+                                fallback_results.append(result)
+                            except Exception as e:
+                                query = future_to_query[future]
+                                logger.error(f"Error processing fallback search for '{query}': {e}")
+                    
+                    # Merge fallback results with original results
+                    fallback_map = {r['query']: r for r in fallback_results}
+                    for i, result in enumerate(all_results):
+                        query = result['query']
+                        if query in fallback_map and fallback_map[query].get('success', False):
+                            # Merge results: academic results first, then general results
+                            academic_organic = result.get('results', {}).get('organic', [])
+                            general_organic = fallback_map[query].get('results', {}).get('organic', [])
+                            
+                            # Deduplicate by URL
+                            seen_urls = {item['link'] for item in academic_organic}
+                            unique_general = [item for item in general_organic if item['link'] not in seen_urls]
+                            
+                            # Combine results
+                            merged_organic = academic_organic + unique_general[:actual_max_results - len(academic_organic)]
+                            all_results[i]['results']['organic'] = merged_organic
+                            
+                            logger.info(
+                                f"[SEARCH_FALLBACK] Merged results for '{query[:50]}...': "
+                                f"{len(academic_organic)} academic + {len(unique_general)} general = {len(merged_organic)} total"
+                            )
+            
+            # Apply global deduplication across all queries (改进的方案三实现)
+            # 步骤1: 收集所有查询的结果
+            all_organic_results = []
+            query_indices = []  # 记录每个结果属于哪个查询
+            
+            for idx, result in enumerate(all_results):
+                if result.get('success', False) and 'results' in result:
+                    organic = result['results'].get('organic', [])
+                    for item in organic:
+                        all_organic_results.append(item)
+                        query_indices.append(idx)
+            
+            total_results_before = len(all_organic_results)
+            
+            # 步骤2: 全局去重（跨查询）
+            if all_organic_results:
+                deduplicated_results = self._deduplicate_search_results(all_organic_results)
+                total_results_after = len(deduplicated_results)
+                
+                # 步骤3: 将去重后的结果分配回各个查询
+                # 创建 URL 到去重结果的映射
+                deduplicated_url_map = {item.get('link', ''): item for item in deduplicated_results}
+                
+                # 按原查询分配去重后的结果
+                query_result_map = {i: [] for i in range(len(all_results))}
+                seen_urls = set()  # 跟踪已分配的 URL，避免重复分配
+                
+                for item, query_idx in zip(all_organic_results, query_indices):
+                    url = item.get('link', '')
+                    # 如果这个 URL 在去重结果中，且还没被分配过
+                    if url in deduplicated_url_map and url not in seen_urls:
+                        query_result_map[query_idx].append(deduplicated_url_map[url])
+                        seen_urls.add(url)
+                
+                # 更新各查询的结果
+                for idx, result in enumerate(all_results):
+                    if result.get('success', False) and 'results' in result:
+                        result['results']['organic'] = query_result_map[idx]
+                
+                if total_results_before > total_results_after:
+                    logger.info(
+                        f"[DEDUP_SUMMARY] Global deduplication across {len(all_results)} queries: "
+                        f"{total_results_before} → {total_results_after} results "
+                        f"({total_results_before - total_results_after} duplicates removed, "
+                        f"{(total_results_before - total_results_after) / total_results_before * 100:.1f}% reduction)"
+                    )
+            else:
+                total_results_after = 0
+
             return MCPToolResult(
                 success=True,
                 data=all_results,
                 metadata={
                     'total_queries': len(queries),
                     'successful_queries': len([r for r in all_results if r.get('success', False)]),
-                    'concurrent_workers': min(max_workers, len(queries))
+                    'concurrent_workers': min(max_workers, len(queries)),
+                    'fallback_triggered': fallback_triggered,
+                    'fallback_queries_count': len(fallback_queries) if fallback_triggered else 0,
+                    'deduplication': {
+                        'results_before': total_results_before,
+                        'results_after': total_results_after,
+                        'duplicates_removed': total_results_before - total_results_after
+                    }
                 }
             )
 
@@ -1806,11 +2294,12 @@ class MCPTools:
             logger.error(f"Batch web search failed: {e}")
             return MCPToolResult(success=False, error=str(e))
 
-    def _generic_search(self, query: str, max_results: int, config: Dict[str, Any]) -> MCPToolResult:
+    def _generic_search(self, query: str, max_results: int, config: Dict[str, Any], 
+                       academic_sites: bool = True) -> MCPToolResult:
         """
-        Generic search function that users need to implement.
+        Generic search function with academic site targeting support.
         
-        This function should return results in the standard format and be wrapped in MCPToolResult:
+        This function returns results in the standard format wrapped in MCPToolResult:
         
         search_res = {
             "organic": [
@@ -1825,7 +2314,11 @@ class MCPTools:
 
         return MCPToolResult(success=True, data=search_res)
         
-        Users should implement their own search logic here based on their preferred search service.
+        Args:
+            query: Search query string
+            max_results: Maximum number of results to return
+            config: Search engine configuration
+            academic_sites: If True, prioritize academic websites in search
         
         Notes:
         1. It is recommended to use search engine APIs that comply with relevant safety and regulatory requirements.
@@ -1837,18 +2330,38 @@ class MCPTools:
         sensitive information. We assume no liability for privacy-related issues arising from such transmission.
         """
         try:
-            # This is a placeholder - users should implement their own search logic
-            # raise NotImplementedError(
-            #     "Generic search provider not implemented. Please implement your own search logic in _generic_search method. "
-            #     "The return format should match the standard format with 'organic' results containing title, link, snippet, and date fields."
-            # )
-
-            # Example implementation for serper (commented out):
+            # Debug: Log function entry
+            logger.warning(f"[SEARCH_DEBUG] _generic_search called with academic_sites={academic_sites}, query={query[:50]}...")
+            
+            # Get academic sites list (dynamic or static)
+            academic_sites_list = self._get_dynamic_academic_sites(query, base_count=15)
+            logger.warning(f"[SEARCH_DEBUG] Academic sites list length: {len(academic_sites_list) if academic_sites_list else 0}")
+            logger.warning(f"[SEARCH_DEBUG] Top 5 sites for this query: {', '.join(academic_sites_list[:5])}")
+            
+            # Enhance query with academic site targeting if enabled
+            enhanced_query = query
+            if academic_sites and academic_sites_list:
+                # Add site: operators to prioritize academic sources
+                # Use OR logic to search across multiple academic sites
+                # Increased from 10 to 15 sites for better coverage (still well under 2048 char limit)
+                site_filters = " OR ".join([f"site:{site}" for site in academic_sites_list[:15]])
+                enhanced_query = f"({query}) ({site_filters})"
+                
+                # Enhanced debug logging for verification
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] ========== Academic Search Enabled ==========")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Original query: {query}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Enhanced query: {enhanced_query}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Using {len(academic_sites_list[:15])} academic sites (from {len(academic_sites_list)} total)")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Top 15 sites: {', '.join(academic_sites_list[:15])}")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] Query length: {len(enhanced_query)} chars (limit: 2048)")
+                logger.warning(f"[ACADEMIC_SEARCH_DEBUG] ================================================")
+                logger.info(f"Academic search enabled. Enhanced query with {len(academic_sites_list[:15])} academic site filters.")
+            
             url = config['base_url']
 
             payload = json.dumps({
-                "q": query,
-                "num": 10
+                "q": enhanced_query,
+                "num": max_results
             })
 
             headers = {
@@ -2249,6 +2762,8 @@ class MCPTools:
     def _extract_title_from_file_content(self, file_path: Path) -> tuple:
         """
         从文件内容中提取标题和URL
+        
+        对于 arXiv 论文，会自动从文件名构建 URL
 
         Args:
             file_path: 文件路径
@@ -2258,6 +2773,17 @@ class MCPTools:
         """
         title = "Unknown Title"
         url_source = "Unknown URL"
+        
+        # 检查是否是 arXiv 文件（通过文件名格式判断）
+        filename = file_path.name
+        # arXiv paper_id 格式：YYMM.NNNNN[vN].txt (例如：2603.02208v1.txt)
+        arxiv_match = re.match(r'^(\d{4}\.\d{5}(?:v\d+)?)\.txt$', filename)
+        
+        if arxiv_match:
+            # 这是 arXiv 文件，从文件名构建 URL
+            paper_id = arxiv_match.group(1)
+            url_source = f"https://arxiv.org/abs/{paper_id}"
+            logger.info(f"识别为 arXiv 文件: {filename}, URL: {url_source}")
 
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -2266,6 +2792,10 @@ class MCPTools:
                 # 改进标题提取逻辑
                 for i, line in enumerate(lines[:30]):  # 检查更多行
                     line = line.strip()
+                    
+                    # 跳过 arXiv 元数据行（如：arXiv:1206.3218v1 [math.FA] 14 Jun 2012）
+                    if line.startswith('arXiv:') or line.startswith('arxiv:'):
+                        continue
                     
                     # 处理"Title: xxx URL Source: yyy"格式（标题和URL在同一行）
                     if line.startswith('Title: ') and 'URL Source:' in line:
@@ -2297,20 +2827,59 @@ class MCPTools:
                             title = re.sub(r'<[^>]+>', '', title).strip()
                             logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                             break
-                    # 处理markdown标题格式
-                    if line.startswith('#'):
-                        title = line.strip('# ').strip()[:200]
-                        logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
-                        break
 
-                # 改进URL提取逻辑：排除中文标点符号，确保URL不包含日期
-                for line in lines[:20]:
-                    # 匹配URL，但排除中文标点符号（，。；：！？）和右方括号]
-                    url_match = re.search(r'https?://[^\s\]，。；：！？]+', line)
-                    if url_match:
-                        url_source = url_match.group(0)
-                        logger.info(f"提取到URL: {url_source[:50]}...")
-                        break
+                # 如果不是 arXiv 文件，从内容中提取 URL
+                if url_source == "Unknown URL":
+                    # 改进URL提取逻辑：排除中文标点符号，确保URL不包含日期
+                    for line in lines[:50]:  # 检查更多行以处理 HTML 文件
+                        # 匹配URL，但排除中文标点符号（，。；：！？）、右方括号]、引号和HTML标签
+                        url_match = re.search(r'https?://[^\s\]，。；：！？"\'<>]+', line)
+                        if url_match:
+                            url_source = url_match.group(0)
+                            # 清理 URL 末尾可能的 HTML 标签残留
+                            url_source = re.sub(r'["\'/]+$', '', url_source)  # 移除末尾的引号、斜杠
+                            logger.info(f"提取到URL: {url_source[:50]}...")
+                            break
+                
+                # 特殊处理：如果是 HTML 文件，尝试从 meta 标签或 canonical 链接提取更准确的信息
+                if '<html' in ''.join(lines[:10]).lower() or '<!doctype html>' in ''.join(lines[:5]).lower():
+                    logger.info(f"检测到 HTML 文件: {file_path.name}")
+                    
+                    # 尝试从 canonical 链接提取 URL
+                    for line in lines[:100]:
+                        canonical_match = re.search(r'<link\s+rel="canonical"\s+href="([^"]+)"', line)
+                        if canonical_match:
+                            url_source = canonical_match.group(1)
+                            logger.info(f"从 canonical 链接提取 URL: {url_source}")
+                            break
+                    
+                    # 尝试从 og:url 提取 URL（备用）
+                    if url_source == "Unknown URL":
+                        for line in lines[:100]:
+                            og_url_match = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', line)
+                            if og_url_match:
+                                url_source = og_url_match.group(1)
+                                logger.info(f"从 og:url 提取 URL: {url_source}")
+                                break
+                    
+                    # 尝试从 og:title 或 citation_title 提取标题
+                    if title == "Unknown Title":
+                        for line in lines[:100]:
+                            # 优先使用 og:title
+                            og_title_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', line)
+                            if og_title_match:
+                                title = og_title_match.group(1)
+                                title = re.sub(r'<[^>]+>', '', title).strip()  # 清理 HTML 标签
+                                logger.info(f"从 og:title 提取标题: {title[:50]}...")
+                                break
+                            
+                            # 备用：使用 citation_title
+                            citation_title_match = re.search(r'<meta\s+name="citation_title"\s+content="([^"]+)"', line)
+                            if citation_title_match:
+                                title = citation_title_match.group(1)
+                                title = re.sub(r'<[^>]+>', '', title).strip()  # 清理 HTML 标签
+                                logger.info(f"从 citation_title 提取标题: {title[:50]}...")
+                                break
         except Exception as e:
             logger.warning(f"警告: 无法读取研究文件 {file_path} - {str(e)}")
 
@@ -3472,25 +4041,73 @@ class MCPTools:
                         # URL显示为完整的来源信息（包含文件名）
                         url_source = full_source_info
                     else:
-                        # 通用路径处理：适用于所有其他类型的文件（research/, url_crawler_save_files/, 或未来新增的目录）
-                        # 先尝试直接路径
-                        direct_file_path = self.workspace_path / file_path
+                        # 通用路径处理：适用于所有其他类型的文件（research/, url_crawler_save_files/, arxiv/, 或未来新增的目录）
+                        # 检查是否是 arXiv 文件（通过路径或文件名格式判断）
+                        arxiv_filename = os.path.basename(file_path)
+                        # arXiv paper_id 格式：YYMM.NNNNN[vN] (例如：2603.02208v1)
+                        is_arxiv_file = (file_path.startswith('arxiv/') or file_path.startswith('./arxiv/') or
+                                        re.match(r'^\d{4}\.\d{5}(v\d+)?\.txt$', arxiv_filename))
                         
-                        if direct_file_path.exists():
-                            # 文件存在，提取标题和URL
-                            title, url_source = self._extract_title_from_file_content(direct_file_path)
-                            logger.info(f"成功从文件提取标题: {file_path}")
-                        else:
-                            # 文件不存在，尝试在research目录查找（向后兼容）
-                            research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
-                            if research_file_path.exists():
-                                title, url_source = self._extract_title_from_file_content(research_file_path)
-                                logger.info(f"从research目录找到文件: {research_file_path}")
+                        if is_arxiv_file:
+                            # arXiv 文件特殊处理：从文件名构建 URL
+                            # 提取 paper_id（例如：2603.02208v1.txt -> 2603.02208v1）
+                            paper_id = arxiv_filename.replace('.txt', '')
+                            
+                            # 构建 arXiv URL
+                            url_source = f"https://arxiv.org/abs/{paper_id}"
+                            
+                            # 从文件内容提取标题
+                            direct_file_path = self.workspace_path / file_path
+                            if direct_file_path.exists():
+                                title, _ = self._extract_title_from_file_content(direct_file_path)
+                                logger.info(f"arXiv 文件: {file_path}, URL: {url_source}")
                             else:
-                                # 两个位置都找不到，尝试从文件名提取标题
-                                title = self._extract_title_from_research_filename(file_path)
-                                logger.warning(f"警告: 文件不存在: {direct_file_path} 或 {research_file_path}，使用文件名提取标题")
+                                title = "Unknown Title"
+                                logger.warning(f"arXiv 文件不存在: {direct_file_path}")
+                        else:
+                            # 其他文件：先尝试直接路径
+                            direct_file_path = self.workspace_path / file_path
+                            
+                            if direct_file_path.exists():
+                                # 文件存在，提取标题和URL
+                                title, url_source = self._extract_title_from_file_content(direct_file_path)
+                                logger.info(f"成功从文件提取标题: {file_path}")
+                            else:
+                                # 文件不存在，尝试在research目录查找（向后兼容）
+                                research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
+                                if research_file_path.exists():
+                                    title, url_source = self._extract_title_from_file_content(research_file_path)
+                                    logger.info(f"从research目录找到文件: {research_file_path}")
+                                else:
+                                    # 两个位置都找不到，尝试从文件名提取标题
+                                    title = self._extract_title_from_research_filename(file_path)
+                                    logger.warning(f"警告: 文件不存在: {direct_file_path} 或 {research_file_path}，使用文件名提取标题")
 
+                    # 【过滤无效引用】跳过 ResearchGate 的反爬虫页面
+                    if title == "Just a moment..." or title.strip() == "Just a moment...":
+                        logger.warning(f"跳过无效引用 {num}: ResearchGate 反爬虫页面 - {url_source}")
+                        continue
+                    
+                    # 【修复 arXiv PDF 文件名作为标题】
+                    # 如果标题是 PDF 文件名格式（如 1404.7828v4.pdf），尝试从文件内容重新提取
+                    if title.endswith('.pdf') and re.match(r'^\d{4}\.\d{4,5}(v\d+)?\.pdf$', title):
+                        logger.warning(f"检测到 PDF 文件名作为标题: {title}，尝试重新提取")
+                        direct_file_path = self.workspace_path / file_path
+                        if direct_file_path.exists():
+                            # 重新提取标题，跳过 arXiv 元数据行
+                            title, _ = self._extract_title_from_file_content(direct_file_path)
+                            logger.info(f"重新提取的标题: {title}")
+                    
+                    # 【统一 arXiv URL 为 /abs/ 格式】
+                    # 将 arxiv.org/pdf/ 转换为 arxiv.org/abs/
+                    if 'arxiv.org/pdf/' in url_source:
+                        # 提取 paper_id（例如：https://arxiv.org/pdf/1404.7828 -> 1404.7828）
+                        pdf_match = re.search(r'arxiv\.org/pdf/(\d{4}\.\d{4,5}(?:v\d+)?)', url_source)
+                        if pdf_match:
+                            paper_id = pdf_match.group(1)
+                            url_source = f"https://arxiv.org/abs/{paper_id}"
+                            logger.info(f"统一 arXiv URL 为摘要页: {url_source}")
+                    
                     # 清理标题中的特殊字符，避免显示问题
                     title_cleaned = title.replace('\u2013', '-').replace('\u2014', '-')  # 替换en-dash和em-dash为普通连字符
                     title_cleaned = title_cleaned.replace('\u201c', '"').replace('\u201d', '"')  # 替换智能引号
@@ -3525,7 +4142,7 @@ class MCPTools:
                     if ('user_uploads' in file_path or file_path.startswith('./user_uploads/') or
                             file_path.startswith('./library_refs/') or file_path.startswith('library_refs/')):
                         # 用户上传文件和文档库文件：统一使用参考文献格式（带📎图标）
-                        file_icon = '<font name="EmojiFont">📎</font>'
+                        file_icon = '<font name="EmojiFont" style="font-style: normal;">📎</font>'
                         # 格式：[序号] 📎 作者. 标题[文献类型]. 来源, 时间
                         if 'author' in locals() and author and author != "[佚名]":
                             # 有作者信息
@@ -3540,17 +4157,27 @@ class MCPTools:
                             else:
                                 reference_entry = f"[{num}] {file_icon} [佚名]. {title_cleaned}[Z]. {url_source}"
                     else:
-                        # 网络文档等其他文件：使用简洁格式（不带图标，让正则表达式自动添加）
-                        # 格式：[num] 标题，URL，时间
+                        # 网络文档等其他文件：根据来源类型使用不同图标
+                        # 格式：[num] 图标 标题，URL，时间
                         if url_source.startswith('http://') or url_source.startswith('https://'):
-                            # 网页链接：使用简洁格式，正则表达式会自动添加🌐图标
+                            # 判断是否为学术论文（arXiv/PubMed/medRxiv/bioRxiv）
+                            is_academic_paper = (
+                                'arxiv.org' in url_source.lower() or 
+                                'pubmed' in url_source.lower() or 
+                                'ncbi.nlm.nih.gov' in url_source.lower() or
+                                'medrxiv.org' in url_source.lower() or
+                                'biorxiv.org' in url_source.lower()
+                            )
+                            
+                            # 所有网络引用（包括学术论文和普通网页）都使用简洁格式
+                            # 让 PDF 转换阶段的正则表达式统一添加图标（📄 或 🌐）和超链接
                             if show_time:
                                 reference_entry = f"[{num}] {title_cleaned}，{url_source}，{doc_time_cleaned}"
                             else:
                                 reference_entry = f"[{num}] {title_cleaned}，{url_source}"
                         else:
                             # 非 URL（如"用户上传文件"、"用户文档库"），使用传统格式带📎图标
-                            file_icon = '<font name="EmojiFont">📎</font>'
+                            file_icon = '<font name="EmojiFont" style="font-style: normal;">📎</font>'
                             if show_time:
                                 reference_entry = f"[{num}] {file_icon} {title_cleaned}，{url_source}，{doc_time_cleaned}"
                             else:
@@ -3687,7 +4314,7 @@ class MCPTools:
 
             # 将引用列表添加到报告末尾 - 确保即使没有找到引用也添加参考来源部分
             # 添加换页符、标题和分隔横线（间距更紧凑，线条更浅）
-            references_section = "\n\n<div style=\"page-break-before: always;\"></div>\n\n## 参考来源\n<hr style=\"border: none; border-top: 1px solid #E5E7EB; margin: 0.5em 0;\" />\n\n"
+            references_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## {ref_title}\n<hr style=\"border: none; border-top: 1px solid #E5E7EB; margin: 0.5em 0;\" />\n\n"
             if references:
                 references_section += "\n\n".join(references)
                 with open(output_file, 'a', encoding='utf-8') as outfile:
@@ -4732,20 +5359,24 @@ Strictly follow the following format for output:
 
             normalized_task_files = [normalize_path(f) for f in task_files]
 
-            # 始终扫描 library_refs 和 user_uploads 目录
+            # 始终扫描 library_refs、user_uploads 和 arxiv 目录
             library_refs_dir = self.workspace_path / "library_refs"
             user_uploads_dir = self.workspace_path / "user_uploads"
+            arxiv_dir = self.workspace_path / "arxiv"
 
             expected_files = []
-            # 扫描两个目录中的所有可能的文件扩展名
+            # 扫描三个目录中的所有可能的文件扩展名
             if library_refs_dir.exists():
                 for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
                     expected_files.extend([f"library_refs/{f.name}" for f in library_refs_dir.glob(ext)])
             if user_uploads_dir.exists():
                 for ext in ['*.txt', '*.pdf', '*.doc', '*.docx']:
                     expected_files.extend([f"user_uploads/{f.name}" for f in user_uploads_dir.glob(ext)])
+            if arxiv_dir.exists():
+                for ext in ['*.txt', '*.pdf']:
+                    expected_files.extend([f"arxiv/{f.name}" for f in arxiv_dir.glob(ext)])
 
-            # 如果这两个目录有文件，则进行补全检查
+            # 如果这些目录有文件，则进行补全检查
             if expected_files:
                 # 智能匹配：基于文件主体名称（保留原始扩展名，移除 .txt 后缀）
                 def get_core_name(path: str) -> str:
@@ -4805,10 +5436,10 @@ Strictly follow the following format for output:
 
                     logger.info(f"✅ 已补全，总任务数: {len(tasks)}")
                 else:
-                    logger.info(f"✅ 所有 library_refs/user_uploads 文件已包含")
+                    logger.info(f"✅ 所有 library_refs/user_uploads/arxiv 文件已包含")
             else:
-                # library_refs 和 user_uploads 目录都没有文件，无需补全
-                logger.info(f"跳过补全验证（library_refs/user_uploads 目录无文件）")
+                # library_refs、user_uploads 和 arxiv 目录都没有文件，无需补全
+                logger.info(f"跳过补全验证（library_refs/user_uploads/arxiv 目录无文件）")
 
             # 【关键修复】过滤掉二进制源文件，优先使用转换后的 .txt 文件
             # 如果同时存在 xxx.pdf 和 xxx.pdf.txt，只保留 .pdf.txt（可读取）
@@ -8085,217 +8716,145 @@ Strictly follow the following format for output:
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
         response = requests.get(pdf_url, verify=False, proxies=proxy)
-        output_file = f"{save_path}/{paper_id}.txt"
-        with open(output_file, 'wb') as f:
+        
+        # 确保目录存在
+        os.makedirs(save_path, exist_ok=True)
+        
+        # 先保存 PDF 文件到临时位置
+        temp_pdf_path = Path(save_path) / f"{paper_id}.pdf"
+        with open(temp_pdf_path, 'wb') as f:
             f.write(response.content)
-        return output_file
+        
+        # 提取 PDF 文本内容
+        try:
+            extracted_text = self._read_pdf_text(temp_pdf_path)
+            if not extracted_text or len(extracted_text.strip()) < 100:
+                logger.warning(f"PDF text extraction failed or content too short for {paper_id}, keeping PDF file")
+                # 如果提取失败，保留 PDF 文件
+                return str(temp_pdf_path)
+            
+            # 保存提取的文本
+            output_file = Path(save_path) / f"{paper_id}.txt"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(extracted_text)
+            
+            # 删除临时 PDF 文件
+            temp_pdf_path.unlink()
+            
+            logger.info(f"Successfully extracted text from arXiv paper {paper_id}")
+            return str(output_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to extract text from PDF {paper_id}: {e}")
+            # 提取失败时保留 PDF 文件
+            return str(temp_pdf_path)
 
     def arxiv_read_paper(self, paper_id: str, save_path: str = "./arxiv") -> MCPToolResult:
         """Read a paper and convert it to text format.
 
         Args:
             paper_id: arXiv paper ID
-            save_path: Directory where the PDF is/will be saved
+            save_path: Directory where the PDF is/will be saved (relative to workspace)
+                      Note: Should be a directory path, not a file path
 
         Returns:
             str: The extracted text content of the paper
         """
         try:
-            txt_path = f"{save_path}/{paper_id}.txt"
-            pdf_path = f"{save_path}/{paper_id}.pdf"
+            # 将 save_path 转换为相对于 workspace_path 的绝对路径
+            # 如果 save_path 以 ./ 开头，去掉它
+            if save_path.startswith('./'):
+                save_path = save_path[2:]
+            
+            # 检查 save_path 是否错误地包含了文件名（以 .txt 或其他扩展名结尾）
+            # 如果是，提取目录部分
+            if save_path.endswith('.txt') or save_path.endswith('.pdf'):
+                logger.warning(f"save_path appears to be a file path: {save_path}, extracting directory")
+                save_path = str(Path(save_path).parent)
+            
+            # 构建完整路径（相对于 workspace）
+            full_save_path = self.workspace_path / save_path
+            
+            txt_path = full_save_path / f"{paper_id}.txt"
+            pdf_path = full_save_path / f"{paper_id}.pdf"
 
+            # 计算相对于 workspace 的文件路径（用于 document_extract）
+            relative_txt_path = str(Path(save_path) / f"{paper_id}.txt")
+            
+            # 构建 arXiv URL（用于参考文献）
+            arxiv_url = f"https://arxiv.org/abs/{paper_id}"
+            
             # 如果已经存在文本文件，直接读取
-            if os.path.exists(txt_path):
+            if txt_path.exists():
                 with open(txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": relative_txt_path,
+                    "url": arxiv_url,
+                    "source_type": "arxiv",
+                    "paper_id": paper_id
+                })
 
             # 如果存在旧的PDF文件，重命名为.txt
-            if os.path.exists(pdf_path):
-                os.rename(pdf_path, txt_path)
+            if pdf_path.exists():
+                pdf_path.rename(txt_path)
                 logger.info(f"已将arxiv论文 {paper_id} 的PDF文件重命名为.txt格式")
                 with open(txt_path, 'rb') as f:
                     content = f.read()
-                return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+                return MCPToolResult(success=True, data={
+                    "paper": content.decode('utf-8', errors='ignore'),
+                    "file_path": relative_txt_path,
+                    "url": arxiv_url,
+                    "source_type": "arxiv",
+                    "paper_id": paper_id
+                })
 
             # 下载文件（download_pdf现在会直接保存为.txt）
-            txt_path = self.download_pdf(paper_id, save_path)
-            with open(txt_path, 'rb') as f:
+            txt_path_str = self.download_pdf(paper_id, str(full_save_path))
+            with open(txt_path_str, 'rb') as f:
                 content = f.read()
-            return MCPToolResult(success=True, data={"paper": content.decode('utf-8', errors='ignore')})
+            return MCPToolResult(success=True, data={
+                "paper": content.decode('utf-8', errors='ignore'),
+                "file_path": relative_txt_path,
+                "url": arxiv_url,
+                "source_type": "arxiv",
+                "paper_id": paper_id
+            })
 
         except Exception as e:
             return MCPToolResult(success=False, error=f"获取arxiv论文内容失败!{e}")
 
-    def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
-                       start_year: int = None, end_year: int = None) -> MCPToolResult:
-        """
-        Search for papers on Springer Nature using their Open Access API.
-        
-        Args:
-            query: Search query string (keywords, title, etc.)
-            max_results: Maximum number of papers to return (default: 10)
-            subject: Filter by subject area (optional)
-            start_year: Filter by start year (optional)
-            end_year: Filter by end year (optional)
-            
-        Returns:
-            MCPToolResult with list of Paper objects
-        """
-        try:
-            BASE_URL = "https://api.springernature.com/openaccess/json"
-            
-            params = {
-                'q': query,
-                'p': max_results,
-                's': 1
-            }
-            
-            if subject:
-                params['q'] = f"{params['q']} subject:{subject}"
-            
-            if start_year and end_year:
-                params['q'] = f"{params['q']} year:{start_year}-{end_year}"
-            elif start_year:
-                params['q'] = f"{params['q']} year:{start_year}-{datetime.now().year}"
-            
-            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
-            
-            if response.status_code != 200:
-                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
-            
-            data = response.json()
-            records = data.get('records', [])
-            
-            papers = []
-            for record in records:
-                try:
-                    pub_date_str = record.get('publicationDate', '')
-                    try:
-                        pub_date = datetime.strptime(pub_date_str, '%Y-%m-%d')
-                    except:
-                        try:
-                            pub_date = datetime.strptime(pub_date_str, '%Y-%m')
-                        except:
-                            pub_date = datetime.now()
-                    
-                    creators = record.get('creators', [])
-                    authors = [creator.get('creator', '') for creator in creators if isinstance(creator, dict)]
-                    
-                    doi = record.get('doi', '')
-                    paper_id = doi if doi else record.get('identifier', '')
-                    
-                    url = record.get('url', [])
-                    paper_url = url[0].get('value', '') if url and isinstance(url, list) and len(url) > 0 else f"https://doi.org/{doi}"
-                    
-                    pdf_url = ''
-                    for url_item in url:
-                        if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
-                            pdf_url = url_item.get('value', '')
-                            break
-                    
-                    abstract = record.get('abstract', '')
-                    
-                    subjects = record.get('subjects', [])
-                    categories = [subj.get('subject', '') for subj in subjects if isinstance(subj, dict)]
-                    
-                    paper = Paper(
-                        paper_id=paper_id,
-                        title=record.get('title', ''),
-                        authors=authors,
-                        abstract=abstract,
-                        doi=doi,
-                        published_date=pub_date,
-                        pdf_url=pdf_url,
-                        url=paper_url,
-                        source='springer',
-                        categories=categories,
-                        keywords=[],
-                        extra={
-                            'publisher': record.get('publisher', ''),
-                            'publicationType': record.get('publicationType', ''),
-                            'issn': record.get('issn', ''),
-                            'isbn': record.get('isbn', ''),
-                            'volume': record.get('volume', ''),
-                            'number': record.get('number', ''),
-                            'startingPage': record.get('startingPage', ''),
-                            'endingPage': record.get('endingPage', '')
-                        }
-                    )
-                    papers.append(paper.to_dict())
-                    
-                except Exception as e:
-                    logger.warning(f"解析Springer论文记录失败: {e}")
-                    continue
-            
-            return MCPToolResult(success=True, data={"papers": papers, "total": len(papers)})
-            
-        except Exception as e:
-            logger.error(f"Springer搜索失败: {e}")
-            return MCPToolResult(success=False, error=f"Springer搜索失败: {e}")
+    # DISABLED: Springer API currently unavailable
+    # def springer_search(self, query: str, max_results: int = 10, subject: str = None, 
+    #                    start_year: int = None, end_year: int = None) -> MCPToolResult:
+    #     """
+    #     Search for papers on Springer Nature using their Open Access API.
+    #     
+    #     Args:
+    #         query: Search query string (keywords, title, etc.)
+    #         max_results: Maximum number of papers to return (default: 10)
+    #         subject: Filter by subject area (optional)
+    #         start_year: Filter by start year (optional)
+    #         end_year: Filter by end year (optional)
+    #         
+    #     Returns:
+    #         MCPToolResult with list of Paper objects
+    #     """
+    #     pass
 
-    def springer_get_article(self, doi: str) -> MCPToolResult:
-        """
-        Get full article details from Springer Nature by DOI.
-        
-        Args:
-            doi: Digital Object Identifier of the paper
-            
-        Returns:
-            MCPToolResult with article content and metadata
-        """
-        try:
-            BASE_URL = "https://api.springernature.com/openaccess/json"
-            
-            params = {
-                'q': f'doi:{doi}',
-                'p': 1
-            }
-            
-            response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy, timeout=30)
-            
-            if response.status_code != 200:
-                return MCPToolResult(success=False, error=f"Springer API请求失败: HTTP {response.status_code}")
-            
-            data = response.json()
-            records = data.get('records', [])
-            
-            if not records:
-                return MCPToolResult(success=False, error=f"未找到DOI为 {doi} 的文章")
-            
-            record = records[0]
-            
-            article_content = {
-                'title': record.get('title', ''),
-                'abstract': record.get('abstract', ''),
-                'doi': record.get('doi', ''),
-                'url': record.get('url', [{}])[0].get('value', '') if record.get('url') else '',
-                'publicationDate': record.get('publicationDate', ''),
-                'publisher': record.get('publisher', ''),
-                'publicationType': record.get('publicationType', ''),
-                'creators': record.get('creators', []),
-                'subjects': record.get('subjects', []),
-                'fullText': ''
-            }
-            
-            pdf_url = ''
-            for url_item in record.get('url', []):
-                if isinstance(url_item, dict) and url_item.get('format', '') == 'pdf':
-                    pdf_url = url_item.get('value', '')
-                    article_content['pdf_url'] = pdf_url
-                    break
-            
-            if pdf_url:
-                logger.info(f"Springer开放获取文章PDF链接: {pdf_url}")
-                article_content['fullText'] = f"PDF可通过以下链接下载: {pdf_url}"
-            else:
-                article_content['fullText'] = "该文章可能不是开放获取,无法获取全文"
-            
-            return MCPToolResult(success=True, data=article_content)
-            
-        except Exception as e:
-            logger.error(f"获取Springer文章失败: {e}")
-            return MCPToolResult(success=False, error=f"获取Springer文章失败: {e}")
+    # DISABLED: Springer API currently unavailable
+    # def springer_get_article(self, doi: str) -> MCPToolResult:
+    #     """
+    #     Get full article details from Springer Nature by DOI.
+    #     
+    #     Args:
+    #         doi: Digital Object Identifier of the paper
+    #         
+    #     Returns:
+    #         MCPToolResult with article content and metadata
+    #     """
+    #     pass
 
     def medrxiv_search(self, query: str, max_results: int = 10, days: int = 30) -> List[Paper]:
         """
@@ -8311,6 +8870,7 @@ Strictly follow the following format for output:
         """
         # Calculate date range: last N days
         try:
+            BASE_URL = "https://api.medrxiv.org/pubs"
             end_date = datetime.now().strftime('%Y-%m-%d')
             start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
@@ -8320,7 +8880,7 @@ Strictly follow the following format for output:
             papers = []
             cursor = 0
             while len(papers) < max_results:
-                url = f"{self.BASE_URL}/{start_date}/{end_date}/{cursor}"
+                url = f"{BASE_URL}/{start_date}/{end_date}/{cursor}"
                 if category:
                     url += f"?category={category}"
 
@@ -9488,50 +10048,51 @@ MCP_TOOL_SCHEMAS = {
             "required": ["paper_id"]
         }
     },
-    "springer_search": {
-        "name": "springer_search",
-        "description": "Search for open access papers on Springer Nature across multiple disciplines. Returns metadata of papers including DOI, PDF links, and abstracts. Only searches open access content. Supports English queries only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query string (keywords, title, etc.), only supports English"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of papers to return (default: 10)"
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Filter by subject area (e.g., 'Computer Science', 'Earth Sciences', 'Life Sciences', 'Medicine', 'Physics', 'Chemistry', 'Mathematics', 'Engineering')"
-                },
-                "start_year": {
-                    "type": "integer",
-                    "description": "Filter by start year (e.g., 2020)"
-                },
-                "end_year": {
-                    "type": "integer",
-                    "description": "Filter by end year (e.g., 2024)"
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    "springer_get_article": {
-        "name": "springer_get_article",
-        "description": "Get full article details from Springer Nature by DOI. Returns article content, metadata, and PDF link if available. Before calling this function, first use springer_search to obtain the article's DOI.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "doi": {
-                    "type": "string",
-                    "description": "Digital Object Identifier (DOI) of the paper"
-                }
-            },
-            "required": ["doi"]
-        }
-    },
+    # DISABLED: Springer API currently unavailable
+    # "springer_search": {
+    #     "name": "springer_search",
+    #     "description": "Search for open access papers on Springer Nature across multiple disciplines. Returns metadata of papers including DOI, PDF links, and abstracts. Only searches open access content. Supports English queries only.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "query": {
+    #                 "type": "string",
+    #                 "description": "Search query string (keywords, title, etc.), only supports English"
+    #             },
+    #             "max_results": {
+    #                 "type": "integer",
+    #                 "description": "Maximum number of papers to return (default: 10)"
+    #             },
+    #             "subject": {
+    #                 "type": "string",
+    #                 "description": "Filter by subject area (e.g., 'Computer Science', 'Earth Sciences', 'Life Sciences', 'Medicine', 'Physics', 'Chemistry', 'Mathematics', 'Engineering')"
+    #             },
+    #             "start_year": {
+    #                 "type": "integer",
+    #                 "description": "Filter by start year (e.g., 2020)"
+    #             },
+    #             "end_year": {
+    #                 "type": "integer",
+    #                 "description": "Filter by end year (e.g., 2024)"
+    #             }
+    #         },
+    #         "required": ["query"]
+    #     }
+    # },
+    # "springer_get_article": {
+    #     "name": "springer_get_article",
+    #     "description": "Get full article details from Springer Nature by DOI. Returns article content, metadata, and PDF link if available. Before calling this function, first use springer_search to obtain the article's DOI.",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "doi": {
+    #                 "type": "string",
+    #                 "description": "Digital Object Identifier (DOI) of the paper"
+    #             }
+    #         },
+    #         "required": ["doi"]
+    #     }
+    # },
     "file_stats": {
         "name": "file_stats",
         "description": "Get comprehensive file statistics without reading full content - perfect for deciding reading strategy",

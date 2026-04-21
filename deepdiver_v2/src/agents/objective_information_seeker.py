@@ -34,7 +34,7 @@ class InformationSeekerAgent(BaseAgent):
         use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
-        use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'
+        # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
         # Get all available tools from MCP
         # Tool schemas have structure: {'type': 'function', 'function': {'name': '...', ...}}
@@ -51,7 +51,7 @@ class InformationSeekerAgent(BaseAgent):
             'websearch': ['batch_web_search', 'web_search'],
             'pubmed': ['pubmed', 'medrxiv'],
             'arxiv': ['arxiv'],
-            'springer': ['springer']
+            # 'springer': ['springer']  # DISABLED
         }
         
         # Dynamically filter tools based on environment variables
@@ -69,11 +69,11 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_arxiv and any(pattern in tool_lower for pattern in tool_category_patterns['arxiv']):
                 is_enabled = True
-            elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
-                is_enabled = True
+            # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
+            #     is_enabled = True
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['springer']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:

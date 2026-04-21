@@ -132,18 +132,54 @@
             return IMAGE_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
 
-        // 辅助函数：检测并处理标题中的图标（📎回形针或🌐地球仪）
-        // 使用 Font Awesome 图标替代 emoji，更美观
-        const ICON_PAPERCLIP = '<span class="inline-flex items-center justify-center w-6 h-6 rounded bg-red-50 mr-1.5"><i class="fa fa-paperclip text-red-500" style="font-size: 14px;"></i></span>';
-        const ICON_GLOBE = '<span class="inline-flex items-center justify-center w-6 h-6 rounded bg-blue-50 mr-1.5"><i class="fa fa-globe text-blue-500" style="font-size: 14px;"></i></span>';
+        // 辅助函数：检测并处理标题中的图标（📎回形针、📄学术论文或🌐地球仪）
+        // 使用 Font Awesome 图标，更美观专业
+        const ICON_PAPERCLIP = '<i class="fa fa-file-pdf-o mr-1.5" style="color: #f97316; font-size: 1em;"></i>';  // PDF文件（橙色）
+        const ICON_ACADEMIC = '<i class="fa fa-file-text-o mr-1.5" style="color: #3b82f6; font-size: 1em;"></i>';   // 学术论文（蓝色）
+        const ICON_GLOBE = '<i class="fa fa-globe mr-1.5" style="color: #3b82f6; font-size: 1em;"></i>';      // 普通网页（蓝色）
+        
+        // 检查URL是否是学术网站（与后端PDF正则表达式完全一致）
+        // 后端位置: mcp_tools.py 第623行
+        function isAcademicUrl(url) {
+            const urlLower = url.toLowerCase();
+            
+            // 排除 Nature 新闻（d41586- 开头）
+            if (urlLower.includes('nature.com/articles/d41586-')) {
+                return false;
+            }
+            
+            // 与后端正则表达式完全一致，使用精确路径匹配
+            return /(?:www\.)?arxiv\.org\/(abs|html)\//i.test(url) ||
+                   /pubmed\.ncbi\.nlm\.nih\.gov\//i.test(url) ||
+                   /pmc\.ncbi\.nlm\.nih\.gov\//i.test(url) ||
+                   /ncbi\.nlm\.nih\.gov\/pubmed\//i.test(url) ||
+                   /(?:www\.)?medrxiv\.org\/content\//i.test(url) ||
+                   /(?:www\.)?biorxiv\.org\/content\//i.test(url) ||
+                   /(?:www\.)?nature\.com\/articles\//i.test(url) ||
+                   /(?:www\.)?thelancet\.com\/(journals|article)\//i.test(url) ||
+                   /(?:www\.)?science\.org\/doi\//i.test(url) ||
+                   /(?:www\.)?cell\.com\//i.test(url) ||
+                   /(?:www\.)?nejm\.org\/doi\//i.test(url) ||
+                   /(?:www\.)?mdpi\.com\//i.test(url) ||
+                   /(?:www\.)?frontiersin\.org\/(journals|articles)\//i.test(url) ||
+                   /(?:www\.)?plos\.org\//i.test(url) ||
+                   /link\.springer\.com\/article\//i.test(url) ||
+                   /onlinelibrary\.wiley\.com\/doi\//i.test(url) ||
+                   /(?:www\.)?bmj\.com\/content\//i.test(url) ||
+                   /jamanetwork\.com\/journals\//i.test(url) ||
+                   /openreview\.net\/(forum|pdf)\?id=/i.test(url);  // OpenReview 学术网站
+        }
         
         function processReferenceIcon(title, defaultIcon) {
             let cleanTitle = title.trim();
             let icon = '';
-            // 检查开头是否包含回形针或地球仪图标（emoji 格式）
+            // 检查开头是否包含图标（emoji 格式）
             if (cleanTitle.startsWith('📎')) {
                 cleanTitle = cleanTitle.replace(/^📎\s*/, '');
                 icon = ICON_PAPERCLIP;
+            } else if (cleanTitle.startsWith('📄')) {
+                cleanTitle = cleanTitle.replace(/^📄\s*/, '');
+                icon = ICON_ACADEMIC;
             } else if (cleanTitle.startsWith('🌐')) {
                 cleanTitle = cleanTitle.replace(/^🌐\s*/, '');
                 icon = ICON_GLOBE;
@@ -155,13 +191,27 @@
         }
         
         // 6. 引用格式处理 [数字] 标题，URL，日期
-        // 根据URL类型添加图标：PDF文件用回形针，网页链接用地球仪
+        // 根据URL类型添加图标：PDF文件用📎，学术网站用📄，普通网页用🌐
         html = html.replace(/\[(\d+)\]\s+([^\n]+?)，\s*(https?:\/\/[^\s,，]+)(?:，\s*([^\n]+))?/gi, function(match, num, title, url, date) {
             const dateStr = date ? `，${date.trim()}` : '';
-            // 根据URL判断默认图标类型：PDF用回形针，网页用地球仪
-            // 识别PDF链接：以.pdf结尾，或者是arxiv/medrxiv/biorxiv的PDF链接格式
-            const isPdfUrl = /\.pdf$/i.test(url) || /arxiv\.org\/pdf\//i.test(url) || /medrxiv\.org\/content\/.*\.full\.pdf/i.test(url) || /biorxiv\.org\/content\/.*\.full\.pdf/i.test(url);
-            const defaultIcon = isPdfUrl ? ICON_PAPERCLIP : ICON_GLOBE;
+            // 判断图标类型优先级：PDF > 学术网站 > 普通网页
+            let defaultIcon;
+            
+            // 识别PDF链接：以.pdf结尾，或标题包含.pdf，或特定PDF链接格式
+            const isPdfUrl = /\.pdf$/i.test(url) || 
+                           /\.pdf/i.test(title) || 
+                           /arxiv\.org\/pdf\//i.test(url) || 
+                           /medrxiv\.org\/content\/.*\.full\.pdf/i.test(url) || 
+                           /biorxiv\.org\/content\/.*\.full\.pdf/i.test(url) ||
+                           /openreview\.net\/pdf\?id=/i.test(url);  // OpenReview PDF
+            
+            if (isPdfUrl) {
+                defaultIcon = ICON_PAPERCLIP;  // PDF文件用📎图标
+            } else if (isAcademicUrl(url)) {
+                defaultIcon = ICON_ACADEMIC;  // 学术网站用📄图标
+            } else {
+                defaultIcon = ICON_GLOBE;  // 普通网页用🌐图标
+            }
             const { cleanTitle, icon } = processReferenceIcon(title, defaultIcon);
             const rendered = `[${num}] ${icon}${cleanTitle}，<a href="${url}" class="text-blue-600 hover:underline" target="_blank">${url}</a>${dateStr}`;
             codeBlocks.push(rendered);
@@ -871,22 +921,23 @@
             <!-- 附件展示区（显示已上传的文件预览卡片） -->
              <div id="attachments-bar" class="mb-3 flex flex-wrap gap-2 max-h-32 overflow-y-auto scrollbar-thumb-rounded hidden"></div>
              
-             <form id="chat-form" class="flex items-center">
+             <form id="chat-form" class="flex flex-wrap items-center gap-2">
                 <textarea 
                     id="user-input" 
-                    placeholder="请输入您的研究问题..." 
+                    placeholder="输入研究问题 · 已适配PubMed/arXiv/medRxiv源，生成文献综述"
                     class="flex-1 rounded-lg p-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none transition-all duration-200" 
+                    style="min-width: 300px;"
                     rows="1"
                 ></textarea>
                 <!-- 搜索源选择（仅DeepDiver模式显示） -->
-                <div id="search-sources-container" class="ml-3 relative hidden">
+                <div id="search-sources-container" class="relative hidden">
                     <button type="button" id="search-source-btn" class="px-3 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors flex items-center space-x-2 text-sm" title="选择搜索源">
                         <i class="fa fa-globe text-blue-500"></i>
                         <span id="search-source-label" class="text-gray-700">全网...</span>
                         <i class="fa fa-chevron-down text-gray-400 text-xs"></i>
                     </button>
                     <!-- 下拉菜单 - 使用bottom定位避免被遮挡 -->
-                    <div id="search-source-dropdown" class="absolute left-0 bottom-full mb-2 w-48 bg-white border border-gray-200 rounded-lg shadow-xl hidden" style="z-index: 9999;">
+                    <div id="search-source-dropdown" class="absolute left-0 bottom-full mb-2 w-56 bg-white border border-gray-200 rounded-lg shadow-xl hidden" style="z-index: 9999;">
                         <div class="py-1">
                             <!-- 全选所有源选项 -->
                             <label class="cursor-pointer transition-colors hover:bg-gray-50 border-b border-gray-200" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
@@ -909,7 +960,7 @@
                             <label class="cursor-pointer transition-colors hover:bg-gray-50" style="display: grid; grid-template-columns: 20px 20px 1fr; gap: 8px; align-items: center; padding: 8px 16px; min-height: 36px;">
                                 <input type="checkbox" value="pubmed" class="search-source-checkbox search-source-item" style="width: 16px; height: 16px; margin: 0;" checked>
                                 <i class="fa fa-heartbeat text-red-500" style="width: 16px; text-align: center;"></i>
-                                <span class="text-sm text-gray-700">Pubmed</span>
+                                <span class="text-sm text-gray-700">PubMed/medRxiv</span>
                             </label>
                         </div>
                     </div>
@@ -1886,7 +1937,7 @@ function copyToClipboard(text, button) {
             const searchSourcesContainer = document.getElementById('search-sources-container');
             
             if (tabName === 'deepdiver') {
-                userInput.placeholder = '请输入您的研究问题...';
+                userInput.placeholder = '输入研究问题 · 已适配PubMed/arXiv/medRxiv源，生成文献综述';
                 // DeepDiver模式：隐藏"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.add('hidden');
@@ -1901,7 +1952,7 @@ function copyToClipboard(text, button) {
                     searchSourcesContainer.classList.remove('hidden');
                 }
             } else if (tabName === 'chat') {
-                userInput.placeholder = '请输入您的问题...';
+                userInput.placeholder = '输入问题 · 快速对话和文件辅助';
                 // Chat模式：显示"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.remove('hidden');
@@ -1916,7 +1967,7 @@ function copyToClipboard(text, button) {
                     searchSourcesContainer.classList.add('hidden');
                 }
             } else if (tabName === 'reasoner') {
-                userInput.placeholder = '请输入需要推理的问题...';
+                userInput.placeholder = '输入推理问题 · 展示完整思考过程';
                 // Reasoner模式：隐藏"全文提示"开关
                 if (ragFullToggleLabel) {
                     ragFullToggleLabel.classList.add('hidden');
@@ -2354,7 +2405,10 @@ function copyToClipboard(text, button) {
             // 显示加载状态
             const loadingDiv = document.createElement('div');
             loadingDiv.className = 'mb-6 flex justify-start message-animation';
-            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : '正在思考…';
+            const _hasChinese = /[\u4e00-\u9fff]/.test(message);
+            const statusText = ((window.selectedTab || '').trim() === 'deepdiver') 
+                ? (_hasChinese ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
+                : (_hasChinese ? '正在思考…' : 'Thinking…');
             loadingDiv.innerHTML = `
                 <div class="flex items-start max-w-[80%]">
                     <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
@@ -2595,7 +2649,7 @@ ${contextText.trim()}
                         
                         let chatSearchResults = [];
                         
-                        fetch('http://localhost:5000/api/chat/search_enhanced', {
+                        fetch('/5000/api/chat/search_enhanced', {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json',
@@ -2945,7 +2999,7 @@ ${contextText.trim()}
                 let reasonerSearchResults = [];
                 
                 // 发送API请求到后端联网搜索增强接口（流式输出）
-                fetch('http://localhost:5000/api/chat/search_enhanced', {
+                fetch('/5000/api/chat/search_enhanced', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -3371,7 +3425,8 @@ ${contextText.trim()}
                     search_sources: selectedSources  // 添加搜索源选择
                 };
                 // 3. 先建立SSE连接（在发送任务请求之前），确保能接收所有进度消息
-                console.log('[DeepDiver] 步骤1: 建立SSE连接, taskId:', taskId);
+                const sseStartTime = Date.now();
+                console.log('[DeepDiver] 步骤1: 建立SSE连接, taskId:', taskId, 'timestamp:', sseStartTime);
                 const eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
                 // 创建进度展示容器（替换静态的loadingDiv）
                 loadingDiv.remove();
@@ -3384,7 +3439,7 @@ ${contextText.trim()}
                         <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
                             <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
                                 <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
-                                <span class="text-sm text-gray-600">正在连接...</span>
+                                <span class="text-sm text-gray-600">${/[\u4e00-\u9fff]/.test(message) ? '正在连接...' : 'Connecting...'}</span>
                             </div>
                             <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
                             </div>
@@ -3400,14 +3455,16 @@ ${contextText.trim()}
                 let sseConnected = false;
                 // SSE连接成功回调
                 eventSource.onopen = () => {
-                    console.log('[DeepDiver] SSE连接已建立');
+                    const sseOpenTime = Date.now();
+                    const sseOpenDelay = sseOpenTime - sseStartTime;
+                    console.log('[DeepDiver] SSE连接已建立, 耗时:', sseOpenDelay, 'ms, timestamp:', sseOpenTime);
                     sseConnected = true;
                     const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
                     if (statusSpan) {
-                        statusSpan.textContent = '正在生成报告';
+                        statusSpan.textContent = /[\u4e00-\u9fff]/.test(message) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...';
                     }
                     // SSE连接建立后，立即发送任务请求
-                    console.log('[DeepDiver] 步骤2: SSE连接就绪，现在发送任务请求');
+                    console.log('[DeepDiver] 步骤2: SSE连接就绪，现在发送任务请求, timestamp:', Date.now());
                     sendDeepDiverTask();
                 };
                 // SSE消息处理
@@ -3422,16 +3479,17 @@ ${contextText.trim()}
                             progressItem.className = 'flex items-start py-1';
                             let detailsHtml = '';
                             let subtaskListHtml = '';
+                            const _isCnMsg = /[\u4e00-\u9fff]/.test(data.message);
                             if (data.details) {
                                 if (data.stage === 'info_seeking' && data.details.subtask_names && data.details.subtask_names.length > 0) {
-                                    detailsHtml = ` · ${data.details.subtasks_count}个子任务`;
+                                    detailsHtml = _isCnMsg ? ` · ${data.details.subtasks_count}个子任务` : ` · ${data.details.subtasks_count} subtasks`;
                                     subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${data.details.subtask_names.map(task => `<div class="flex items-start"><span class="mr-1">-</span><span>${task}</span></div>`).join('')}</div>`;
                                 } else if (data.stage === 'writing_started' && data.details.file_names && data.details.file_names.length > 0) {
                                     const totalRetrieved = data.details.total_retrieved_count || data.details.key_files_count;
-                                    detailsHtml = `开始撰写报告 · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）`;
+                                    detailsHtml = _isCnMsg ? ` · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）` : ` · Based on ${data.details.key_files_count} key files (${totalRetrieved} references retrieved)`;
                                     const displayFiles = data.details.file_names.slice(0, 5);
                                     const hasMore = data.details.key_files_count > 5;
-                                    subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">...还有${data.details.key_files_count - 5}个文件</div>` : ''}</div>`;
+                                    subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">${_isCnMsg ? '...还有' : '...and '}${data.details.key_files_count - 5}${_isCnMsg ? '个文件' : ' more files'}</div>` : ''}</div>`;
                                 } else if (data.stage === 'writing_chapter') {
                                     detailsHtml = '';
                                 }
@@ -3453,7 +3511,7 @@ ${contextText.trim()}
                             const timeline = document.getElementById(`progress-timeline-${taskId}`);
                             const errorItem = document.createElement('div');
                             errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
-                            errorItem.innerHTML = `<span class="mr-2">•</span><span>错误: ${data.message}</span>`;
+                            errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '错误' : 'Error'}: ${data.message}</span>`;
                             if (timeline) timeline.appendChild(errorItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
@@ -3461,7 +3519,7 @@ ${contextText.trim()}
                             const timeline = document.getElementById(`progress-timeline-${taskId}`);
                             const cancelledItem = document.createElement('div');
                             cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
-                            cancelledItem.innerHTML = `<span class="mr-2">•</span><span>任务已取消</span>`;
+                            cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(message) ? '任务已取消' : 'Task cancelled'}</span>`;
                             if (timeline) timeline.appendChild(cancelledItem);
                             eventSource.close();
                             delete window.sessionEventSources[sessionId];
@@ -3471,13 +3529,17 @@ ${contextText.trim()}
                     }
                 };
                 eventSource.onerror = (error) => {
-                    console.error('[SSE] 连接错误:', error);
+                    const errorTime = Date.now();
+                    const errorDelay = errorTime - sseStartTime;
+                    console.error('[SSE] 连接错误:', error, '发生时间:', errorDelay, 'ms后, timestamp:', errorTime, 'readyState:', eventSource.readyState);
                     eventSource.close();
                     delete window.sessionEventSources[sessionId];
                 };
                 // 4. 定义发送任务的函数（在SSE连接建立后调用）
                 const sendDeepDiverTask = () => {
-                    console.log('[DeepDiver] 步骤3: 发送任务到后端API');
+                    const taskSendTime = Date.now();
+                    const delaySinceSSEStart = taskSendTime - sseStartTime;
+                    console.log('[DeepDiver] 步骤3: 发送任务到后端API, timestamp:', taskSendTime, 'SSE建立后延迟:', delaySinceSSEStart, 'ms');
                     fetch('/8000/api/query', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -3624,44 +3686,58 @@ ${contextText.trim()}
                             result = data.final_report;
                             has_report = 1;
                             try {
+                                // 方法1: 查找第一个 # 标题
                                 const titleMatch = result.match(/^#\s+(.+?)$/m);
                                 if (titleMatch && titleMatch[1]) {
                                     report_title = titleMatch[1].trim();
                                 } else {
+                                    // 方法2: 查找第一行非空内容作为标题
                                     const lines = result.split('\n').filter(line => line.trim());
                                     if (lines.length > 0) {
                                         report_title = lines[0].replace(/^#+\s*/, '').trim();
                                     }
                                 }
+                                // 限制标题长度（最多50个字符）
                                 if (report_title.length > 50) {
                                     report_title = report_title.substring(0, 50) + '...';
                                 }
+                                // 如果仍然没有标题，使用默认值
                                 if (!report_title) {
                                     report_title = '研究报告';
                                 }
+                                console.log("提取的报告标题：", report_title);
                             } catch (e) {
+                                console.warn("提取标题失败：", e);
                                 report_title = '研究报告';
                             }
                         }
                         if (result === null) {
                             report_title = '';
+                            // 安全检查：确保 planner_result 和 task_summary 存在
                             if (data.planner_result && data.planner_result.task_summary) {
                                 result = extractAnswer(data.planner_result.task_summary);
                             } else {
                                 result = '任务执行完成，但未生成报告内容。';
+                                console.warn('[DeepDiver] planner_result 或 task_summary 不存在');
                             }
-                        }
+                        } 
+                        // 提取"完整答案"到"任务已圆满完成"之间的信息
                         function extractAnswer(content) {
+                            // 使用正则表达式匹配
                             const regex = /## 完整答案[\s\S]*?(?=任务已圆满完成)/;
                             const match = content.match(regex);
+                            
                             if (match) {
+                                // 去除开头的"## 完整答案"和多余空格
                                 let answer = match[0].replace(/## 完整答案\n*/, '').trim();
+                                // 添加任务已圆满完成的结论
                                 answer += '\n\n任务已圆满完成';
                                 return answer;
                             } else {
-                                return content;
+                                return content; // 如果没有匹配到，返回原始内容
                             }
                         }
+                        // 检查响应数据
                         if (result) {
                             console.log('[DeepDiver] 收到报告，长度:', result.length, '(由SSE completed事件加载显示)');
                             if (window.currentSessionId === sessionId) {
@@ -3759,12 +3835,21 @@ ${contextText.trim()}
             // 注意：统计信息仍保留在 rawText 中用于提取展示
             if (sender === 'ai' && hasReport === 1) {
                 try {
+                    // 匹配中文版本的统计信息
                     // 匹配带换页符的新格式：<div style="page-break-before: always;"></div>
                     formattedText = formattedText.replace(/\n*<div style="page-break-before: always;"><\/div>\s*\n*##\s*报告统计信息[\s\S]*$/g, '');
                     // 匹配标题格式（无换页符）：## 报告统计信息
                     formattedText = formattedText.replace(/\n*---\s*\n\s*##\s*报告统计信息[\s\S]*$/g, '');
                     // 兼容旧的粗体格式：**报告统计信息**
                     formattedText = formattedText.replace(/\n*---\s*\n\s*\*\*报告统计信息\*\*[\s\S]*$/g, '');
+                    
+                    // 匹配英文版本的统计信息
+                    // 匹配带换页符的新格式：<div style="page-break-before: always;"></div>
+                    formattedText = formattedText.replace(/\n*<div style="page-break-before: always;"><\/div>\s*\n*##\s*Report Statistics[\s\S]*$/g, '');
+                    // 匹配标题格式（无换页符）：## Report Statistics
+                    formattedText = formattedText.replace(/\n*---\s*\n\s*##\s*Report Statistics[\s\S]*$/g, '');
+                    // 兼容旧的粗体格式：**Report Statistics**
+                    formattedText = formattedText.replace(/\n*---\s*\n\s*\*\*Report Statistics\*\*[\s\S]*$/g, '');
                 } catch (e) {}
             }
             
@@ -3858,33 +3943,56 @@ ${contextText.trim()}
             // 3. 如果是报告消息，从内容中提取并显示统计信息（字数和耗时）
             if (sender === 'ai' && hasReport === 1) {
                 try {
-                    // 从报告内容末尾提取统计信息
-                    const wordCountMatch = rawText.match(/报告字数[：:]\s*([\d,]+)\s*字/);
-                    const executionTimeMatch = rawText.match(/生成耗时[：:]\s*([\d.]+)\s*秒/);
-                    const webSearchMatch = rawText.match(/网站检索[：:]\s*([\d,]+)\s*次/);
+                    // 从报告内容末尾提取统计信息（支持中英文格式）
+                    // 中文格式匹配
+                    let wordCountMatch = rawText.match(/报告字数[：:]\s*([\d,]+)\s*字/);
+                    let executionTimeMatch = rawText.match(/生成耗时[：:]\s*([\d.]+)\s*秒/);
+                    let webSearchMatch = rawText.match(/网站检索[：:]\s*([\d,]+)\s*次/);
+                    
+                    // 英文格式匹配（如果中文匹配失败）
+                    if (!wordCountMatch) {
+                        wordCountMatch = rawText.match(/Word Count[：:]\s*([\d,]+)\s*words/);
+                    }
+                    if (!executionTimeMatch) {
+                        executionTimeMatch = rawText.match(/Generation Time[：:]\s*([\d.]+)\s*seconds/);
+                    }
+                    if (!webSearchMatch) {
+                        webSearchMatch = rawText.match(/Web Searches[：:]\s*([\d,]+)\s*times/);
+                    }
                     
                     if (wordCountMatch || executionTimeMatch || webSearchMatch) {
                         const statsDiv = document.createElement('div');
                         statsDiv.className = 'flex items-center space-x-4 mt-2 text-xs text-gray-500';
                         
+                        // 检测是否为英文报告（通过是否匹配到英文格式判断）
+                        const isEnglish = rawText.match(/Word Count[：:]\s*([\d,]+)\s*words/) || 
+                                         rawText.match(/Generation Time[：:]\s*([\d.]+)\s*seconds/) || 
+                                         rawText.match(/Web Searches[：:]\s*([\d,]+)\s*times/);
+                        
                         if (wordCountMatch) {
                             const wordCount = wordCountMatch[1].replace(/,/g, '');
                             const wordCountSpan = document.createElement('span');
-                            wordCountSpan.innerHTML = `<i class="fa fa-file-text-o mr-1"></i>字数: ${parseInt(wordCount).toLocaleString()}`;
+                            wordCountSpan.innerHTML = isEnglish 
+                                ? `<i class="fa fa-file-text-o mr-1"></i>Word Count: ${parseInt(wordCount).toLocaleString()}`
+                                : `<i class="fa fa-file-text-o mr-1"></i>字数: ${parseInt(wordCount).toLocaleString()}`;
                             statsDiv.appendChild(wordCountSpan);
                         }
                         
                         if (executionTimeMatch) {
                             const executionTime = parseFloat(executionTimeMatch[1]);
                             const timeSpan = document.createElement('span');
-                            timeSpan.innerHTML = `<i class="fa fa-clock-o mr-1"></i>耗时: ${executionTime.toFixed(2)}秒`;
+                            timeSpan.innerHTML = isEnglish
+                                ? `<i class="fa fa-clock-o mr-1"></i>Time: ${executionTime.toFixed(2)}s`
+                                : `<i class="fa fa-clock-o mr-1"></i>耗时: ${executionTime.toFixed(2)}秒`;
                             statsDiv.appendChild(timeSpan);
                         }
 
                         if (webSearchMatch) {
                             const totalSearch = webSearchMatch[1].replace(/,/g, '');
                             const webSpan = document.createElement('span');
-                            webSpan.innerHTML = `<i class="fa fa-globe mr-1"></i>检索: ${parseInt(totalSearch).toLocaleString()}次`;
+                            webSpan.innerHTML = isEnglish
+                                ? `<i class="fa fa-globe mr-1"></i>Searches: ${parseInt(totalSearch).toLocaleString()}`
+                                : `<i class="fa fa-globe mr-1"></i>检索: ${parseInt(totalSearch).toLocaleString()}次`;
                             statsDiv.appendChild(webSpan);
                         }
                         
@@ -4611,10 +4719,12 @@ ${contextText.trim()}
                                                     const pending = document.createElement('div');
                                                     pending.className = 'mb-6 flex justify-start message-animation pending-spinner';
                                                     
-                                                    // 根据后端返回的模式显示不同的提示文本
+                                                    // 根据后端返回的模式显示不同的提示文本（根据最后一条用户消息语言切换）
+                                                    const _lastUserMsg = data.messages.filter(m => m.from_who === 'user').pop();
+                                                    const _isCn = _lastUserMsg ? /[\u4e00-\u9fff]/.test(_lastUserMsg.content) : true;
                                                     const statusText = (queryModel === 'deepdiver') 
-                                                        ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' 
-                                                        : '正在思考…';
+                                                        ? (_isCn ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...')
+                                                        : (_isCn ? '正在思考…' : 'Thinking…');
                                                     
                                                     pending.innerHTML = `
                                                         <div class="flex items-start max-w-[80%]">
@@ -6592,7 +6702,7 @@ ${contextText.trim()}
                         <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
                             <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
                                 <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
-                                <span class="text-sm text-gray-600">正在生成报告</span>
+                                <span class="text-sm text-gray-600">${(() => { const _msgs = chatMessages.querySelectorAll('.justify-end .message-container div'); const _lastMsg = _msgs.length > 0 ? _msgs[_msgs.length - 1].textContent : ''; return /[\u4e00-\u9fff]/.test(_lastMsg) ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' : 'SciAssistant is planning, researching, and generating the report. This may take about 20 minutes, please wait...'; })()}</span>
                             </div>
                             <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
                                 <!-- 进度条目将动态插入 -->
@@ -6638,16 +6748,17 @@ ${contextText.trim()}
                         // 构建进度消息的唯一标识（用于去重）
                         let detailsHtml = '';
                         let subtaskListHtml = '';
+                        const _isCnMsg2 = /[\u4e00-\u9fff]/.test(data.message);
                         if (data.details) {
                             if (data.stage === 'info_seeking' && data.details.subtask_names && data.details.subtask_names.length > 0) {
-                                detailsHtml = ` · ${data.details.subtasks_count}个子任务`;
+                                detailsHtml = _isCnMsg2 ? ` · ${data.details.subtasks_count}个子任务` : ` · ${data.details.subtasks_count} subtasks`;
                                 subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${data.details.subtask_names.map(task => `<div class="flex items-start"><span class="mr-1">-</span><span>${task}</span></div>`).join('')}</div>`;
                             } else if (data.stage === 'writing_started' && data.details.file_names && data.details.file_names.length > 0) {
                                 const totalRetrieved = data.details.total_retrieved_count || data.details.key_files_count;
-                                detailsHtml = ` · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）`;
+                                detailsHtml = _isCnMsg2 ? ` · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）` : ` · Based on ${data.details.key_files_count} key files (${totalRetrieved} references retrieved)`;
                                 const displayFiles = data.details.file_names.slice(0, 5);
                                 const hasMore = data.details.key_files_count > 5;
-                                subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">...还有${data.details.key_files_count - 5}个文件</div>` : ''}</div>`;
+                                subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">${_isCnMsg2 ? '...还有' : '...and '}${data.details.key_files_count - 5}${_isCnMsg2 ? '个文件' : ' more files'}</div>` : ''}</div>`;
                             }
                         }
                         // 创建临时元素以获取文本内容用于去重
@@ -6691,7 +6802,7 @@ ${contextText.trim()}
                     } else if (data.type === 'error') {
                         const errorItem = document.createElement('div');
                         errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
-                        errorItem.innerHTML = `<span class="mr-2">•</span><span>错误: ${data.message}</span>`;
+                        errorItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message) ? '错误' : 'Error'}: ${data.message}</span>`;
                         const errTimeline = document.getElementById(`progress-timeline-${taskId}`);
                         if (errTimeline) errTimeline.appendChild(errorItem);
                         eventSource.close();
@@ -6706,7 +6817,7 @@ ${contextText.trim()}
                     } else if (data.type === 'cancelled') {
                         const cancelledItem = document.createElement('div');
                         cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
-                        cancelledItem.innerHTML = `<span class="mr-2">•</span><span>任务已取消</span>`;
+                        cancelledItem.innerHTML = `<span class="mr-2">•</span><span>${/[\u4e00-\u9fff]/.test(data.message || '') ? '任务已取消' : 'Task cancelled'}</span>`;
                         const cancelTimeline = document.getElementById(`progress-timeline-${taskId}`);
                         if (cancelTimeline) cancelTimeline.appendChild(cancelledItem);
                         eventSource.close();
