@@ -2327,36 +2327,8 @@ function copyToClipboard(text, button) {
             // 【并发控制】DeepDiver模式：在显示加载状态之前先检查并发状态
             if (window.selectedTab === 'deepdiver') {
                 try {
-                    const concurrencyResp = await fetch('/8000/api/concurrency');
-                    if (concurrencyResp.ok) {
-                        const concurrencyData = await concurrencyResp.json();
-                        console.log('[DeepDiver] 并发状态预检查:', concurrencyData);
-                        
-                        if (concurrencyData.status === 'busy') {
-                            // 超过4个query，直接拒绝服务，不显示加载状态
-                            const busyMessage = '抱歉，服务暂时拥挤，建议10分钟后再尝试';
-                            if (window.currentSessionId === sessionId) {
-                                addMessage(busyMessage, 'ai');
-                            }
-                            // 将拒绝消息保存到数据库
-                            console.log('[DeepDiver] 保存拒绝消息到数据库, sessionId:', sessionId);
-                            saveResultToDB(busyMessage, sessionId, 'ai');
-                            // 清理pending状态，防止切换会话后显示"正在整理报告..."
-                            window.pendingSessions = window.pendingSessions || {};
-                            if (window.pendingSessions[sessionId]) {
-                                window.pendingSessions[sessionId].loading = false;
-                                window.pendingSessions[sessionId].spinner = null;
-                            }
-                            // 恢复按钮状态
-                            submitButton.disabled = false;
-                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                            cancelButton.classList.add('hidden');
-                            return;
-                        } else if (concurrencyData.status === 'queuing') {
-                            // 等于4个query，显示排队提示但继续处理
-                            showToast('当前平台用户较多，你的请求正在排队处理中，感谢您的耐心等待~', 'warning');
-                        }
-                    }
+                    // 移除前端并发预检查，让后端统一处理队列逻辑
+                    // 所有请求都发送到后端，由后端决定是立即执行还是加入队列
                 } catch (e) {
                     console.warn('[DeepDiver] 并发状态预检查失败，继续发送请求:', e);
                 }
@@ -3135,149 +3107,400 @@ ${contextText.trim()}
                         'Content-Type': 'application/json',
                     },
                     signal: window.sessionControllers[sessionId]?.signal,
-                    body: JSON.stringify(requestBody)  // 使用完整的requestBody，包含user_files
+                    body: JSON.stringify(requestBody)
                 })
                 .then(response => {
-                    loadingDiv.remove();
                     if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
                     return response.json();
                 })
                 .then(data => {
+                    // 检查是否为队列响应
+                    if (data.planner_agent_name === 'QueueManager' && data.planner_error && data.planner_error.includes('排队位置')) {
+                        loadingDiv.remove();
+                        
+                        // 创建队列状态显示
+                        const queueDiv = document.createElement('div');
+                        queueDiv.className = 'mb-6 flex justify-start message-animation';
+                        queueDiv.id = `queue-status-${taskId}`;
+                        queueDiv.innerHTML = `
+                            <div class="flex items-start max-w-[80%]">
+                                <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                <div class="bg-blue-50 border-l-4 border-blue-500 text-gray-800 p-4 rounded-lg shadow-sm w-full">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <div class="flex items-center">
+                                            <i class="fa fa-clock-o mr-2 text-blue-500"></i>
+                                            <span class="font-semibold text-blue-700">任务队列状态</span>
+                                        </div>
+                                        <button id="cancel-queue-${taskId}" class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200">
+                                            <i class="fa fa-times mr-1"></i>取消任务
+                                        </button>
+                                    </div>
+                                    <div class="text-sm space-y-1">
+                                        <div class="flex items-center">
+                                            <span class="text-gray-600">队列状态：</span>
+                                            <span class="ml-2 px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">运行中 <span id="running-${taskId}">-</span></span>
+                                            <span class="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">处理中 <span id="queued-${taskId}">-</span></span>
+                                        </div>
+                                        <div class="flex items-center mt-2">
+                                            <span class="text-gray-600">当前位置：第</span>
+                                            <span class="ml-1 text-lg font-bold text-blue-600" id="position-${taskId}">-</span>
+                                            <span class="text-gray-600">位</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                        chatMessages.appendChild(queueDiv);
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        
+                        // 为队列中的取消按钮添加事件监听器
+                        const queueCancelBtn = document.getElementById(`cancel-queue-${taskId}`);
+                        queueCancelBtn.addEventListener('click', async () => {
+                            try {
+                                const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                    },
+                                    body: JSON.stringify({
+                                        reason: '用户主动取消排队任务'
+                                    })
+                                });
+                                
+                                const cancelData = await cancelResponse.json();
+                                console.log('队列任务取消成功:', cancelData);
+                                
+                                // 停止轮询
+                                if (typeof pollInterval !== 'undefined') {
+                                    clearInterval(pollInterval);
+                                }
+                                
+                                // 移除队列状态显示
+                                queueDiv.remove();
+                                
+                                // 清理会话状态
+                                if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) {
+                                    delete window.sessionTasks[sessionId];
+                                }
+                                
+                                // 显示取消消息
+                                const cancelMsgDiv = document.createElement('div');
+                                cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                                cancelMsgDiv.innerHTML = `
+                                    <div class="flex items-start max-w-[80%]">
+                                        <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                        <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
+                                            <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p>
+                                        </div>
+                                    </div>
+                                `;
+                                chatMessages.appendChild(cancelMsgDiv);
+                                chatMessages.scrollTop = chatMessages.scrollHeight;
+                                
+                                // 保存取消消息到数据库
+                                saveResultToDB(cancelData.message, sessionId, 'ai');
+                                
+                                // 恢复UI状态
+                                submitButton.disabled = false;
+                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                document.getElementById('cancel-button').classList.add('hidden');
+                                
+                            } catch (error) {
+                                console.error('取消队列任务失败:', error);
+                                showToast('取消任务失败，请重试', 'error');
+                            }
+                        });
+                        
+                        // 轮询队列状态
+                        const pollInterval = setInterval(async () => {
+                            try {
+                                const queueResp = await fetch('/8000/api/queue/status');
+                                const queueData = await queueResp.json();
+                                
+                                document.getElementById(`running-${taskId}`).textContent = queueData.running_count;
+                                document.getElementById(`queued-${taskId}`).textContent = queueData.queued_count;
+                                
+                                const myTask = queueData.queued_tasks.find(t => t.task_id === taskId);
+                                if (myTask) {
+                                    document.getElementById(`position-${taskId}`).textContent = myTask.position;
+                                } else {
+                                    // 任务已开始执行，停止队列轮询
+                                    clearInterval(pollInterval);
+                                    queueDiv.remove();
+                                    
+                                    // 显示执行中状态（带中断按钮）
+                                    const execDiv = document.createElement('div');
+                                    execDiv.className = 'mb-6 flex justify-start message-animation';
+                                    execDiv.id = `exec-status-${taskId}`;
+                                    execDiv.innerHTML = `
+                                        <div class="flex items-start max-w-[80%]">
+                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                            <div class="bg-ai-message text-gray-800 p-4 rounded-lg shadow-sm">
+                                                <div class="flex items-center justify-between">
+                                                    <div class="flex items-center">
+                                                        <i class="fa fa-spinner fa-spin mr-2 text-gray-500"></i>
+                                                        <span class="text-gray-600 text-sm">SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...</span>
+                                                    </div>
+                                                    <button id="cancel-exec-${taskId}" class="ml-4 px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200 flex-shrink-0">
+                                                        <i class="fa fa-times mr-1"></i>中断
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `;
+                                    chatMessages.appendChild(execDiv);
+                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                    
+                                    // 显示全局中断按钮
+                                    document.getElementById('cancel-button').classList.remove('hidden');
+                                    
+                                    // 开始轮询任务执行状态，直到任务完成
+                                    let taskResultPollStopped = false;
+                                    const taskResultPollInterval = setInterval(async () => {
+                                        if (taskResultPollStopped) return;
+                                        
+                                        try {
+                                            const taskStatusResp = await fetch(`/8000/api/task/${taskId}`);
+                                            const taskStatus = await taskStatusResp.json();
+                                            console.log(`Task ${taskId} status:`, taskStatus.status);
+                                            
+                                            // 检查任务是否完成、失败或取消
+                                            if (taskStatus.status === 'completed' || taskStatus.status === 'failed' || taskStatus.status === 'cancelled') {
+                                                taskResultPollStopped = true;
+                                                clearInterval(taskResultPollInterval);
+                                                
+                                                // 移除执行状态显示
+                                                const execStatusDiv = document.getElementById(`exec-status-${taskId}`);
+                                                if (execStatusDiv) execStatusDiv.remove();
+                                                
+                                                // 恢复UI状态
+                                                submitButton.disabled = false;
+                                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                                document.getElementById('cancel-button').classList.add('hidden');
+                                                
+                                                if (taskStatus.status === 'completed' && taskStatus.result) {
+                                                    // 任务完成，显示结果
+                                                    let result = null;
+                                                    let has_report = 0;
+                                                    let report_title = '';
+                                                    
+                                                    if (taskStatus.result.final_report) {
+                                                        result = taskStatus.result.final_report;
+                                                        has_report = 1;
+                                                        try {
+                                                            const titleMatch = result.match(/^#\s+(.+?)$/m);
+                                                            if (titleMatch && titleMatch[1]) {
+                                                                report_title = titleMatch[1].trim();
+                                                            }
+                                                            if (report_title.length > 50) {
+                                                                report_title = report_title.substring(0, 50) + '...';
+                                                            }
+                                                            if (!report_title) report_title = '研究报告';
+                                                        } catch (e) {
+                                                            report_title = '研究报告';
+                                                        }
+                                                    } else if (taskStatus.result.planner_result && taskStatus.result.planner_result.task_summary) {
+                                                        result = taskStatus.result.planner_result.task_summary;
+                                                    } else {
+                                                        result = '任务执行完成。';
+                                                    }
+                                                    
+                                                    if (result && window.currentSessionId === sessionId) {
+                                                        addMessage(result, 'ai', taskStatus.result.session_id || '', has_report);
+                                                    }
+                                                } else if (taskStatus.status === 'cancelled') {
+                                                    // 任务被取消
+                                                    const cancelMsgDiv = document.createElement('div');
+                                                    cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                                                    cancelMsgDiv.innerHTML = `
+                                                        <div class="flex items-start max-w-[80%]">
+                                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                                            <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
+                                                                <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>任务已取消</p>
+                                                            </div>
+                                                        </div>
+                                                    `;
+                                                    chatMessages.appendChild(cancelMsgDiv);
+                                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                                } else if (taskStatus.status === 'failed') {
+                                                    // 任务失败
+                                                    const errorMsg = taskStatus.error || '任务执行失败';
+                                                    const failMsgDiv = document.createElement('div');
+                                                    failMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                                                    failMsgDiv.innerHTML = `
+                                                        <div class="flex items-start max-w-[80%]">
+                                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                                            <div class="bg-red-50 text-red-700 p-3 rounded-lg shadow-sm">
+                                                                <p class="text-sm"><i class="fa fa-exclamation-circle mr-1"></i>${errorMsg}</p>
+                                                            </div>
+                                                        </div>
+                                                    `;
+                                                    chatMessages.appendChild(failMsgDiv);
+                                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                                }
+                                            }
+                                        } catch (err) {
+                                            console.error('任务状态轮询失败:', err);
+                                        }
+                                    }, 5000); // 每5秒轮询一次任务状态
+                                    
+                                    // 为执行中状态的中断按钮添加事件监听器
+                                    const execCancelBtn = document.getElementById(`cancel-exec-${taskId}`);
+                                    execCancelBtn.addEventListener('click', async () => {
+                                        try {
+                                            const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
+                                                method: 'POST',
+                                                headers: {
+                                                    'Content-Type': 'application/json',
+                                                },
+                                                body: JSON.stringify({
+                                                    reason: '用户主动取消执行中任务'
+                                                })
+                                            });
+                                            
+                                            const cancelData = await cancelResponse.json();
+                                            console.log('执行中任务取消成功:', cancelData);
+                                            
+                                            // 停止任务状态轮询
+                                            taskResultPollStopped = true;
+                                            clearInterval(taskResultPollInterval);
+                                            
+                                            // 移除执行状态显示
+                                            execDiv.remove();
+                                            
+                                            // 清理会话状态
+                                            if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) {
+                                                delete window.sessionTasks[sessionId];
+                                            }
+                                            
+                                            // 中止前端请求
+                                            if (window.sessionControllers && window.sessionControllers[sessionId]) {
+                                                window.sessionControllers[sessionId].abort();
+                                                delete window.sessionControllers[sessionId];
+                                            }
+                                            
+                                            // 显示取消消息
+                                            const cancelMsgDiv = document.createElement('div');
+                                            cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                                            cancelMsgDiv.innerHTML = `
+                                                <div class="flex items-start max-w-[80%]">
+                                                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                                    <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
+                                                        <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p>
+                                                    </div>
+                                                </div>
+                                            `;
+                                            chatMessages.appendChild(cancelMsgDiv);
+                                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                                            
+                                            // 保存取消消息到数据库
+                                            saveResultToDB(cancelData.message, sessionId, 'ai');
+                                            
+                                            // 恢复UI状态
+                                            submitButton.disabled = false;
+                                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                            document.getElementById('cancel-button').classList.add('hidden');
+                                            
+                                        } catch (error) {
+                                            console.error('取消执行中任务失败:', error);
+                                            showToast('取消任务失败，请重试', 'error');
+                                        }
+                                    });
+                                }
+                            } catch (err) {
+                                console.error('队列状态轮询失败:', err);
+                            }
+                        }, 3000);
+                        
+                        return;
+                    }
+                    
                     window.SessionList.forEach((item,index)=>{
                         if(item.id==window.currentSessionId){
                            window.SessionList.splice(index,1)
                         }
-                       }
-                    )
-                console.log(window.SessionList)
-                // 移除加载状态
-                        loadingDiv.remove();
-                        //console.log("所有数据：",data)
-                        const backendSessionId = data.session_id;  // 直接获取根节点的session_id
-                        let result = null;
-                        let has_report = 0
-                        let report_title = '';
-                        if (data.final_report) {
-                            result = data.final_report;
-                            has_report = 1
-                            
-                            // 提取报告标题：查找第一个 # 标题或前50个字符
-                            try {
-                                // 方法1: 查找第一个 # 标题
-                                const titleMatch = result.match(/^#\s+(.+?)$/m);
-                                if (titleMatch && titleMatch[1]) {
-                                    report_title = titleMatch[1].trim();
-                                } else {
-                                    // 方法2: 查找第一行非空内容作为标题
-                                    const lines = result.split('\n').filter(line => line.trim());
-                                    if (lines.length > 0) {
-                                        report_title = lines[0].replace(/^#+\s*/, '').trim();
-                                    }
+                    });
+                    
+                    loadingDiv.remove();
+                    const backendSessionId = data.session_id;
+                    let result = null;
+                    let has_report = 0;
+                    let report_title = '';
+                    
+                    if (data.final_report) {
+                        result = data.final_report;
+                        has_report = 1;
+                        
+                        try {
+                            const titleMatch = result.match(/^#\s+(.+?)$/m);
+                            if (titleMatch && titleMatch[1]) {
+                                report_title = titleMatch[1].trim();
+                            } else {
+                                const lines = result.split('\n').filter(line => line.trim());
+                                if (lines.length > 0) {
+                                    report_title = lines[0].replace(/^#+\s*/, '').trim();
                                 }
-                                // 限制标题长度（最多50个字符）
-                                if (report_title.length > 50) {
-                                    report_title = report_title.substring(0, 50) + '...';
-                                }
-                                // 如果仍然没有标题，使用默认值
-                                if (!report_title) {
-                                    report_title = '研究报告';
-                                }
-                                console.log("提取的报告标题：", report_title);
-                            } catch (e) {
-                                console.warn("提取标题失败：", e);
+                            }
+                            if (report_title.length > 50) {
+                                report_title = report_title.substring(0, 50) + '...';
+                            }
+                            if (!report_title) {
                                 report_title = '研究报告';
                             }
+                        } catch (e) {
+                            report_title = '研究报告';
                         }
-                        if (result === null) {
-                            report_title = '';
-                            // 安全检查：确保 planner_result 和 task_summary 存在
-                            if (data.planner_result && data.planner_result.task_summary) {
-                                result = extractAnswer(data.planner_result.task_summary);
-                            } else {
-                                result = '任务执行完成，但未生成报告内容。';
-                                console.warn('[DeepDiver] planner_result 或 task_summary 不存在');
-                            }
-                        } 
-                        // 提取"完整答案"到"任务已圆满完成"之间的信息
-                        function extractAnswer(content) {
-                            // 使用正则表达式匹配
+                    }
+                    
+                    if (result === null) {
+                        report_title = '';
+                        if (data.planner_result && data.planner_result.task_summary) {
                             const regex = /## 完整答案[\s\S]*?(?=任务已圆满完成)/;
-                            const match = content.match(regex);
-                            
+                            const match = data.planner_result.task_summary.match(regex);
                             if (match) {
-                                // 去除开头的"## 完整答案"和多余空格
-                                let answer = match[0].replace(/## 完整答案\n*/, '').trim();
-                                // 添加任务已圆满完成的结论
-                                answer += '\n\n任务已圆满完成';
-                                return answer;
+                                result = match[0].replace(/## 完整答案\n*/, '').trim() + '\n\n任务已圆满完成';
                             } else {
-                                return content; // 如果没有匹配到，返回原始内容
+                                result = data.planner_result.task_summary;
                             }
-                        }
-                        // 检查响应数据
-                        if (result) {
-                            console.log('[DeepDiver] 收到报告，长度:', result.length, 'has_report:', has_report);
-                            console.log('[DeepDiver] currentSessionId:', window.currentSessionId, 'sessionId:', sessionId, '匹配:', window.currentSessionId === sessionId);
-                            
-                            // 仅在当前会话时渲染AI回复
-                            if (window.currentSessionId === sessionId) {
-                                console.log('[DeepDiver] 开始显示报告...');
-                                
-                                // 先清理pending状态和spinner
-                                window.pendingSessions = window.pendingSessions || {};
-                                if (window.pendingSessions[sessionId]) {
-                                    window.pendingSessions[sessionId].loading = false;
-                                    window.pendingSessions[sessionId].spinner = null;
-                                }
-                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                                
-                                // 添加报告消息
-                                addMessage(result, 'ai', backendSessionId, has_report);
-                                console.log('[DeepDiver] 报告已添加到DOM');
-                                
-                                // 强制滚动到底部
-                                setTimeout(() => {
-                                    const chatMessages = document.getElementById('chat-messages');
-                                    if (chatMessages) {
-                                        chatMessages.scrollTop = chatMessages.scrollHeight;
-                                    }
-                                }, 100);
-                            } else {
-                                console.warn('[DeepDiver] 会话ID不匹配，跳过显示');
-                            }
-                            
-                            // DeepDiver模式保存逻辑:
-                            // 后端 a.py 已统一处理所有保存（完整报告和简单回复），前端无需保存
                         } else {
-                            console.warn('[DeepDiver] 未收到有效报告内容');
-                            if (window.currentSessionId === sessionId) {
-                                addMessage('抱歉，未能获取有效的回复。', 'ai', backendSessionId);
-                            }
+                            result = '任务执行完成，但未生成报告内容。';
                         }
-
-                    })
-                    .catch(error => {
+                    }
+                    
+                    if (result && window.currentSessionId === sessionId) {
+                        window.pendingSessions = window.pendingSessions || {};
+                        if (window.pendingSessions[sessionId]) {
+                            window.pendingSessions[sessionId].loading = false;
+                            window.pendingSessions[sessionId].spinner = null;
+                        }
+                        try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                        
+                        addMessage(result, 'ai', backendSessionId, has_report);
+                        
+                        setTimeout(() => {
+                            const chatMessages = document.getElementById('chat-messages');
+                            if (chatMessages) {
+                                chatMessages.scrollTop = chatMessages.scrollHeight;
+                            }
+                        }, 100);
+                    }
+                })
+                .catch(error => {
                     loadingDiv.remove();
                     if (window.currentSessionId === sessionId) {
                         try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                        // 只有当错误不是AbortError（用户主动取消）时才显示错误消息
                         if (error.name !== 'AbortError') {
-        }
-    }
-    console.error('API请求失败:', error);
-})
-.finally(() => {
-    // 如果当前会话的taskId不等于请求时的taskId，说明已经开始了新任务，不恢复UI
-    if (window.sessionTasks[sessionId] !== taskId) {
-        console.log("DeepDiver finally: taskId changed, skipping UI reset");
-        return;
-    }
-
-                    console.log("触发了")
-                    // 恢复按钮状态
+                            addMessage('获取响应失败，请重试', 'ai');
+                        }
+                    }
+                    console.error('API请求失败:', error);
+                })
+                .finally(() => {
+                    if (window.sessionTasks[sessionId] !== taskId) {
+                        return;
+                    }
                     submitButton.disabled = false;
                     submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                    // 隐藏中断按钮
                     document.getElementById('cancel-button').classList.add('hidden');
                 });
             }
@@ -3501,6 +3724,8 @@ ${contextText.trim()}
                         // 自动调整输入框高度
                         userInput.style.height = 'auto';
                         userInput.style.height = userInput.scrollHeight + 'px';
+                        // 显示提示
+                        showCopyToast(copyButton, '已填充到输入框');
                     }
                 });
             } else {

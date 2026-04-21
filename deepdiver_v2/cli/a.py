@@ -77,6 +77,9 @@ import time
 query_history: List[Dict[str, Any]] = []  # 仅记录查询历史，无会话关联
 batch_results: Dict[str, Any] = {}
 executor = None  # 线程池将在lifespan中初始化
+queue_executor = None  # 队列处理线程池
+cancel_executor = None  # 专用取消操作线程池，避免被任务执行阻塞
+MAX_CONCURRENT_TASKS = 4  # 最大并发任务数
 
 
 # 数据模型（请求/响应格式）
@@ -177,8 +180,13 @@ async def lifespan(app: FastAPI):
         os.environ['MCP_USE_STDIO'] = 'false'
 
     # 初始化全局线程池
-    global executor
-    executor = ThreadPoolExecutor(max_workers=8)
+    global executor, queue_executor, cancel_executor
+    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
+    queue_executor = ThreadPoolExecutor(max_workers=1)  # 队列处理器单线程
+    cancel_executor = ThreadPoolExecutor(max_workers=8)  # 专用取消操作线程池，支持多个并发取消请求
+    
+    # 启动队列处理器
+    queue_executor.submit(process_task_queue)
 
     logger.info(f"PlannerAgent服务器初始化成功（PID: {os.getpid()}, 延迟: {delay:.2f}s）")
     yield  # 运行期间
@@ -187,6 +195,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"服务器正在关闭... (PID: {os.getpid()})")
     if executor:
         executor.shutdown(wait=True)
+    if queue_executor:
+        queue_executor.shutdown(wait=True)
+    if cancel_executor:
+        cancel_executor.shutdown(wait=True)
 
 
 # 初始化FastAPI应用
@@ -377,22 +389,33 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         with open(username_file, 'w', encoding='utf-8') as f:
             f.write(username)
 
+        # 在开始执行前检查任务是否已被取消
+        if task_manager.is_task_cancelled(task_id):
+            logger.info(f"Task {task_id} was cancelled before execution")
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
+            raise HTTPException(status_code=499, detail="Task was cancelled by user")
+
         # 构建增强的查询文本
         enhanced_query = _build_enhanced_query(query_text, user_files_data)
+
+        # 再次检查取消状态
+        if task_manager.is_task_cancelled(task_id):
+            logger.info(f"Task {task_id} was cancelled before agent execution")
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
+            raise HTTPException(status_code=499, detail="Task was cancelled by user")
 
         start_time = time.time()
         response = agent.execute_task(enhanced_query + " /no_think")
         execution_time = time.time() - start_time
 
-        # 检查是否被取消
-        if hasattr(response, 'error') and response.error and "cancelled" in str(response.error).lower():
-            task_manager.update_task_status(task_id, TaskStatus.CANCELLED, error=response.error)
+        # 检查是否被取消（通过agent响应或直接检查状态）
+        if (task_manager.is_task_cancelled(task_id) or 
+            (hasattr(response, 'error') and response.error and "cancelled" in str(response.error).lower())):
+            logger.info(f"Task {task_id} was cancelled during or after execution")
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED, error=getattr(response, 'error', 'Task cancelled'))
             raise HTTPException(status_code=499, detail="Task was cancelled by user")
 
-        # 更新任务状态为完成
-        task_manager.update_task_status(task_id, TaskStatus.COMPLETED, result=True)
-
-        # 读取最终报告内容
+        # 读取最终报告内容（在更新任务状态之前读取，以便保存到result中）
         final_report_content = None
         report_relative_path = None
         try:
@@ -576,8 +599,8 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         except Exception as e:
             logger.error(f"读取最终报告失败: {e}")
 
-        # 返回符合 QueryResponse 模型的字典结构
-        return {
+        # 构建完整的结果对象
+        result_data = {
             'success': response.success,
             'query': query_text,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -593,6 +616,12 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             'final_report': final_report_content,
             'report_path': report_relative_path
         }
+        
+        # 【关键修复】更新任务状态为完成，并保存完整的结果对象（包含final_report）
+        # 这样前端轮询时可以获取到报告内容
+        task_manager.update_task_status(task_id, TaskStatus.COMPLETED, result=result_data)
+        
+        return result_data
     except Exception as e:
         task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
         # 返回符合 QueryResponse 模型的字典结构
@@ -662,34 +691,143 @@ def process_batch_task(
     )
 
 
+# 队列处理函数
+def process_task_queue():
+    """后台线程持续处理队列中的任务"""
+    logger.info("Queue processor started")
+    loop_count = 0
+    while True:
+        try:
+            loop_count += 1
+            # 每30次循环输出一次状态日志（约30秒）
+            if loop_count % 30 == 0:
+                queued_count = task_manager.get_queued_tasks_count()
+                running_count = task_manager.get_running_tasks_count()
+                logger.info(f"Queue processor heartbeat: running={running_count}, queued={queued_count}, max={MAX_CONCURRENT_TASKS}")
+            
+            # 检查是否有空闲槽位
+            running_count = task_manager.get_running_tasks_count()
+            if running_count < MAX_CONCURRENT_TASKS:
+                # 【关键修复】先收集需要处理的任务信息，然后释放锁再进行状态更新
+                # 避免在持有锁的情况下调用update_task_status导致死锁
+                cancelled_task_ids = []
+                next_task_id = None
+                next_task_params = None
+                should_start_task = False
+                
+                with task_manager._tasks_lock:
+                    # 收集已取消的队列任务ID
+                    for task in task_manager._tasks.values():
+                        if task.status == TaskStatus.QUEUED and task.is_cancelled():
+                            cancelled_task_ids.append(task.task_id)
+                    
+                    # 获取未取消的队列任务
+                    queued_tasks = sorted(
+                        [task for task in task_manager._tasks.values() 
+                         if task.status == TaskStatus.QUEUED and not task.is_cancelled()],
+                        key=lambda t: t.created_at
+                    )
+                    
+                    if queued_tasks:
+                        next_task = queued_tasks[0]
+                        if not next_task.is_cancelled():
+                            next_task_id = next_task.task_id
+                            next_task_params = next_task.progress.get('params')
+                            
+                            # 【关键修复】只有当params存在且包含query_data时才启动任务
+                            if next_task_params is not None and 'query_data' in next_task_params:
+                                should_start_task = True
+                                # 直接在锁内更新状态（不调用update_task_status避免死锁）
+                                next_task.status = TaskStatus.RUNNING
+                                next_task.updated_at = time.time()
+                                logger.info(f"Task {next_task_id} status changed to RUNNING")
+                            else:
+                                # params无效，记录错误并标记任务失败
+                                logger.error(f"Task {next_task_id} has invalid params: {next_task_params}")
+                                next_task.status = TaskStatus.FAILED
+                                next_task.error = "任务参数无效"
+                                next_task.updated_at = time.time()
+                
+                # 锁已释放，现在安全地更新已取消任务的状态
+                for task_id in cancelled_task_ids:
+                    logger.info(f"Removing cancelled queued task {task_id}")
+                    task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
+                
+                # 启动下一个任务
+                if should_start_task and next_task_id and next_task_params:
+                    logger.info(f"Starting queued task {next_task_id} with params keys: {list(next_task_params.keys())}")
+                    executor.submit(
+                        execute_queued_task,
+                        next_task_id,
+                        next_task_params
+                    )
+            
+            # 更新所有队列任务的位置
+            task_manager.update_queue_positions()
+            
+            # 短暂休眠，避免CPU占用过高
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Queue processor error: {e}", exc_info=True)
+            time.sleep(5)
+
+
+def execute_queued_task(task_id: str, params: Dict[str, Any]):
+    """执行队列中的任务"""
+    try:
+        # 在开始执行前检查任务是否已被取消
+        if task_manager.is_task_cancelled(task_id):
+            logger.info(f"Queued task {task_id} was cancelled before execution started")
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
+            return
+        
+        logger.info(f"Executing queued task {task_id}")
+        result = process_single_query(
+            params['query_data'],
+            task_id=task_id,
+            username=params.get('username', '用户'),
+            skip_task_creation=True,
+            frontend_session_id=params.get('frontend_session_id')
+        )
+        
+        # 【关键修复】任务完成后保存结果到TaskManager，以便前端轮询获取
+        if result:
+            if result.get('success', False):
+                logger.info(f"Queued task {task_id} completed successfully")
+                task_manager.update_task_status(task_id, TaskStatus.COMPLETED, result=result)
+            else:
+                error_msg = result.get('planner_error', '任务执行失败')
+                logger.warning(f"Queued task {task_id} failed: {error_msg}")
+                task_manager.update_task_status(task_id, TaskStatus.FAILED, result=result, error=error_msg)
+        else:
+            logger.warning(f"Queued task {task_id} returned no result")
+            task_manager.update_task_status(task_id, TaskStatus.FAILED, error="任务未返回结果")
+            
+    except Exception as e:
+        # 检查是否是因为任务取消导致的异常
+        if task_manager.is_task_cancelled(task_id):
+            logger.info(f"Queued task {task_id} was cancelled during execution")
+            task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
+        else:
+            logger.error(f"Error executing queued task {task_id}: {e}", exc_info=True)
+            task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+
+
 # API端点实现
 @app.post("/api/query", response_model=QueryResponse, summary="处理单个查询")
 async def handle_single_query(request: SingleQueryRequest):
     """异步处理单个查询，支持高并发和用户文件上传"""
 
-    # 【并发控制】检查当前运行中的query数量
-    running_count = task_manager.get_running_tasks_count()
-
-    if running_count >= 4:
-        # 已有4个query运行，第5个请求拒绝服务
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "SERVICE_BUSY",
-                "message": "抱歉，服务暂时拥挤，建议10分钟后再尝试",
-                "running_queries": running_count
-            }
-        )
-
     # 生成唯一任务ID
     task_id = request.taskId
-    loop = asyncio.get_event_loop()
-
-    # 【关键修复】在提交到线程池之前就创建任务，确保并发计数及时生效
+    
+    # 【并发控制】检查当前运行中的query数量
+    running_count = task_manager.get_running_tasks_count()
+    
+    # 创建任务
     task_manager.create_task(task_id, request.query)
-    task_manager.update_task_status(task_id, TaskStatus.RUNNING)
 
-    # 准备强制使用的文件数据（直接上传）
+    # 准备任务参数
     user_files_data = []
     if request.user_files and len(request.user_files) > 0:
         for file in request.user_files:
@@ -721,6 +859,48 @@ async def handle_single_query(request: SingleQueryRequest):
             'arxiv': request.search_sources.arxiv
         }
 
+    # 判断是立即执行还是加入队列
+    if running_count >= MAX_CONCURRENT_TASKS:
+        # 超过并发限制，加入队列
+        task_manager.update_task_status(task_id, TaskStatus.QUEUED)
+        
+        # 保存任务参数到progress中，供队列处理器使用
+        task_manager.update_task_progress(task_id, {
+            'params': {
+                'query_data': (request.query, 0, all_files_data, search_sources_dict),
+                'username': request.username,
+                'frontend_session_id': request.frontend_session_id
+            }
+        })
+        
+        # 更新队列位置
+        task_manager.update_queue_positions()
+        queue_position = task_manager.get_queue_position(task_id)
+        
+        logger.info(f"Task {task_id} queued at position {queue_position}")
+        
+        # 返回队列状态响应
+        return {
+            'success': False,
+            'query': request.query,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'session_id': '',
+            'task_id': task_id,
+            'planner_result': None,
+            'planner_error': f'任务已加入队列，当前排队位置: {queue_position}',
+            'planner_reasoning_trace': [],
+            'planner_iterations': 0,
+            'planner_execution_time': 0,
+            'planner_agent_name': 'QueueManager',
+            'section_writer_responses': [],
+            'final_report': None,
+            'report_path': None
+        }
+    
+    # 有空闲槽位，立即执行
+    task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+    loop = asyncio.get_event_loop()
+    
     # 使用线程池执行，避免阻塞事件循环
     if executor is None:
         raise HTTPException(status_code=500, detail="Server executor not initialized")
@@ -728,15 +908,15 @@ async def handle_single_query(request: SingleQueryRequest):
     result = await loop.run_in_executor(
         executor,
         lambda: process_single_query((request.query, 0, all_files_data, search_sources_dict), task_id=task_id, username=request.username,
-                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id)  # 传递用户文件数据、搜索源和用户名，跳过任务创建（已在上面创建）
+                                     skip_task_creation=True, frontend_session_id=request.frontend_session_id)
     )
     # 记录历史（可选）
     query_history.append({
         "task_id": task_id,
-        "request_id": result['session_id'],  # 使用字典访问方式
+        "request_id": result['session_id'],
         "query": request.query,
-        "timestamp": result['timestamp'],  # 使用字典访问方式
-        "success": result['success'],  # 使用字典访问方式
+        "timestamp": result['timestamp'],
+        "success": result['success'],
         "user_files_count": len(user_files_data),
         "reference_files_count": len(reference_files_data)
     })
@@ -782,16 +962,18 @@ def get_batch_result(batch_id: str):
 @app.get("/api/concurrency", summary="获取当前并发状态")
 async def get_concurrency_status():
     """
-    返回当前运行中的query数量，用于前端预检查
+    返回当前运行中的query数量和队列状态，用于前端预检查
     
     Returns:
         running_queries: 当前运行中的query数量
+        queued_queries: 当前排队中的query数量
         max_concurrent: 最大并发数阈值
         status: 状态标识 (available/queuing/busy)
     """
     running_count = task_manager.get_running_tasks_count()
+    queued_count = task_manager.get_queued_tasks_count()
 
-    if running_count >= 4:
+    if running_count >= MAX_CONCURRENT_TASKS:
         status = "busy"
     elif running_count >= 3:
         status = "queuing"
@@ -800,8 +982,47 @@ async def get_concurrency_status():
 
     return {
         "running_queries": running_count,
-        "max_concurrent": 4,
+        "queued_queries": queued_count,
+        "max_concurrent": MAX_CONCURRENT_TASKS,
         "status": status
+    }
+
+
+@app.get("/api/queue/status", summary="获取队列详细状态")
+async def get_queue_status():
+    """
+    获取队列的详细状态信息，包括所有排队任务
+    
+    Returns:
+        running_count: 运行中任务数
+        queued_count: 排队中任务数
+        queued_tasks: 排队任务列表（包含task_id, query, position, created_at）
+    """
+    running_count = task_manager.get_running_tasks_count()
+    queued_count = task_manager.get_queued_tasks_count()
+    
+    # 获取所有排队任务的详细信息
+    with task_manager._tasks_lock:
+        queued_tasks = sorted(
+            [task for task in task_manager._tasks.values() if task.status == TaskStatus.QUEUED],
+            key=lambda t: t.created_at
+        )
+        queued_tasks_info = [
+            {
+                "task_id": task.task_id,
+                "query": task.query[:100] + "..." if len(task.query) > 100 else task.query,
+                "position": i + 1,
+                "created_at": task.created_at,
+                "waiting_time": time.time() - task.created_at
+            }
+            for i, task in enumerate(queued_tasks)
+        ]
+    
+    return {
+        "running_count": running_count,
+        "queued_count": queued_count,
+        "max_concurrent": MAX_CONCURRENT_TASKS,
+        "queued_tasks": queued_tasks_info
     }
 
 
@@ -839,25 +1060,40 @@ async def cancel_task(task_id: str):
     Returns:
         取消结果
     """
-    success = task_manager.cancel_task(task_id)
+    # 【关键修复】直接同步执行取消操作
+    # cancel_task操作本身非常快（只是设置一个threading.Event），不需要放到线程池
+    # 这样可以避免线程池阻塞导致的请求pending问题
+    try:
+        logger.info(f"Received cancel request for task {task_id}")
+        success = task_manager.cancel_task(task_id)
+        logger.info(f"Cancel task {task_id} result: {success}")
+        
+        if not success:
+            task_info = task_manager.get_task(task_id)
+            if task_info is None:
+                raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+            else:
+                return {
+                    "success": False,
+                    "message": "任务已经中断！",
+                    "task_id": task_id,
+                    "status": task_info.status.value
+                }
 
-    if not success:
-        task_info = task_manager.get_task(task_id)
-        if task_info is None:
-            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-        else:
-            return {
-                "success": False,
-                "message": "任务已经中断！",
-                "task_id": task_id,
-                "status": task_info.status.value
-            }
-
-    return {
-        "success": True,
-        "message": "任务中断成功！",
-        "task_id": task_id
-    }
+        return {
+            "success": True,
+            "message": "任务中断成功！",
+            "task_id": task_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Cancel task {task_id} failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"取消任务时发生错误: {str(e)}",
+            "task_id": task_id
+        }
 
 
 @app.get("/api/task/{task_id}", summary="获取任务状态")
@@ -884,7 +1120,7 @@ async def get_task_status(task_id: str):
         "updated_at": task_info.updated_at,
         "progress": task_info.progress,
         "error": task_info.error,
-        "has_result": task_info.result is not None
+        "result": task_info.result  # 返回完整结果，以便前端轮询获取
     }
 
 
