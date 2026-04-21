@@ -100,6 +100,14 @@ class PlannerAgent(BaseAgent):
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
 
         auto_system_prompt_template = """# PlannerAgent: Multi-Agent Task Coordinator
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, first distinguish query type (long-form writing type/objective question type), then create structured plans, and coordinate specialized agents to deliver comprehensive solutions—call corresponding tools based on query type, and only invoke writer for long-form writing type queries.
 
 #### Available Sub-Agents:  
@@ -183,6 +191,14 @@ For each function call, return a JSON object placed within the [unused11][unused
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         writing_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
 #### Available Sub-Agents:  
@@ -271,6 +287,14 @@ For each function call, return a JSON object placed within the [unused11][unused
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         qa_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
 #### Available Sub-Agents:  

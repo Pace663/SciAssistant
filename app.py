@@ -1,4 +1,3 @@
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import pathlib
 import pymysql
 import hashlib
@@ -6,6 +5,7 @@ import re
 import os
 import jwt
 import datetime
+import time
 from flask import Flask, request, jsonify, app, abort, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Optional
 import shutil
 import sys
+import json
+import requests
+from flask import Response, stream_with_context
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -537,6 +540,7 @@ def add_chat_message():
     """添加聊天消息"""
     try:
         data = request.get_json()
+        logger.info(f"[add_chat_message] 收到请求: from_who={data.get('from_who') if data else 'NO_DATA'}, session_id={data.get('session_id') if data else 'NO_DATA'}, content_len={len(data.get('content','')) if data else 0}")
         if not data:
             return jsonify({'error': '没有提供JSON数据'}), 400
 
@@ -577,15 +581,14 @@ def add_chat_message():
                     session_id, from_who, round_num, timestamp,
                     message_uuid, content, think_msg, has_report, report_title
                 ))
+                insert_rows = cursor.rowcount
                 sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
-                cursor.execute(sql1, (session_id))
+                cursor.execute(sql1, (session_id,))
                 
-                if has_report == 1:
-                    logger.info(f"成功插入DeepDiver报告: session_id={session_id}, report_title={report_title}, size={len(content)}")
-                else:
-                    logger.info(f"成功插入消息: session_id={session_id}, from={from_who}")
+                logger.info(f"[add_chat_message] INSERT rowcount={insert_rows}, from_who={from_who}, session_id={session_id}, content_len={len(content)}")
                     
             connection.commit()
+            logger.info(f"[add_chat_message] COMMIT 完成, from_who={from_who}")
 
             return jsonify({
                 'success': True,
@@ -1719,6 +1722,405 @@ def start_file_qa():
         logger.error(f"启动文件问答失败: {str(e)}")
         return jsonify({'success': False, 'message': f'启动文件问答失败: {str(e)}'}), 500
 
+# ------------------- 联网搜索增强接口 -------------------
+# 大模型API配置
+LLM_API_URL = "http://10.1.11.175:8088/v1/chat/completions"
+LLM_MODEL_NAME = "pangu"
+
+def call_llm(messages, stream=False, timeout=60):
+    """调用大模型API的辅助函数"""
+    payload = {
+        "model": LLM_MODEL_NAME,
+        "messages": messages,
+        "stream": stream
+    }
+    try:
+        resp = requests.post(
+            LLM_API_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            stream=stream,
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        if stream:
+            return resp  # 返回原始response对象，由调用方处理流
+        else:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"调用大模型失败: {e}")
+        raise
+
+
+def rewrite_query_for_search(user_query):
+    """
+    调用大模型将用户query改写/拆分为适合搜索引擎的搜索关键词。
+    返回一个搜索关键词列表（1~3个）。
+    """
+    # 获取当前年月日，用于时间敏感查询
+    import pytz
+    beijing_tz = pytz.timezone('Asia/Shanghai')
+    current_time = datetime.datetime.now(beijing_tz)
+    current_year = current_time.year
+    current_month = current_time.month
+    current_day = current_time.day
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"你是一个搜索查询改写助手。当前时间是{current_year}年{current_month}月{current_day}日。\n"
+                "用户会给你一个问题，你需要将它改写为1到3个适合在搜索引擎中搜索的关键词短语。\n\n"
+                "要求：\n"
+                "1. 每个搜索词应该简洁、精准，适合搜索引擎\n"
+                "2. 如果问题比较简单，1个搜索词即可；如果问题复杂，可以拆分为2-3个搜索词\n"
+                "3. **时间敏感问题必须添加时间限定**：\n"
+                f"   - 如果用户问\"最近\"、\"近期\"，可以加上\"{current_year}年{current_month}月\"或\"{current_year}年{current_month}月{current_day}日\"\n"
+                f"   - 如果用户问\"今年\"，加上\"{current_year}年\"\n"
+                f"   - 如果用户问\"今天\"、\"最新\"，加上\"{current_year}年{current_month}月{current_day}日\"或\"最新\"\n"
+                "   - 例如：\"最近有什么热门事件\" -> \"2026年2月热门事件\" 或 \"2026年2月26日热点新闻\"\n"
+                "4. 只输出搜索词，每行一个，不要输出任何其他内容\n"
+                "5. 搜索词使用与用户问题相同的语言\n\n"
+                "示例：\n"
+                "用户问题：EVO2是谁研发的\n"
+                "输出：\nEVO2 研发机构\nEVO2 开发者是谁\n\n"
+                "用户问题：最近有什么热门事件\n"
+                f"输出：\n{current_year}年{current_month}月热门事件\n{current_year}年{current_month}月{current_day}日热点新闻\n"
+            )
+        },
+        {"role": "user", "content": user_query + " /no_think"}
+    ]
+    try:
+        result = call_llm(messages, stream=False, timeout=30)
+        # 解析返回的搜索词（每行一个）
+        search_queries = [q.strip() for q in result.strip().split('\n') if q.strip()]
+        # 过滤掉空行和过长的查询
+        search_queries = [q for q in search_queries if len(q) <= 100]
+        if not search_queries:
+            # 如果改写失败，使用原始query
+            search_queries = [user_query]
+        logger.info(f"Query改写结果: {user_query} -> {search_queries}")
+        return search_queries[:3]  # 最多3个
+    except Exception as e:
+        logger.error(f"Query改写失败: {e}，使用原始query")
+        return [user_query]
+
+
+SERPER_API_URL = "https://google.serper.dev/search"
+SERPER_API_KEY = "a11caf9d62c8e83e6d682b066f9517e9a23c55c7"
+
+
+def web_search(query, max_results=5):
+    """
+    联网搜索：使用Google Serper API（与deepdiver共用同一个Key）。
+    返回搜索结果列表，每个结果包含 title, url, snippet。
+    """
+    results = _search_serper(query, max_results)
+    if results:
+        return results
+    logger.error(f"Google Serper搜索失败: '{query}'")
+    return []
+
+
+def _search_serper(query, max_results=5, max_retries=3):
+    """
+    使用Google Serper API进行搜索（与deepdiver项目共用同一个API Key）。
+    API文档: https://serper.dev/
+    增加重试机制以提高稳定性。
+    """
+    results = []
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            payload = json.dumps({
+                "q": query,
+                "num": max_results
+            })
+            headers = {
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json"
+            }
+            resp = requests.post(SERPER_API_URL, headers=headers, data=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # 解析organic搜索结果
+            organic = data.get("organic", [])
+            for item in organic[:max_results]:
+                results.append({
+                    'title': item.get('title', ''),
+                    'url': item.get('link', ''),
+                    'snippet': item.get('snippet', '')
+                })
+
+            # 如果有知识图谱结果，也加入
+            kg = data.get("knowledgeGraph", {})
+            if kg and kg.get("description"):
+                results.insert(0, {
+                    'title': kg.get('title', '知识图谱'),
+                    'url': kg.get('descriptionLink') or kg.get('website', ''),
+                    'snippet': kg.get('description', '')
+                })
+
+            logger.info(f"Google Serper搜索 '{query}' 获取到 {len(results)} 条结果")
+            return results
+            
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.5
+                logger.warning(f"Google Serper搜索失败 (尝试 {attempt + 1}/{max_retries}): {e}，{wait_time}秒后重试...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Google Serper搜索失败 (已重试{max_retries}次): {e}")
+    
+    return results
+
+
+def do_web_search(user_query):
+    """
+    完整的联网搜索流程：query改写 -> 搜索 -> 汇总结果。
+    返回 (search_queries, all_results) 元组。
+    """
+    # 1. Query改写
+    search_queries = rewrite_query_for_search(user_query)
+    
+    # 2. 对每个搜索词进行搜索
+    all_results = []
+    seen_urls = set()
+    for sq in search_queries:
+        results = web_search(sq, max_results=5)
+        for r in results:
+            if r['url'] not in seen_urls:
+                seen_urls.add(r['url'])
+                all_results.append(r)
+    
+    # 限制总结果数
+    all_results = all_results[:10]
+    logger.info(f"联网搜索完成: 原始query='{user_query}', 改写为={search_queries}, 获取到{len(all_results)}条结果")
+    return search_queries, all_results
+
+
+def build_search_enhanced_messages(user_query, search_results, search_queries):
+    """
+    构建搜索增强的消息列表，将搜索结果作为上下文注入。
+    """
+    # 获取服务器当前时间（北京时间 UTC+8）
+    import pytz
+    beijing_tz = pytz.timezone('Asia/Shanghai')
+    current_time = datetime.datetime.now(beijing_tz)
+    current_time_str = current_time.strftime('%Y年%m月%d日 %H:%M:%S')
+    current_weekday = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'][current_time.weekday()]
+    
+    # 检查是否有搜索结果
+    if not search_results:
+        # 搜索失败时的特殊处理
+        system_prompt = f"""你是一个严谨的智能助手，具备联网搜索能力。
+
+【重要提示】：本次联网搜索失败（网络连接问题），无法获取最新信息。
+
+【回答规则】：
+1. 明确告知用户：由于联网搜索失败，无法提供最新的实时信息
+2. 对于时间敏感的问题（如"今天是几号"、"最新新闻"等），必须明确说明无法回答
+3. 对于一般性知识问题，可以基于训练数据回答，但需要说明：
+   - 信息可能不是最新的
+   - 训练数据截止时间
+4. 建议用户稍后重试或使用其他方式获取实时信息
+5. 回答要诚实、客观，不要编造或猜测实时信息
+
+用户问题：{user_query}
+"""
+    else:
+        # 有搜索结果时的正常处理
+        context_parts = []
+        for i, r in enumerate(search_results, 1):
+            context_parts.append(f"[{i}] {r['title']}\n来源: {r['url']}\n摘要: {r['snippet']}")
+        
+        search_context = "\n\n".join(context_parts)
+        
+        system_prompt = f"""你是一个严谨的智能助手，具备联网搜索能力。以下是根据用户问题从互联网搜索到的最新信息：
+
+【服务器当前时间（北京时间）】：{current_time_str} {current_weekday}
+
+搜索关键词: {', '.join(search_queries)}
+搜索结果:
+{search_context}
+
+【回答规则】：
+1. **时间类问题优先使用服务器时间**：如果用户问"现在几点"、"今天几号"等实时问题，必须以【服务器当前时间】为准，搜索结果仅作参考
+2. **检查搜索结果的时效性**：
+   - 用户问"最近"、"近期"、"今年"等时间敏感问题时，必须检查搜索结果中的时间信息
+   - 如果搜索结果中的事件时间与当前时间（{current_time.year}年{current_time.month}月）相差较远（如2023年的事件），必须明确指出这些信息已过时
+   - 优先使用与当前时间最接近的搜索结果
+   - 如果所有搜索结果都是过时的，应说明"搜索结果主要是X年的信息，可能不是最新的"
+3. 搜索结果是第一权威来源：涉及事实性信息（如谁开发的、什么时候发布的、具体数据等）时，必须以搜索结果为准，不得与搜索结果矛盾
+4. 来源标注：凡是引用搜索结果中的事实，必须标注来源编号（如 [1]、[2] 等）
+5. 模型知识可补充：如果搜索结果已覆盖核心事实，你可以用自身知识补充背景解释、原理分析等，但不能编造具体事实（如人名、机构名、数字等）
+6. 冲突处理：如果你的知识与搜索结果矛盾，以搜索结果为准
+7. 信息不足时：如果搜索结果不足以回答某个方面，可以说明：根据现有搜索结果未找到该信息
+8. 回答要准确、客观、全面，组织清晰，适当使用列表或分段提升可读性
+"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query}
+    ]
+    return messages
+
+
+@app.route('/api/chat/search_enhanced', methods=['POST'])
+def chat_search_enhanced():
+    """
+    联网搜索增强的聊天接口。
+    流程：用户query -> query改写 -> 搜索引擎搜索 -> 搜索结果+query -> 大模型回答
+    
+    请求体：{
+        "message": "用户问题",
+        "stream": true/false,  // 是否流式输出，默认false
+        "mode": "chat"/"reasoner"  // 模式，默认chat
+    }
+    
+    非流式返回：{
+        "success": true,
+        "reply": "AI回答内容",
+        "search_queries": ["改写后的搜索词"],
+        "search_results": [{"title": "", "url": "", "snippet": ""}],
+        "reasoning_content": ""  // 仅reasoner模式
+    }
+    
+    流式返回：SSE格式，与OpenAI兼容
+    """
+    data = request.get_json(silent=True) or {}
+    user_message = (data.get('message') or '').strip()
+    is_stream = data.get('stream', False)
+    mode = data.get('mode', 'chat')  # chat 或 reasoner
+    session_id = (data.get('session_id') or '').strip()  # 前端传入的会话ID，用于后端自动保存AI回复
+    
+    if not user_message:
+        return jsonify({'success': False, 'message': '缺少message参数'}), 400
+    
+    try:
+        # 1. 联网搜索
+        search_queries, search_results = do_web_search(user_message)
+        
+        # 2. 构建搜索增强的消息
+        messages = build_search_enhanced_messages(user_message, search_results, search_queries)
+        
+        # 3. 根据模式调整消息
+        if mode == 'chat':
+            # Chat模式：添加 /no_think 标记禁用推理
+            messages[-1]["content"] = messages[-1]["content"] + " /no_think"
+        # reasoner模式不加 /no_think，让模型进行推理
+        
+        # 4. 调用大模型生成回答
+        if is_stream:
+            # 流式输出
+            def generate():
+                full_content = ''       # 累积完整AI回复内容
+                reasoning_content = ''  # 累积推理过程（reasoner模式）
+                try:
+                    # 先发送搜索信息事件
+                    search_info = {
+                        "type": "search_info",
+                        "search_queries": search_queries,
+                        "search_results": search_results
+                    }
+                    yield f"data: {json.dumps(search_info, ensure_ascii=False)}\n\n"
+                    
+                    # 调用大模型流式输出
+                    resp = call_llm(messages, stream=True, timeout=120)
+                    has_done = False
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if line:
+                            # 直接转发SSE数据
+                            if line.startswith('data:'):
+                                yield f"{line}\n\n"
+                                if '[DONE]' in line:
+                                    has_done = True
+                                else:
+                                    # 解析并累积内容
+                                    try:
+                                        chunk_data = json.loads(line[5:].strip())
+                                        if chunk_data.get('choices') and chunk_data['choices'][0].get('delta'):
+                                            delta = chunk_data['choices'][0]['delta']
+                                            if delta.get('content'):
+                                                full_content += delta['content']
+                                            if delta.get('reasoning_content'):
+                                                reasoning_content += delta['reasoning_content']
+                                    except (json.JSONDecodeError, KeyError, IndexError):
+                                        pass
+                            elif not line.startswith(':'):
+                                yield f"data: {line}\n\n"
+                    # 确保流结束时发送[DONE]信号
+                    if not has_done:
+                        yield "data: [DONE]\n\n"
+                except Exception as e:
+                    logger.error(f"流式搜索增强回答失败: {e}")
+                    error_data = {"error": str(e)}
+                    yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                finally:
+                    # 流式输出结束后，自动保存AI回复到数据库
+                    if session_id and (full_content.strip() or reasoning_content.strip()):
+                        try:
+                            # 附加搜索来源到内容末尾
+                            save_content = full_content
+                            if search_results:
+                                save_content += '\n\n---\n**搜索来源：**\n'
+                                for idx, sr in enumerate(search_results):
+                                    save_content += f"{idx + 1}. [{sr.get('title', '')}]({sr.get('url', '')})\n"
+                            
+                            connection = get_db_connection()
+                            if connection:
+                                try:
+                                    with connection.cursor() as cursor:
+                                        sql = """
+                                            INSERT INTO conversation_detail 
+                                            (session_id, from_who, round, timestamp, content, think_msg, create_time)
+                                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                                        """
+                                        cursor.execute(sql, (
+                                            session_id, 'ai', 1, datetime.datetime.now(),
+                                            save_content, reasoning_content
+                                        ))
+                                        sql1 = "UPDATE chat_list SET update_time = NOW() WHERE session_id = %s"
+                                        cursor.execute(sql1, (session_id,))
+                                    connection.commit()
+                                    logger.info(f"[search_enhanced] 后端自动保存AI回复成功: session_id={session_id}, content_len={len(save_content)}, reasoning_len={len(reasoning_content)}")
+                                except Exception as db_err:
+                                    logger.error(f"[search_enhanced] 后端自动保存AI回复失败: {db_err}")
+                                finally:
+                                    connection.close()
+                        except Exception as save_err:
+                            logger.error(f"[search_enhanced] 保存AI回复异常: {save_err}")
+            
+            return Response(
+                stream_with_context(generate()),
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            )
+        else:
+            # 非流式输出
+            reply = call_llm(messages, stream=False, timeout=120)
+            return jsonify({
+                'success': True,
+                'reply': reply,
+                'search_queries': search_queries,
+                'search_results': search_results
+            })
+    
+    except Exception as e:
+        logger.error(f"搜索增强聊天失败: {e}")
+        return jsonify({'success': False, 'message': f'搜索增强失败: {str(e)}'}), 500
+
+
 #健康检查接口
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -1733,4 +2135,4 @@ if __name__ == '__main__':
     log.setLevel(logging.ERROR)  # 只显示错误，不显示 INFO 级别的访问日志
     
     # 生产环境请修改debug=False，并配置合适的host和port
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

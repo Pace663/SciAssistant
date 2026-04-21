@@ -189,6 +189,14 @@
             return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
+        // 6.3 正文中的引用标注 [数字] -> 上标小字体，可点击跳转到搜索来源
+        // 匹配正文中的 [数字] 格式（非行首，前面是中文/英文/标点），转为上标链接
+        html = html.replace(/(?<=[^\n\[])(\[(\d+)\])/g, function(match, full, num) {
+            const rendered = `<sup class="citation-ref" data-ref="${num}" style="cursor:pointer;color:#3b82f6;font-size:0.7em;margin:0 1px;padding:1px 3px;border-radius:3px;background:#eff6ff;vertical-align:super;line-height:1;" onclick="(function(e){var src=document.getElementById('search-source-'+${num});if(src){src.scrollIntoView({behavior:'smooth',block:'center'});src.style.transition='background 0.3s';src.style.background='#fef3c7';setTimeout(function(){src.style.background='';},2000);}e.stopPropagation();})(event)">[${num}]</sup>`;
+            codeBlocks.push(rendered);
+            return URL_PLACEHOLDER + (codeBlocks.length - 1) + '___';
+        });
+        
         // 7. Markdown格式链接 [text](url)
         html = html.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, function(match, text, url, title) {
             const titleAttr = title ? ` title="${title}"` : '';
@@ -2506,28 +2514,33 @@ ${contextText.trim()}
                 // 等待prepareMessagesPromise完成，使用构建好的messages（包含RAG上下文）
                 prepareMessagesPromise.then(messages => {
                     console.log('[Chat模式] 最终发送的messages:', messages);
-                    // 发送API请求（携带session_id）
-                    fetch('/8088/v1/chat/completions', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        signal: window.sessionControllers[sessionId]?.signal,
-                        body: JSON.stringify({
-                            "model":"pangu",
-                            "messages": messages.map(msg => ({
-                                role: msg.role,
-                                content: msg.role === 'user' ? msg.content + " /no_think" : msg.content
-                            }))
+                    
+                    // 判断是否有附件（有附件走原有RAG+直接调用模型，无附件走联网搜索增强）
+                    const hasRAGContext = messages.length > 1 && messages[0].role === 'system';
+                    
+                    if (hasRAGContext) {
+                        // 有附件：走原有RAG流程，直接调用模型
+                        console.log('[Chat模式] 有附件，走RAG流程直接调用模型');
+                        fetch('http://10.1.11.175:8088/v1/chat/completions', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            signal: window.sessionControllers[sessionId]?.signal,
+                            body: JSON.stringify({
+                                "model":"pangu",
+                                "messages": messages.map(msg => ({
+                                    role: msg.role,
+                                    content: msg.role === 'user' ? msg.content + " /no_think" : msg.content
+                                }))
+                            })
                         })
-                    })
-                    .then(response => {
-                        loadingDiv.remove();
-                        if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
-                        return response.json();
-                    })
-                    .then(data => {
-                    // 移除加载状态
+                        .then(response => {
+                            loadingDiv.remove();
+                            if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
+                            return response.json();
+                        })
+                        .then(data => {
                             loadingDiv.remove();
 
                             // 检查响应数据
@@ -2554,29 +2567,247 @@ ${contextText.trim()}
                             if (window.currentSessionId === sessionId) {
                                 try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
                             }
-                            // 注意：附件已在sendMessage函数中清除，这里不需要再次清除
-                    })
-                    .catch(error => {
-                        loadingDiv.remove();
-                        // 清理pending状态
-                        window.pendingSessions = window.pendingSessions || {};
-                        if (window.pendingSessions[sessionId]) {
-                            window.pendingSessions[sessionId].loading = false;
-                            window.pendingSessions[sessionId].spinner = null;
-                        }
-                        if (window.currentSessionId === sessionId) {
-                            try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                            addMessage('获取响应失败，请重试', 'ai');
-                        }
-                        console.error('API请求失败:', error);
-                    })
-                    .finally(() => {
-                        // 只在非deepdiver模式下恢复按钮状态
-                        if (window.selectedTab !== 'deepdiver') {
+                        })
+                        .catch(error => {
+                            loadingDiv.remove();
+                            window.pendingSessions = window.pendingSessions || {};
+                            if (window.pendingSessions[sessionId]) {
+                                window.pendingSessions[sessionId].loading = false;
+                                window.pendingSessions[sessionId].spinner = null;
+                            }
+                            if (window.currentSessionId === sessionId) {
+                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                                addMessage('获取响应失败，请重试', 'ai');
+                            }
+                            console.error('API请求失败:', error);
+                        })
+                        .finally(() => {
+                            if (window.selectedTab !== 'deepdiver') {
+                                submitButton.disabled = false;
+                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                            }
+                        });
+                    } else {
+                        // 无附件：走联网搜索增强API（流式输出）
+                        console.log('[Chat模式] 无附件，走联网搜索增强API（流式）');
+                        const loadingSpan = loadingDiv.querySelector('span');
+                        if (loadingSpan) loadingSpan.textContent = '正在联网搜索并思考…';
+                        
+                        let chatSearchResults = [];
+                        
+                        fetch('http://localhost:5000/api/chat/search_enhanced', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            signal: window.sessionControllers[sessionId]?.signal,
+                            body: JSON.stringify({
+                                "message": message,
+                                "stream": true,
+                                "mode": "chat",
+                                "session_id": sessionId
+                            })
+                        })
+                        .then(response => {
+                            if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
+                            if (loadingDiv && loadingDiv.parentNode) loadingDiv.remove();
+                            
+                            let chatAiElement = null;
+                            let chatFullResponse = '';
+                            const chatDecoder = new TextDecoder();
+                            const chatReader = response.body.getReader();
+                            
+                            // 创建流式消息容器
+                            if (window.currentSessionId === sessionId) {
+                                const msgDiv = document.createElement('div');
+                                msgDiv.className = 'mb-6 flex justify-start message-animation';
+                                msgDiv.setAttribute('data-streaming', 'true');
+                                
+                                const bubble = document.createElement('div');
+                                bubble.className = 'message-container relative flex items-start w-[80%]';
+                                
+                                const avatar = document.createElement('img');
+                                avatar.src = './images/my-ai-avatar.jpg';
+                                avatar.alt = 'AI头像';
+                                avatar.className = 'w-8 h-8 rounded-full mr-3 object-cover';
+                                
+                                const wrapper = document.createElement('div');
+                                wrapper.className = 'flex flex-col';
+                                
+                                const content = document.createElement('div');
+                                content.className = 'bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm text-sm leading-normal';
+                                content.innerHTML = '<div class="main-content"></div>';
+                                
+                                wrapper.appendChild(content);
+                                bubble.appendChild(avatar);
+                                bubble.appendChild(wrapper);
+                                msgDiv.appendChild(bubble);
+                                
+                                chatMessages.appendChild(msgDiv);
+                                chatMessages.scrollTop = chatMessages.scrollHeight;
+                                chatAiElement = content;
+                            }
+                            
+                            let chatSaved = false; // 防止重复保存
+                            
+                            // 保存Chat AI回复到数据库的辅助函数
+                            function saveChatResponse() {
+                                if (chatSaved) return;
+                                // 附加搜索来源
+                                if (chatFullResponse.trim() && chatSearchResults.length > 0) {
+                                    chatFullResponse += '\n\n---\n**搜索来源：**\n';
+                                    chatSearchResults.forEach((sr, idx) => {
+                                        chatFullResponse += `${idx + 1}. [${sr.title}](${sr.url})\n`;
+                                    });
+                                }
+                                if (chatFullResponse.trim()) {
+                                    chatSaved = true;
+                                    console.log('[Chat流式] 保存到数据库, 内容长度:', chatFullResponse.length);
+                                    // saveResultToDB(chatFullResponse, sessionId, 'ai'); // 已移至后端处理
+                                } else {
+                                    console.warn('[Chat流式] fullResponse为空，不保存');
+                                }
+                            }
+                            
+
+                            function processChatStream() {
+                                chatReader.read().then(({ done, value }) => {
+                                    if (done) {
+                                        console.log('[Chat流式] done=true, chatFullResponse长度:', chatFullResponse.length);
+                                        window.pendingSessions = window.pendingSessions || {};
+                                        if (window.pendingSessions[sessionId]) {
+                                            window.pendingSessions[sessionId].loading = false;
+                                            window.pendingSessions[sessionId].spinner = null;
+                                        }
+                                        
+                                        // 后端已自动保存AI回复，前端不再重复保存
+                                        
+                                        // 更新UI
+                                        try {
+                                            if (window.currentSessionId === sessionId) {
+                                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                                                
+                                                // 附加搜索来源到显示内容
+                                                if (chatFullResponse.trim() && chatSearchResults.length > 0) {
+                                                    chatFullResponse += '\n\n---\n**搜索来源：**\n';
+                                                    chatSearchResults.forEach((sr, idx) => {
+                                                        chatFullResponse += `${idx + 1}. [${sr.title}](${sr.url})\n`;
+                                                    });
+                                                }
+                                                
+                                                if (chatFullResponse.trim()) {
+                                                    document.querySelectorAll('[data-streaming="true"]').forEach(el => el.remove());
+                                                    addMessage(chatFullResponse, 'ai');
+                                                    // 为搜索来源链接添加锚点ID
+                                                    if (chatSearchResults.length > 0) {
+                                                        const lastMsg = chatMessages.querySelector('.mb-6:last-child');
+                                                        if (lastMsg) {
+                                                            const links = lastMsg.querySelectorAll('a[target="_blank"]');
+                                                            const sourceLinks = Array.from(links).slice(-chatSearchResults.length);
+                                                            sourceLinks.forEach((link, idx) => {
+                                                                const parentDiv = link.closest('div') || link.parentElement;
+                                                                if (parentDiv) parentDiv.id = `search-source-${idx + 1}`;
+                                                            });
+                                                        }
+                                                    }
+                                                } else {
+                                                    document.querySelectorAll('[data-streaming="true"]').forEach(el => el.remove());
+                                                    addMessage('抱歉，未能获取有效的回复。', 'ai');
+                                                }
+                                            }
+                                        } catch (uiErr) {
+                                            console.error('[Chat流式] UI更新出错:', uiErr);
+                                        }
+                                        
+                                        submitButton.disabled = false;
+                                        submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                        return;
+                                    }
+                                    
+                                    const chunk = chatDecoder.decode(value, { stream: true });
+                                    const lines = chunk.split('\n');
+                                    for (const line of lines) {
+                                        if (line.startsWith('data:')) {
+                                            const data = line.slice(5).trim();
+                                            if (data === '[DONE]') {
+                                                processChatStream();
+                                                return;
+                                            }
+                                            
+                                            try {
+                                                const json = JSON.parse(data);
+                                                
+                                                // 搜索信息事件
+                                                if (json.type === 'search_info') {
+                                                    chatSearchResults = json.search_results || [];
+                                                    console.log('[Chat搜索增强] 搜索词:', json.search_queries);
+                                                    console.log('[Chat搜索增强] 搜索结果数:', chatSearchResults.length);
+                                                    continue;
+                                                }
+                                                
+                                                // 模型流式输出
+                                                if (json.choices && json.choices[0] && json.choices[0].delta) {
+                                                    const delta = json.choices[0].delta;
+                                                    if (delta.content) {
+                                                        chatFullResponse += delta.content;
+                                                    }
+                                                    
+                                                    // 实时更新UI
+                                                    if (window.currentSessionId === sessionId && chatAiElement) {
+                                                        const mainContent = chatAiElement.querySelector('.main-content');
+                                                        if (mainContent) {
+                                                            mainContent.innerHTML = markdownToHtml(chatFullResponse);
+                                                            highlightCodeBlocks(mainContent);
+                                                            renderMathFormulas(mainContent);
+                                                        }
+                                                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                                                    }
+                                                }
+                                            } catch (e) {
+                                                console.warn('[Chat流式] 解析JSON失败:', e, '数据:', data);
+                                            }
+                                        }
+                                    }
+                                    processChatStream();
+                                }).catch(error => {
+                                    console.error('[Chat流式] 处理错误:', error);
+                                    
+                                    window.pendingSessions = window.pendingSessions || {};
+                                    if (window.pendingSessions[sessionId]) {
+                                        window.pendingSessions[sessionId].loading = false;
+                                        window.pendingSessions[sessionId].spinner = null;
+                                    }
+                                    if (window.currentSessionId === sessionId) {
+                                        document.querySelectorAll('[data-streaming="true"]').forEach(el => el.remove());
+                                        if (error.name !== 'AbortError') {
+                                            addMessage('获取响应失败，请重试', 'ai');
+                                        }
+                                    }
+                                    submitButton.disabled = false;
+                                    submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                });
+                            }
+                            
+                            processChatStream();
+                        })
+                        .catch(error => {
+                            if (loadingDiv && loadingDiv.parentNode) loadingDiv.remove();
+                            window.pendingSessions = window.pendingSessions || {};
+                            if (window.pendingSessions[sessionId]) {
+                                window.pendingSessions[sessionId].loading = false;
+                                window.pendingSessions[sessionId].spinner = null;
+                            }
+                            if (window.currentSessionId === sessionId) {
+                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                                if (error.name !== 'AbortError') {
+                                    addMessage('获取响应失败，请重试', 'ai');
+                                }
+                            }
+                            console.error('[Chat搜索增强] API请求失败:', error);
                             submitButton.disabled = false;
                             submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                        }
-                    });
+                        });
+                    }
                 }).catch(error => {
                     console.error('[Chat模式] 准备消息失败:', error);
                     loadingDiv.remove();
@@ -2706,20 +2937,25 @@ ${contextText.trim()}
             
             console.log("问答模式：", query_model);
             if(query_model.trim() === "reasoner"){
-                // 发送API请求（携带session_id），实现流式输出
-                fetch('/8088/v1/chat/completions', {
+                // 更新loading提示文字
+                const reasonerLoadingSpan = loadingDiv.querySelector('span');
+                if (reasonerLoadingSpan) reasonerLoadingSpan.textContent = '正在联网搜索并推理…';
+                
+                // 存储搜索信息，用于在回复末尾展示
+                let reasonerSearchResults = [];
+                
+                // 发送API请求到后端联网搜索增强接口（流式输出）
+                fetch('http://localhost:5000/api/chat/search_enhanced', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        // 'Authorization': `Bearer ${window.userToken}`
                     },
+                    signal: window.sessionControllers[sessionId]?.signal,
                     body: JSON.stringify({
-                           "model":"pangu",
-                            "messages":[
-                          {"role":"user","content":message}
-                        ],
-                        "stream":true
-                        // session_id: sessionId // 将session_id发送到后端
+                        "message": message,
+                        "stream": true,
+                        "mode": "reasoner",
+                        "session_id": sessionId
                     })
                 })
                 .then(response => {
@@ -2769,6 +3005,25 @@ ${contextText.trim()}
                         chatMessages.scrollTop = chatMessages.scrollHeight;
                         
                         aiMessageElement = messageContent;
+                    }
+                    
+                    let reasonerSaved = false;
+                    
+                    function saveReasonerResponse() {
+                        if (reasonerSaved) return;
+                        if ((fullResponse.trim() || reasoningContent.trim()) && reasonerSearchResults.length > 0) {
+                            fullResponse += '\n\n---\n**搜索来源：**\n';
+                            reasonerSearchResults.forEach((sr, idx) => {
+                                fullResponse += `${idx + 1}. [${sr.title}](${sr.url})\n`;
+                            });
+                        }
+                        if (fullResponse.trim() || reasoningContent.trim()) {
+                            reasonerSaved = true;
+                            console.log('[Reasoner流式] 保存到数据库, fullResponse长度:', fullResponse.length, 'reasoningContent长度:', reasoningContent.length);
+                            saveResultToDB(fullResponse || '', sessionId, 'ai', '', 0, reasoningContent);
+                        } else {
+                            console.warn('[Reasoner流式] fullResponse和reasoningContent都为空，不保存');
+                        }
                     }
                     
                     // 处理流式响应的函数
@@ -2920,6 +3175,15 @@ ${contextText.trim()}
                                     
                                     try {
                                         const json = JSON.parse(data);
+                                        
+                                        // 处理搜索信息事件（后端先发送搜索结果）
+                                        if (json.type === 'search_info') {
+                                            reasonerSearchResults = json.search_results || [];
+                                            console.log('[Reasoner搜索增强] 搜索词:', json.search_queries);
+                                            console.log('[Reasoner搜索增强] 搜索结果数:', reasonerSearchResults.length);
+                                            continue;
+                                        }
+                                        
                                         if (json.choices && json.choices[0] && json.choices[0].delta) {
                                             const delta = json.choices[0].delta;
                                             

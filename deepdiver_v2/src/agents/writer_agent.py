@@ -160,7 +160,16 @@ class WriterAgent(BaseAgent):
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the writer agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
-        system_prompt_template = """You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content. Then you strictly follow the steps given below:
+        system_prompt_template = """You are a professional writing master. You will receive key files and user problems. Your task is to generate an outline highly consistent with the user problem, classify files into sections, and iteratively call section_writer tool to create comprehensive content.
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query and respond accordingly:**
+- **English query → Write the entire article in English**
+- **Chinese query (中文) → Write the entire article in Chinese (中文撰写)**
+- **Mixed Chinese-English query → Write the entire article in Chinese (中文撰写)**
+This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
+
+Then you strictly follow the steps given below:
         
         MANDATORY WORKFLOW:
         
@@ -174,9 +183,16 @@ class WriterAgent(BaseAgent):
         Select these segments as the basis for outline generation. Note that we only focus on relevance to the question, so when generating the outline, do not add unrelated sections just for the sake of length. Additionally, the sections should flow logically and not be too disjointed, as this would harm the readability of the final output.  
         - The overall structure must be **logically clear**, with **no repetition or redundancy** between chapters.  
         - **Note1:** The generated outline must not only have chapter-level headings (Level 1) highly relevant to the user’s question, but the subheadings (Level 2) must also be highly relevant to the user’s question. It is not permitted to generate chapter titles with weak relevance, whether Level 1 or Level 2.
-        - **Note2:** STRICT NUMBERING AND MARKDOWN FORMAT REQUIRED: 
-            - Level 1 headings (Chapters) MUST use Markdown '##' (H2) and Arabic numerals followed by a dunhao (e.g., "## 1、引言", "## 2、核心概念"). Do NOT use Chinese numerals like "一、" or "Chapter 1".
-            - Level 2 headings (Subsections) MUST use Markdown '###' (H3) and hierarchical Arabic numbering (e.g., "### 1.1 背景", "### 1.2 目标", "### 2.1 主要发现").
+        - **Note2:** STRICT NUMBERING FORMAT REQUIRED (CRITICAL FOR PDF TOC): 
+            - Level 1 headings (Chapters) MUST use Markdown '##' (H2) and Arabic numerals followed by a period:
+              * For English: "## 1. Introduction", "## 2. Core Concepts"
+              * For Chinese: "## 1. 引言", "## 2. 核心概念"
+              * Do NOT use Chinese numerals like "一、" or "Chapter 1".
+            - Level 2 headings (Subsections) MUST be **PLAIN TEXT WITHOUT any markdown symbols** (no ###, no **, no *):
+              * For English: "2.1 Background", "2.2 Main Findings" (just number + space + title)
+              * For Chinese: "2.1 背景", "2.2 主要发现"
+              * **WRONG FORMAT**: "### 2.1 Title" or "**### 2.1 Title**" (has markdown symbols)
+              * **CORRECT FORMAT**: "2.1 Title" (plain text, no markdown)
             - This structure is CRITICAL for the final PDF table of contents.
         - **Note3:** The number of chapters must not exceed 7, dynamic evaluation can be performed based on the collected content. For example, if there is a lot of content, more chapters can be generated, and vice versa. But each chapter should only include Level 1 and Level 2 headings. Also, please generate more Level 2 headings (suggest 4-8) to ensure the content is rich and detailed. However, if the first chapter is an abstract or introduction, do not generate subheadings (level-2 headings)—only include the main heading (level-1). Additionally, tailor the outline style based on the type of document. For example, in a research report, the first chapter should preferably be titled \"Abstract\" or \"Introduction.\"  
         
