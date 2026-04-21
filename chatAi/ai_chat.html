@@ -1186,7 +1186,11 @@
             window.selectedTab = 'deepdiver';
             // 全局中断控制器，用于取消API请求
             window.abortController = null;
-            
+            // 清理所有残留的进度容器和pending状态（页面刷新后）
+            window.pendingSessions = {};
+            window.sessionEventSources = {};
+            window.sessionControllers = {};
+            window.sessionTasks = {};
             // 初始化功能标签按钮
             initFeatureTabs();
             
@@ -2637,16 +2641,20 @@ ${contextText.trim()}
                             window.pendingSessions[window.currentSessionId].loading = false;
                             window.pendingSessions[window.currentSessionId].spinner = null;
                         }
-
-                        // 2. 同时使用AbortController中断前端请求
+                        // 2. 关闭SSE连接
+                        if (window.sessionEventSources && window.sessionEventSources[currentSessionId]) {
+                            window.sessionEventSources[currentSessionId].close();
+                            delete window.sessionEventSources[currentSessionId];
+                            console.log('[Cancel] SSE连接已关闭:', currentSessionId);
+                        }
+                        // 3. 同时使用AbortController中断前端请求
                         if (controller) {
                             controller.abort();
                             // 清理存储的 controller 和 taskId
                             if (window.sessionControllers) delete window.sessionControllers[currentSessionId];
                             if (window.sessionTasks) delete window.sessionTasks[currentSessionId];
                         }
-                        
-                        // 3. 更新UI状态
+                        // 4. 更新UI状态
                         // 修复：只有当当前显示的会话仍然是被中断的会话时，才更新UI控件
                         if (currentSessionId == window.currentSessionId) {
                             cancelButton.classList.add('hidden');
@@ -2656,8 +2664,7 @@ ${contextText.trim()}
                                 submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
                             }
                         }
-                        
-                        // 4. 移除loading元素
+                        // 5. 移除loading元素
                         const chatMessages = document.getElementById('chat-messages');
                         try { 
                             document.querySelectorAll('.pending-spinner').forEach(el => el.remove());
@@ -3099,410 +3106,336 @@ ${contextText.trim()}
                     username: currentUsername,  // 添加用户名字段
                     search_sources: selectedSources  // 添加搜索源选择
                 };
-
-                // 3. 发送到DeepDiver API
-                fetch('/8000/api/query', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    signal: window.sessionControllers[sessionId]?.signal,
-                    body: JSON.stringify(requestBody)
-                })
-                .then(response => {
-                    if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
-                    return response.json();
-                })
-                .then(data => {
-                    // 检查是否为队列响应
-                    if (data.planner_agent_name === 'QueueManager' && data.planner_error && data.planner_error.includes('排队位置')) {
-                        loadingDiv.remove();
-                        
-                        // 创建队列状态显示
-                        const queueDiv = document.createElement('div');
-                        queueDiv.className = 'mb-6 flex justify-start message-animation';
-                        queueDiv.id = `queue-status-${taskId}`;
-                        queueDiv.innerHTML = `
-                            <div class="flex items-start max-w-[80%]">
-                                <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                <div class="bg-blue-50 border-l-4 border-blue-500 text-gray-800 p-4 rounded-lg shadow-sm w-full">
-                                    <div class="flex items-center justify-between mb-2">
-                                        <div class="flex items-center">
-                                            <i class="fa fa-clock-o mr-2 text-blue-500"></i>
-                                            <span class="font-semibold text-blue-700">任务队列状态</span>
+                // 3. 先建立SSE连接（在发送任务请求之前），确保能接收所有进度消息
+                console.log('[DeepDiver] 步骤1: 建立SSE连接, taskId:', taskId);
+                const eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
+                // 创建进度展示容器（替换静态的loadingDiv）
+                loadingDiv.remove();
+                const progressContainer = document.createElement('div');
+                progressContainer.className = 'mb-6 flex justify-start message-animation';
+                progressContainer.setAttribute('data-progress-container', taskId);
+                progressContainer.innerHTML = `
+                    <div class="flex items-start max-w-[80%] w-full">
+                        <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
+                        <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
+                            <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
+                                <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
+                                <span class="text-sm text-gray-600">正在连接...</span>
+                            </div>
+                            <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
+                            </div>
+                        </div>
+                    </div>
+                `;
+                chatMessages.appendChild(progressContainer);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                // 记录EventSource以便取消时关闭
+                window.sessionEventSources = window.sessionEventSources || {};
+                window.sessionEventSources[sessionId] = eventSource;
+                // 标记SSE连接状态
+                let sseConnected = false;
+                // SSE连接成功回调
+                eventSource.onopen = () => {
+                    console.log('[DeepDiver] SSE连接已建立');
+                    sseConnected = true;
+                    const statusSpan = progressContainer.querySelector('.text-sm.text-gray-600');
+                    if (statusSpan) {
+                        statusSpan.textContent = '正在生成报告';
+                    }
+                    // SSE连接建立后，立即发送任务请求
+                    console.log('[DeepDiver] 步骤2: SSE连接就绪，现在发送任务请求');
+                    sendDeepDiverTask();
+                };
+                // SSE消息处理
+                eventSource.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('[SSE] 接收到进度消息:', data);
+                        if (data.type === 'progress') {
+                            const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                            if (!timeline) return;
+                            const progressItem = document.createElement('div');
+                            progressItem.className = 'flex items-start py-1';
+                            let detailsHtml = '';
+                            let subtaskListHtml = '';
+                            if (data.details) {
+                                if (data.stage === 'info_seeking' && data.details.subtask_names && data.details.subtask_names.length > 0) {
+                                    detailsHtml = ` · ${data.details.subtasks_count}个子任务`;
+                                    subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${data.details.subtask_names.map(task => `<div class="flex items-start"><span class="mr-1">-</span><span>${task}</span></div>`).join('')}</div>`;
+                                } else if (data.stage === 'writing_started' && data.details.file_names && data.details.file_names.length > 0) {
+                                    const totalRetrieved = data.details.total_retrieved_count || data.details.key_files_count;
+                                    detailsHtml = `开始撰写报告 · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）`;
+                                    const displayFiles = data.details.file_names.slice(0, 5);
+                                    const hasMore = data.details.key_files_count > 5;
+                                    subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">...还有${data.details.key_files_count - 5}个文件</div>` : ''}</div>`;
+                                } else if (data.stage === 'writing_chapter') {
+                                    detailsHtml = '';
+                                }
+                            }
+                            progressItem.innerHTML = `<div class="flex-1"><div class="flex items-center text-gray-600"><span class="mr-2 text-gray-400">•</span><span>${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
+                            timeline.appendChild(progressItem);
+                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                        } else if (data.type === 'completed') {
+                            console.log('[SSE] 任务完成');
+                            eventSource.close();
+                            delete window.sessionEventSources[sessionId];
+                            if (progressContainer && progressContainer.parentNode) {
+                                progressContainer.remove();
+                            }
+                            loadSessionMessages(sessionId).catch(error => {
+                                console.error('[SSE] 加载消息失败:', error);
+                            });
+                        } else if (data.type === 'error') {
+                            const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                            const errorItem = document.createElement('div');
+                            errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
+                            errorItem.innerHTML = `<span class="mr-2">•</span><span>错误: ${data.message}</span>`;
+                            if (timeline) timeline.appendChild(errorItem);
+                            eventSource.close();
+                            delete window.sessionEventSources[sessionId];
+                        } else if (data.type === 'cancelled') {
+                            const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                            const cancelledItem = document.createElement('div');
+                            cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
+                            cancelledItem.innerHTML = `<span class="mr-2">•</span><span>任务已取消</span>`;
+                            if (timeline) timeline.appendChild(cancelledItem);
+                            eventSource.close();
+                            delete window.sessionEventSources[sessionId];
+                        }
+                    } catch (e) {
+                        console.error('[SSE] 解析进度消息失败:', e, event.data);
+                    }
+                };
+                eventSource.onerror = (error) => {
+                    console.error('[SSE] 连接错误:', error);
+                    eventSource.close();
+                    delete window.sessionEventSources[sessionId];
+                };
+                // 4. 定义发送任务的函数（在SSE连接建立后调用）
+                const sendDeepDiverTask = () => {
+                    console.log('[DeepDiver] 步骤3: 发送任务到后端API');
+                    fetch('/8000/api/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        signal: window.sessionControllers[sessionId]?.signal,
+                        body: JSON.stringify(requestBody)
+                    })
+                    .then(response => {
+                        if (!response.ok) throw new Error(`HTTP错误，状态码：${response.status}`);
+                        return response.json();
+                    })
+                    .then(data => {
+                        // 检查是否为队列响应
+                        if (data.planner_agent_name === 'QueueManager' && data.planner_error && data.planner_error.includes('排队位置')) {
+                            // 关闭SSE连接，改用队列轮询
+                            eventSource.close();
+                            delete window.sessionEventSources[sessionId];
+                            if (progressContainer && progressContainer.parentNode) {
+                                progressContainer.remove();
+                            }
+                            // 创建队列状态显示
+                            const queueDiv = document.createElement('div');
+                            queueDiv.className = 'mb-6 flex justify-start message-animation';
+                            queueDiv.id = `queue-status-${taskId}`;
+                            queueDiv.innerHTML = `
+                                <div class="flex items-start max-w-[80%]">
+                                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
+                                    <div class="bg-blue-50 border-l-4 border-blue-500 text-gray-800 p-4 rounded-lg shadow-sm w-full">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <div class="flex items-center">
+                                                <i class="fa fa-clock-o mr-2 text-blue-500"></i>
+                                                <span class="font-semibold text-blue-700">任务队列状态</span>
+                                            </div>
+                                            <button id="cancel-queue-${taskId}" class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200">
+                                                <i class="fa fa-times mr-1"></i>取消任务
+                                            </button>
                                         </div>
-                                        <button id="cancel-queue-${taskId}" class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200">
-                                            <i class="fa fa-times mr-1"></i>取消任务
-                                        </button>
-                                    </div>
-                                    <div class="text-sm space-y-1">
-                                        <div class="flex items-center">
-                                            <span class="text-gray-600">队列状态：</span>
-                                            <span class="ml-2 px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">运行中 <span id="running-${taskId}">-</span></span>
-                                            <span class="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">处理中 <span id="queued-${taskId}">-</span></span>
-                                        </div>
-                                        <div class="flex items-center mt-2">
-                                            <span class="text-gray-600">当前位置：第</span>
-                                            <span class="ml-1 text-lg font-bold text-blue-600" id="position-${taskId}">-</span>
-                                            <span class="text-gray-600">位</span>
+                                        <div class="text-sm space-y-1">
+                                            <div class="flex items-center">
+                                                <span class="text-gray-600">队列状态：</span>
+                                                <span class="ml-2 px-2 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-medium">运行中 <span id="running-${taskId}">-</span></span>
+                                                <span class="ml-2 px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-medium">处理中 <span id="queued-${taskId}">-</span></span>
+                                            </div>
+                                            <div class="flex items-center mt-2">
+                                                <span class="text-gray-600">当前位置：第</span>
+                                                <span class="ml-1 text-lg font-bold text-blue-600" id="position-${taskId}">-</span>
+                                                <span class="text-gray-600">位</span>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
-                            </div>
-                        `;
-                        chatMessages.appendChild(queueDiv);
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
-                        
-                        // 为队列中的取消按钮添加事件监听器
-                        const queueCancelBtn = document.getElementById(`cancel-queue-${taskId}`);
-                        queueCancelBtn.addEventListener('click', async () => {
-                            try {
-                                const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                    },
-                                    body: JSON.stringify({
-                                        reason: '用户主动取消排队任务'
-                                    })
-                                });
-                                
-                                const cancelData = await cancelResponse.json();
-                                console.log('队列任务取消成功:', cancelData);
-                                
-                                // 停止轮询
-                                if (typeof pollInterval !== 'undefined') {
-                                    clearInterval(pollInterval);
+                            `;
+                            chatMessages.appendChild(queueDiv);
+                            chatMessages.scrollTop = chatMessages.scrollHeight;
+                            // 提前声明轮询变量和取消标志
+                            let queuePollInterval = null;
+                            let isQueueCancelled = false;
+                            // 队列取消按钮
+                            const queueCancelBtn = document.getElementById(`cancel-queue-${taskId}`);
+                            queueCancelBtn.addEventListener('click', async () => {
+                                try {
+                                    // 立即标记为已取消，防止轮询触发reconnectSSE
+                                    isQueueCancelled = true;
+                                    const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ reason: '用户主动取消排队任务' })
+                                    });
+                                    const cancelData = await cancelResponse.json();
+                                    console.log('队列任务取消成功:', cancelData);
+                                    // 停止轮询
+                                    if (queuePollInterval) {
+                                        clearInterval(queuePollInterval);
+                                        queuePollInterval = null;
+                                    }
+                                    queueDiv.remove();
+                                    if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) delete window.sessionTasks[sessionId];
+                                    const cancelMsgDiv = document.createElement('div');
+                                    cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
+                                    cancelMsgDiv.innerHTML = `<div class="flex items-start max-w-[80%]"><img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover"><div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm"><p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p></div></div>`;
+                                    chatMessages.appendChild(cancelMsgDiv);
+                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                    saveResultToDB(cancelData.message, sessionId, 'ai');
+                                    submitButton.disabled = false;
+                                    submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                                    document.getElementById('cancel-button').classList.add('hidden');
+                                } catch (error) {
+                                    console.error('取消队列任务失败:', error);
+                                    showToast('取消任务失败，请重试', 'error');
                                 }
-                                
-                                // 移除队列状态显示
-                                queueDiv.remove();
-                                
-                                // 清理会话状态
-                                if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) {
-                                    delete window.sessionTasks[sessionId];
+                            });
+                            // 轮询队列状态
+                            queuePollInterval = setInterval(async () => {
+                                // 如果任务已被取消，停止轮询
+                                if (isQueueCancelled) {
+                                    clearInterval(queuePollInterval);
+                                    return;
                                 }
-                                
-                                // 显示取消消息
-                                const cancelMsgDiv = document.createElement('div');
-                                cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
-                                cancelMsgDiv.innerHTML = `
-                                    <div class="flex items-start max-w-[80%]">
-                                        <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                        <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
-                                            <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p>
-                                        </div>
-                                    </div>
-                                `;
-                                chatMessages.appendChild(cancelMsgDiv);
-                                chatMessages.scrollTop = chatMessages.scrollHeight;
-                                
-                                // 保存取消消息到数据库
-                                saveResultToDB(cancelData.message, sessionId, 'ai');
-                                
-                                // 恢复UI状态
-                                submitButton.disabled = false;
-                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                                document.getElementById('cancel-button').classList.add('hidden');
-                                
-                            } catch (error) {
-                                console.error('取消队列任务失败:', error);
-                                showToast('取消任务失败，请重试', 'error');
+                                try {
+                                    const queueResp = await fetch('/8000/api/queue/status');
+                                    const queueData = await queueResp.json();
+                                    // 再次检查取消标志（fetch期间可能已取消）
+                                    if (isQueueCancelled) {
+                                        clearInterval(queuePollInterval);
+                                        return;
+                                    }
+                                    const runningEl = document.getElementById(`running-${taskId}`);
+                                    const queuedEl = document.getElementById(`queued-${taskId}`);
+                                    if (runningEl) runningEl.textContent = queueData.running_count;
+                                    if (queuedEl) queuedEl.textContent = queueData.queued_count;
+                                    const myTask = queueData.queued_tasks.find(t => t.task_id === taskId);
+                                    if (myTask) {
+                                        const posEl = document.getElementById(`position-${taskId}`);
+                                        if (posEl) posEl.textContent = myTask.position;
+                                    } else {
+                                        // 任务不在队列中，检查是否已被取消
+                                        if (isQueueCancelled) {
+                                            clearInterval(queuePollInterval);
+                                            return;
+                                        }
+                                        // 任务已开始执行，停止队列轮询，重新建立SSE连接
+                                        clearInterval(queuePollInterval);
+                                        queueDiv.remove();
+                                        // 重新建立SSE连接监听进度
+                                        reconnectSSE(taskId, sessionId);
+                                    }
+                                } catch (err) {
+                                    console.error('队列状态轮询失败:', err);
+                                }
+                            }, 3000);
+                            return;
+                        }
+                        // 非队列响应，正常处理
+                        window.SessionList.forEach((item,index)=>{
+                            if(item.id==window.currentSessionId){
+                               window.SessionList.splice(index,1)
                             }
                         });
-                        
-                        // 轮询队列状态
-                        const pollInterval = setInterval(async () => {
+                        console.log(window.SessionList);
+                        const backendSessionId = data.session_id;
+                        let result = null;
+                        let has_report = 0;
+                        let report_title = '';
+                        if (data.final_report) {
+                            result = data.final_report;
+                            has_report = 1;
                             try {
-                                const queueResp = await fetch('/8000/api/queue/status');
-                                const queueData = await queueResp.json();
-                                
-                                document.getElementById(`running-${taskId}`).textContent = queueData.running_count;
-                                document.getElementById(`queued-${taskId}`).textContent = queueData.queued_count;
-                                
-                                const myTask = queueData.queued_tasks.find(t => t.task_id === taskId);
-                                if (myTask) {
-                                    document.getElementById(`position-${taskId}`).textContent = myTask.position;
+                                const titleMatch = result.match(/^#\s+(.+?)$/m);
+                                if (titleMatch && titleMatch[1]) {
+                                    report_title = titleMatch[1].trim();
                                 } else {
-                                    // 任务已开始执行，停止队列轮询
-                                    clearInterval(pollInterval);
-                                    queueDiv.remove();
-                                    
-                                    // 显示执行中状态（带中断按钮）
-                                    const execDiv = document.createElement('div');
-                                    execDiv.className = 'mb-6 flex justify-start message-animation';
-                                    execDiv.id = `exec-status-${taskId}`;
-                                    execDiv.innerHTML = `
-                                        <div class="flex items-start max-w-[80%]">
-                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                            <div class="bg-ai-message text-gray-800 p-4 rounded-lg shadow-sm">
-                                                <div class="flex items-center justify-between">
-                                                    <div class="flex items-center">
-                                                        <i class="fa fa-spinner fa-spin mr-2 text-gray-500"></i>
-                                                        <span class="text-gray-600 text-sm">SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟，请等待...</span>
-                                                    </div>
-                                                    <button id="cancel-exec-${taskId}" class="ml-4 px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 text-xs rounded-md border border-red-300 transition-colors duration-200 flex-shrink-0">
-                                                        <i class="fa fa-times mr-1"></i>中断
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    `;
-                                    chatMessages.appendChild(execDiv);
-                                    chatMessages.scrollTop = chatMessages.scrollHeight;
-                                    
-                                    // 显示全局中断按钮
-                                    document.getElementById('cancel-button').classList.remove('hidden');
-                                    
-                                    // 开始轮询任务执行状态，直到任务完成
-                                    let taskResultPollStopped = false;
-                                    const taskResultPollInterval = setInterval(async () => {
-                                        if (taskResultPollStopped) return;
-                                        
-                                        try {
-                                            const taskStatusResp = await fetch(`/8000/api/task/${taskId}`);
-                                            const taskStatus = await taskStatusResp.json();
-                                            console.log(`Task ${taskId} status:`, taskStatus.status);
-                                            
-                                            // 检查任务是否完成、失败或取消
-                                            if (taskStatus.status === 'completed' || taskStatus.status === 'failed' || taskStatus.status === 'cancelled') {
-                                                taskResultPollStopped = true;
-                                                clearInterval(taskResultPollInterval);
-                                                
-                                                // 移除执行状态显示
-                                                const execStatusDiv = document.getElementById(`exec-status-${taskId}`);
-                                                if (execStatusDiv) execStatusDiv.remove();
-                                                
-                                                // 恢复UI状态
-                                                submitButton.disabled = false;
-                                                submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                                                document.getElementById('cancel-button').classList.add('hidden');
-                                                
-                                                if (taskStatus.status === 'completed' && taskStatus.result) {
-                                                    // 任务完成，显示结果
-                                                    let result = null;
-                                                    let has_report = 0;
-                                                    let report_title = '';
-                                                    
-                                                    if (taskStatus.result.final_report) {
-                                                        result = taskStatus.result.final_report;
-                                                        has_report = 1;
-                                                        try {
-                                                            const titleMatch = result.match(/^#\s+(.+?)$/m);
-                                                            if (titleMatch && titleMatch[1]) {
-                                                                report_title = titleMatch[1].trim();
-                                                            }
-                                                            if (report_title.length > 50) {
-                                                                report_title = report_title.substring(0, 50) + '...';
-                                                            }
-                                                            if (!report_title) report_title = '研究报告';
-                                                        } catch (e) {
-                                                            report_title = '研究报告';
-                                                        }
-                                                    } else if (taskStatus.result.planner_result && taskStatus.result.planner_result.task_summary) {
-                                                        result = taskStatus.result.planner_result.task_summary;
-                                                    } else {
-                                                        result = '任务执行完成。';
-                                                    }
-                                                    
-                                                    if (result && window.currentSessionId === sessionId) {
-                                                        addMessage(result, 'ai', taskStatus.result.session_id || '', has_report);
-                                                    }
-                                                } else if (taskStatus.status === 'cancelled') {
-                                                    // 任务被取消
-                                                    const cancelMsgDiv = document.createElement('div');
-                                                    cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
-                                                    cancelMsgDiv.innerHTML = `
-                                                        <div class="flex items-start max-w-[80%]">
-                                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                                            <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
-                                                                <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>任务已取消</p>
-                                                            </div>
-                                                        </div>
-                                                    `;
-                                                    chatMessages.appendChild(cancelMsgDiv);
-                                                    chatMessages.scrollTop = chatMessages.scrollHeight;
-                                                } else if (taskStatus.status === 'failed') {
-                                                    // 任务失败
-                                                    const errorMsg = taskStatus.error || '任务执行失败';
-                                                    const failMsgDiv = document.createElement('div');
-                                                    failMsgDiv.className = 'mb-6 flex justify-start message-animation';
-                                                    failMsgDiv.innerHTML = `
-                                                        <div class="flex items-start max-w-[80%]">
-                                                            <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                                            <div class="bg-red-50 text-red-700 p-3 rounded-lg shadow-sm">
-                                                                <p class="text-sm"><i class="fa fa-exclamation-circle mr-1"></i>${errorMsg}</p>
-                                                            </div>
-                                                        </div>
-                                                    `;
-                                                    chatMessages.appendChild(failMsgDiv);
-                                                    chatMessages.scrollTop = chatMessages.scrollHeight;
-                                                }
-                                            }
-                                        } catch (err) {
-                                            console.error('任务状态轮询失败:', err);
-                                        }
-                                    }, 5000); // 每5秒轮询一次任务状态
-                                    
-                                    // 为执行中状态的中断按钮添加事件监听器
-                                    const execCancelBtn = document.getElementById(`cancel-exec-${taskId}`);
-                                    execCancelBtn.addEventListener('click', async () => {
-                                        try {
-                                            const cancelResponse = await fetch(`/8000/api/task/${taskId}/cancel`, {
-                                                method: 'POST',
-                                                headers: {
-                                                    'Content-Type': 'application/json',
-                                                },
-                                                body: JSON.stringify({
-                                                    reason: '用户主动取消执行中任务'
-                                                })
-                                            });
-                                            
-                                            const cancelData = await cancelResponse.json();
-                                            console.log('执行中任务取消成功:', cancelData);
-                                            
-                                            // 停止任务状态轮询
-                                            taskResultPollStopped = true;
-                                            clearInterval(taskResultPollInterval);
-                                            
-                                            // 移除执行状态显示
-                                            execDiv.remove();
-                                            
-                                            // 清理会话状态
-                                            if (window.sessionTasks && window.sessionTasks[sessionId] === taskId) {
-                                                delete window.sessionTasks[sessionId];
-                                            }
-                                            
-                                            // 中止前端请求
-                                            if (window.sessionControllers && window.sessionControllers[sessionId]) {
-                                                window.sessionControllers[sessionId].abort();
-                                                delete window.sessionControllers[sessionId];
-                                            }
-                                            
-                                            // 显示取消消息
-                                            const cancelMsgDiv = document.createElement('div');
-                                            cancelMsgDiv.className = 'mb-6 flex justify-start message-animation';
-                                            cancelMsgDiv.innerHTML = `
-                                                <div class="flex items-start max-w-[80%]">
-                                                    <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover">
-                                                    <div class="bg-gray-100 text-gray-700 p-3 rounded-lg shadow-sm">
-                                                        <p class="text-sm"><i class="fa fa-info-circle mr-1"></i>${cancelData.message}</p>
-                                                    </div>
-                                                </div>
-                                            `;
-                                            chatMessages.appendChild(cancelMsgDiv);
-                                            chatMessages.scrollTop = chatMessages.scrollHeight;
-                                            
-                                            // 保存取消消息到数据库
-                                            saveResultToDB(cancelData.message, sessionId, 'ai');
-                                            
-                                            // 恢复UI状态
-                                            submitButton.disabled = false;
-                                            submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                                            document.getElementById('cancel-button').classList.add('hidden');
-                                            
-                                        } catch (error) {
-                                            console.error('取消执行中任务失败:', error);
-                                            showToast('取消任务失败，请重试', 'error');
-                                        }
-                                    });
+                                    const lines = result.split('\n').filter(line => line.trim());
+                                    if (lines.length > 0) {
+                                        report_title = lines[0].replace(/^#+\s*/, '').trim();
+                                    }
                                 }
-                            } catch (err) {
-                                console.error('队列状态轮询失败:', err);
-                            }
-                        }, 3000);
-                        
-                        return;
-                    }
-                    
-                    window.SessionList.forEach((item,index)=>{
-                        if(item.id==window.currentSessionId){
-                           window.SessionList.splice(index,1)
-                        }
-                    });
-                    
-                    loadingDiv.remove();
-                    const backendSessionId = data.session_id;
-                    let result = null;
-                    let has_report = 0;
-                    let report_title = '';
-                    
-                    if (data.final_report) {
-                        result = data.final_report;
-                        has_report = 1;
-                        
-                        try {
-                            const titleMatch = result.match(/^#\s+(.+?)$/m);
-                            if (titleMatch && titleMatch[1]) {
-                                report_title = titleMatch[1].trim();
-                            } else {
-                                const lines = result.split('\n').filter(line => line.trim());
-                                if (lines.length > 0) {
-                                    report_title = lines[0].replace(/^#+\s*/, '').trim();
+                                if (report_title.length > 50) {
+                                    report_title = report_title.substring(0, 50) + '...';
                                 }
-                            }
-                            if (report_title.length > 50) {
-                                report_title = report_title.substring(0, 50) + '...';
-                            }
-                            if (!report_title) {
+                                if (!report_title) {
+                                    report_title = '研究报告';
+                                }
+                            } catch (e) {
                                 report_title = '研究报告';
                             }
-                        } catch (e) {
-                            report_title = '研究报告';
                         }
-                    }
-                    
-                    if (result === null) {
-                        report_title = '';
-                        if (data.planner_result && data.planner_result.task_summary) {
-                            const regex = /## 完整答案[\s\S]*?(?=任务已圆满完成)/;
-                            const match = data.planner_result.task_summary.match(regex);
-                            if (match) {
-                                result = match[0].replace(/## 完整答案\n*/, '').trim() + '\n\n任务已圆满完成';
+                        if (result === null) {
+                            report_title = '';
+                            if (data.planner_result && data.planner_result.task_summary) {
+                                result = extractAnswer(data.planner_result.task_summary);
                             } else {
-                                result = data.planner_result.task_summary;
+                                result = '任务执行完成，但未生成报告内容。';
+                            }
+                        }
+                        function extractAnswer(content) {
+                            const regex = /## 完整答案[\s\S]*?(?=任务已圆满完成)/;
+                            const match = content.match(regex);
+                            if (match) {
+                                let answer = match[0].replace(/## 完整答案\n*/, '').trim();
+                                answer += '\n\n任务已圆满完成';
+                                return answer;
+                            } else {
+                                return content;
+                            }
+                        }
+                        if (result) {
+                            console.log('[DeepDiver] 收到报告，长度:', result.length, '(由SSE completed事件加载显示)');
+                            if (window.currentSessionId === sessionId) {
+                                window.pendingSessions = window.pendingSessions || {};
+                                if (window.pendingSessions[sessionId]) {
+                                    window.pendingSessions[sessionId].loading = false;
+                                    window.pendingSessions[sessionId].spinner = null;
+                                }
+                                try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
                             }
                         } else {
-                            result = '任务执行完成，但未生成报告内容。';
-                        }
-                    }
-                    
-                    if (result && window.currentSessionId === sessionId) {
-                        window.pendingSessions = window.pendingSessions || {};
-                        if (window.pendingSessions[sessionId]) {
-                            window.pendingSessions[sessionId].loading = false;
-                            window.pendingSessions[sessionId].spinner = null;
-                        }
-                        try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                        
-                        addMessage(result, 'ai', backendSessionId, has_report);
-                        
-                        setTimeout(() => {
-                            const chatMessages = document.getElementById('chat-messages');
-                            if (chatMessages) {
-                                chatMessages.scrollTop = chatMessages.scrollHeight;
+                            // 只有在没有结果时才显示错误消息
+                            if (window.currentSessionId === sessionId) {
+                                addMessage('抱歉，未能获取有效的回复。', 'ai', backendSessionId);
                             }
-                        }, 100);
-                    }
-                })
-                .catch(error => {
-                    loadingDiv.remove();
-                    if (window.currentSessionId === sessionId) {
-                        try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
-                        if (error.name !== 'AbortError') {
-                            addMessage('获取响应失败，请重试', 'ai');
                         }
-                    }
-                    console.error('API请求失败:', error);
-                })
-                .finally(() => {
-                    if (window.sessionTasks[sessionId] !== taskId) {
-                        return;
-                    }
-                    submitButton.disabled = false;
-                    submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
-                    document.getElementById('cancel-button').classList.add('hidden');
-                });
+                    })
+                    .catch(error => {
+                        console.error('[DeepDiver] API请求失败:', error);
+                        if (progressContainer && progressContainer.parentNode) {
+                            progressContainer.remove();
+                        }
+                        if (window.currentSessionId === sessionId) {
+                            try { document.querySelectorAll('.pending-spinner').forEach(el => el.remove()); } catch (e) {}
+                            if (error.name !== 'AbortError') {
+                                addMessage('获取响应失败，请重试', 'ai');
+                            }
+                        }
+                    })
+                    .finally(() => {
+                        if (window.sessionTasks[sessionId] !== taskId) {
+                            return;
+                        }
+                        submitButton.disabled = false;
+                        submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        document.getElementById('cancel-button').classList.add('hidden');
+                    });
+                };
             }
         }
         
@@ -3724,8 +3657,6 @@ ${contextText.trim()}
                         // 自动调整输入框高度
                         userInput.style.height = 'auto';
                         userInput.style.height = userInput.scrollHeight + 'px';
-                        // 显示提示
-                        showCopyToast(copyButton, '已填充到输入框');
                     }
                 });
             } else {
@@ -4144,10 +4075,6 @@ ${contextText.trim()}
         // 重新加载会话消息的函数（用于轮询检测到新消息后刷新）
         function loadSessionMessages(sessionId) {
             console.log('[重新加载] 加载会话消息:', sessionId);
-            
-            // 清空当前聊天内容
-            chatMessages.innerHTML = '';
-            
             // 清理 pending 状态
             window.pendingSessions = window.pendingSessions || {};
             if (window.pendingSessions[sessionId]) {
@@ -4158,29 +4085,49 @@ ${contextText.trim()}
                 window.pendingSessions[sessionId].loading = false;
                 window.pendingSessions[sessionId].spinner = null;
             }
-            
-            // 重新加载消息
-            fetch(`/5000/api/chat/messages/${sessionId}`, {
+            // 返回Promise，先加载消息，加载完成后再清空并重新渲染
+            return fetch(`/5000/api/chat/messages/${sessionId}`, {
                 headers: {
                     'Authorization': `Bearer ${window.userToken}`
                 }
             })
             .then(response => response.json())
             .then(data => {
+                // 只保存有活跃SSE连接的进度容器
+                const progressContainers = chatMessages.querySelectorAll('[data-progress-container]');
+                const savedContainers = [];
+                const hasActiveSSE = window.sessionEventSources && window.sessionEventSources[sessionId];
+                if (hasActiveSSE) {
+                    progressContainers.forEach(container => {
+                        savedContainers.push({
+                            element: container.cloneNode(true),
+                            taskId: container.getAttribute('data-progress-container')
+                        });
+                    });
+                    console.log(`[重新加载] 保存了 ${savedContainers.length} 个进度容器（有活跃SSE）`);
+                } else {
+                    console.log(`[重新加载] 跳过保存进度容器（无活跃SSE）`);
+                }
+                chatMessages.innerHTML = '';
                 if (data.messages && data.messages.length > 0) {
                     data.messages.forEach(item => {
                         const thinkMsg = (item.has_report === 0 && item.think_msg) ? item.think_msg : '';
                         addMessage(item.content, item.from_who, item.uuid, item.has_report, thinkMsg);
                     });
-                    
-                    // 滚动到底部
-                    setTimeout(() => {
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
-                    }, 100);
                 }
+                if (savedContainers.length > 0) {
+                    savedContainers.forEach(({ element, taskId }) => {
+                        console.log(`[重新加载] 恢复进度容器: taskId=${taskId}`);
+                        chatMessages.appendChild(element);
+                    });
+                }
+                setTimeout(() => {
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                }, 100);
             })
             .catch(error => {
                 console.error('[重新加载] 加载失败:', error);
+                throw error;
             });
         }
         
@@ -4298,7 +4245,19 @@ ${contextText.trim()}
                 this.classList.add('active', 'bg-primary/10', 'text-primary');
                 this.querySelector('i').classList.remove('text-gray-500');
                 this.querySelector('i').classList.add('text-primary');
-                
+                // 【切换会话】保存当前会话的进度容器（如果有活跃SSE连接）
+                window.savedProgressContainers = window.savedProgressContainers || {};
+                const previousSessionId = window.currentSessionId;
+                if (previousSessionId && window.sessionEventSources && window.sessionEventSources[previousSessionId]) {
+                    const progressContainers = chatMessages.querySelectorAll('[data-progress-container]');
+                    if (progressContainers.length > 0) {
+                        window.savedProgressContainers[previousSessionId] = [];
+                        progressContainers.forEach(container => {
+                            window.savedProgressContainers[previousSessionId].push(container.cloneNode(true));
+                        });
+                        console.log(`[切换会话] 保存了会话 ${previousSessionId} 的 ${progressContainers.length} 个进度容器`);
+                    }
+                }
                 // 清空当前聊天内容
                 chatMessages.innerHTML = '';
                 chatMessages.appendChild(initialPrompt);
@@ -4326,11 +4285,14 @@ ${contextText.trim()}
                     document.getElementById('cancel-button').classList.remove('hidden');
                     submitButton.disabled = true;
                     submitButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+                    // 标记需要重连SSE，但等历史消息加载完成后再重连，确保消息顺序正确
+                    window.needReconnectSSE = true;
                 } else {
                     // 无任务在跑：隐藏中断按钮，发送按钮恢复正常
                     document.getElementById('cancel-button').classList.add('hidden');
                     submitButton.disabled = false;
                     submitButton.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                    window.needReconnectSSE = false;
                 }
 
                 if (sessionId) {
@@ -4366,11 +4328,26 @@ ${contextText.trim()}
                                             // 根据后端返回的任务状态显示加载提示
                                             try {
                                                 if (data.has_pending_task && !chatMessages.querySelector('.pending-spinner')) {
+                                                    const queryModel = data.pending_mode || 'chat';
+                                                    // 如果有 taskID 且是 DeepDiver 模式，直接使用 SSE，跳过静态提示和轮询
+                                                    if (window.taskId && queryModel === 'deepdiver') {
+                                                        // 检查是否需要重连SSE（切换会话时设置的标志）
+                                                        if (window.needReconnectSSE) {
+                                                            console.log('[切换会话] 历史消息加载完成，现在重连SSE');
+                                                            reconnectSSE(window.taskId, sessionId);
+                                                            window.needReconnectSSE = false;
+                                                            return;
+                                                        }
+                                                        // 页面刷新恢复场景
+                                                        console.log('[页面恢复] 检测到 taskId，直接使用 SSE 恢复进度显示');
+                                                        reconnectSSE(window.taskId, sessionId);
+                                                        return; // 跳过后续的静态提示和轮询逻辑
+                                                    }
+                                                    // 否则，显示静态提示并启动轮询
                                                     const pending = document.createElement('div');
                                                     pending.className = 'mb-6 flex justify-start message-animation pending-spinner';
                                                     
                                                     // 根据后端返回的模式显示不同的提示文本
-                                                    const queryModel = data.pending_mode || 'chat';
                                                     const statusText = (queryModel === 'deepdiver') 
                                                         ? 'SciAssistant正在为您规划、查询资料、生成报告，大约需要20分钟,请等待...' 
                                                         : '正在思考…';
@@ -4445,9 +4422,8 @@ ${contextText.trim()}
                                                             }
                                                         });
                                                     };
-                                                    
-                                                    // 首次轮询在5秒后开始
-                                                    const pollTimeout = setTimeout(doPoll, 5000);
+                                                    // 首次轮询立即开始（0秒延迟）
+                                                    const pollTimeout = setTimeout(doPoll, 0);
                                                     window.pendingSessions[sessionId].pollTimeout = pollTimeout;
                                                 }
                                             } catch (e) { 
@@ -6300,7 +6276,195 @@ ${contextText.trim()}
                 notification.remove();
             });
         }
-
+        // 重新连接 SSE 以恢复进度显示（页面刷新后使用）
+        function reconnectSSE(taskId, sessionId) {
+            console.log('[SSE恢复] 重新连接 SSE，taskId:', taskId, 'sessionId:', sessionId);
+            // 先关闭该会话已有的SSE连接，避免重复
+            if (window.sessionEventSources && window.sessionEventSources[sessionId]) {
+                console.log('[SSE恢复] 关闭已有的SSE连接:', sessionId);
+                window.sessionEventSources[sessionId].close();
+                delete window.sessionEventSources[sessionId];
+            }
+            // 显示取消按钮
+            const cancelButton = document.getElementById('cancel-button');
+            if (cancelButton) {
+                cancelButton.classList.remove('hidden');
+            }
+            // 禁用发送按钮并显示转圈状态
+            const submitButton = document.querySelector('button[type="submit"]');
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+            }
+            // 确保 sessionTasks 记录了当前任务
+            window.sessionTasks = window.sessionTasks || {};
+            window.sessionTasks[sessionId] = taskId;
+            // 检查是否已存在进度容器
+            let progressContainer = document.querySelector(`[data-progress-container="${taskId}"]`);
+            let restoredProgress = false;
+            if (!progressContainer) {
+                // 优先恢复已保存的进度容器（包含已有进度）
+                if (window.savedProgressContainers && window.savedProgressContainers[sessionId]) {
+                    const savedContainers = window.savedProgressContainers[sessionId];
+                    const matchingContainer = savedContainers.find(c => c.getAttribute('data-progress-container') === taskId);
+                    if (matchingContainer) {
+                        console.log(`[SSE恢复] 恢复已保存的进度容器: taskId=${taskId}`);
+                        progressContainer = matchingContainer;
+                        chatMessages.appendChild(progressContainer);
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        restoredProgress = true;
+                        delete window.savedProgressContainers[sessionId];
+                    }
+                }
+            }
+            if (!progressContainer) {
+                // 没有保存的容器，创建新的空容器
+                progressContainer = document.createElement('div');
+                progressContainer.className = 'mb-6 flex justify-start message-animation';
+                progressContainer.setAttribute('data-progress-container', taskId);
+                progressContainer.innerHTML = `
+                    <div class="flex items-start max-w-[80%] w-full">
+                        <img src="./images/my-ai-avatar.jpg" alt="AI头像" class="w-8 h-8 rounded-full mr-3 object-cover" onerror="this.onerror=null; this.src='./images/user.png';">
+                        <div class="bg-ai-message text-gray-800 p-4 rounded-lg rounded-tr-none shadow-sm flex-1">
+                            <div class="flex items-center mb-2 pb-2 border-b border-gray-200">
+                                <i class="fa fa-spinner fa-pulse mr-2 text-gray-500 text-sm"></i>
+                                <span class="text-sm text-gray-600">正在生成报告</span>
+                            </div>
+                            <div class="progress-timeline space-y-1 text-xs" id="progress-timeline-${taskId}">
+                                <!-- 进度条目将动态插入 -->
+                            </div>
+                        </div>
+                    </div>
+                `;
+                chatMessages.appendChild(progressContainer);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            // 记录已显示的进度消息（用于去重）
+            window.displayedProgressMessages = window.displayedProgressMessages || {};
+            if (!window.displayedProgressMessages[taskId]) {
+                window.displayedProgressMessages[taskId] = new Set();
+            }
+            // 如果恢复了进度容器，收集已有的进度消息文本用于去重
+            if (restoredProgress) {
+                const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                if (timeline) {
+                    const existingItems = timeline.querySelectorAll('.flex.items-start.py-1');
+                    existingItems.forEach(item => {
+                        const textContent = item.textContent.trim();
+                        if (textContent) {
+                            window.displayedProgressMessages[taskId].add(textContent);
+                        }
+                    });
+                    console.log(`[SSE恢复] 已记录 ${window.displayedProgressMessages[taskId].size} 条已显示的进度消息`);
+                }
+            }
+            // 建立 SSE 连接
+            const eventSource = new EventSource(`/8000/api/query/stream/${taskId}`);
+            // 记录 EventSource
+            window.sessionEventSources = window.sessionEventSources || {};
+            window.sessionEventSources[sessionId] = eventSource;
+            // SSE 消息处理
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('[SSE恢复] 接收到进度消息:', data);
+                    if (data.type === 'progress') {
+                        const timeline = document.getElementById(`progress-timeline-${taskId}`);
+                        if (!timeline) return;
+                        // 构建进度消息的唯一标识（用于去重）
+                        let detailsHtml = '';
+                        let subtaskListHtml = '';
+                        if (data.details) {
+                            if (data.stage === 'info_seeking' && data.details.subtask_names && data.details.subtask_names.length > 0) {
+                                detailsHtml = ` · ${data.details.subtasks_count}个子任务`;
+                                subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${data.details.subtask_names.map(task => `<div class="flex items-start"><span class="mr-1">-</span><span>${task}</span></div>`).join('')}</div>`;
+                            } else if (data.stage === 'writing_started' && data.details.file_names && data.details.file_names.length > 0) {
+                                const totalRetrieved = data.details.total_retrieved_count || data.details.key_files_count;
+                                detailsHtml = ` · 基于${data.details.key_files_count}个核心文件（检索到${totalRetrieved}个相关文献）`;
+                                const displayFiles = data.details.file_names.slice(0, 5);
+                                const hasMore = data.details.key_files_count > 5;
+                                subtaskListHtml = `<div class="ml-6 mt-1 text-xs text-gray-500 space-y-0.5">${displayFiles.map(file => `<div class="flex items-start"><span class="mr-1">-</span><span>${file}</span></div>`).join('')}${hasMore ? `<div class="text-gray-400">...还有${data.details.key_files_count - 5}个文件</div>` : ''}</div>`;
+                            }
+                        }
+                        // 创建临时元素以获取文本内容用于去重
+                        const tempDiv = document.createElement('div');
+                        tempDiv.innerHTML = `<div class="flex-1"><div class="flex items-center text-gray-600"><span class="mr-2 text-gray-400">•</span><span>${data.message}${detailsHtml}</span></div>${subtaskListHtml}</div>`;
+                        const messageText = tempDiv.textContent.trim();
+                        // 检查是否已显示过此消息
+                        if (window.displayedProgressMessages[taskId] && window.displayedProgressMessages[taskId].has(messageText)) {
+                            console.log('[SSE恢复] 跳过重复的进度消息:', messageText);
+                            return;
+                        }
+                        // 添加新的进度条目
+                        const progressItem = document.createElement('div');
+                        progressItem.className = 'flex items-start py-1';
+                        progressItem.innerHTML = tempDiv.innerHTML;
+                        timeline.appendChild(progressItem);
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        // 记录已显示的消息
+                        if (window.displayedProgressMessages[taskId]) {
+                            window.displayedProgressMessages[taskId].add(messageText);
+                        }
+                    } else if (data.type === 'completed') {
+                        console.log('[SSE恢复] 任务完成');
+                        eventSource.close();
+                        delete window.sessionEventSources[sessionId];
+                        const cancelBtn = document.getElementById('cancel-button');
+                        if (cancelBtn) cancelBtn.classList.add('hidden');
+                        const submitBtn = document.querySelector('button[type="submit"]');
+                        if (submitBtn) {
+                            submitBtn.disabled = false;
+                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        }
+                        if (progressContainer && progressContainer.parentNode) {
+                            progressContainer.remove();
+                        }
+                        window.SessionList = window.SessionList || [];
+                        window.SessionList = window.SessionList.filter(item => !(item.id === sessionId && item.taskID === taskId));
+                        if (window.currentSessionId === sessionId) {
+                            loadSessionMessages(sessionId).catch(err => console.error('[SSE恢复] 加载消息失败:', err));
+                        }
+                    } else if (data.type === 'error') {
+                        const errorItem = document.createElement('div');
+                        errorItem.className = 'flex items-center text-xs text-red-600 mt-2 pt-2 border-t border-gray-200';
+                        errorItem.innerHTML = `<span class="mr-2">•</span><span>错误: ${data.message}</span>`;
+                        const errTimeline = document.getElementById(`progress-timeline-${taskId}`);
+                        if (errTimeline) errTimeline.appendChild(errorItem);
+                        eventSource.close();
+                        delete window.sessionEventSources[sessionId];
+                        const cancelBtn = document.getElementById('cancel-button');
+                        if (cancelBtn) cancelBtn.classList.add('hidden');
+                        const submitBtn = document.querySelector('button[type="submit"]');
+                        if (submitBtn) {
+                            submitBtn.disabled = false;
+                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        }
+                    } else if (data.type === 'cancelled') {
+                        const cancelledItem = document.createElement('div');
+                        cancelledItem.className = 'flex items-center text-xs text-orange-600 mt-2 pt-2 border-t border-gray-200';
+                        cancelledItem.innerHTML = `<span class="mr-2">•</span><span>任务已取消</span>`;
+                        const cancelTimeline = document.getElementById(`progress-timeline-${taskId}`);
+                        if (cancelTimeline) cancelTimeline.appendChild(cancelledItem);
+                        eventSource.close();
+                        delete window.sessionEventSources[sessionId];
+                        const cancelBtn = document.getElementById('cancel-button');
+                        if (cancelBtn) cancelBtn.classList.add('hidden');
+                        const submitBtn = document.querySelector('button[type="submit"]');
+                        if (submitBtn) {
+                            submitBtn.disabled = false;
+                            submitBtn.innerHTML = '<i class="fa fa-paper-plane"></i>';
+                        }
+                    }
+                } catch (e) {
+                    console.error('[SSE恢复] 解析进度消息失败:', e, event.data);
+                }
+            };
+            eventSource.onerror = (error) => {
+                console.error('[SSE恢复] 连接错误:', error);
+                eventSource.close();
+                delete window.sessionEventSources[sessionId];
+            };
+        }
     </script>
 </body>
 </html>

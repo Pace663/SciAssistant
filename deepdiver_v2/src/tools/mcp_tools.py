@@ -206,12 +206,17 @@ def _wrap_special_symbol(symbol: str, fallback: str = None) -> str:
     return symbol
 
 
-def _strip_font_tags(text: str) -> str:
-    text = re.sub(r'</?\s*font\b[^>]*>', '', text, flags=re.IGNORECASE)
+def _strip_escaped_font_tags(text: str) -> str:
     text = re.sub(r'&lt;\s*/?\s*font\b[^&]*?&gt;', '', text, flags=re.IGNORECASE)
     text = re.sub(r'&amp;lt;\s*/?\s*font\b[^&]*?&amp;gt;', '', text, flags=re.IGNORECASE)
     text = re.sub(r'&#60;\s*/?\s*font\b[^#]*?&#62;', '', text, flags=re.IGNORECASE)
     text = re.sub(r'&#x3c;\s*/?\s*font\b[^#]*?&#x3e;', '', text, flags=re.IGNORECASE)
+    return text
+
+
+def _strip_all_font_tags(text: str) -> str:
+    text = re.sub(r'</?\s*font\b[^>]*>', '', text, flags=re.IGNORECASE)
+    text = _strip_escaped_font_tags(text)
     return text
 
 
@@ -227,7 +232,7 @@ def _simplify_latex(latex_text: str) -> str:
         简化后的文本
     """
  
-    latex_text = _strip_font_tags(latex_text)
+    latex_text = _strip_all_font_tags(latex_text)
  
     # 常见LaTeX命令映射 - 使用有序字典确保处理顺序
     # 重要：必须先处理长命令，再处理短命令，避免部分匹配
@@ -650,7 +655,7 @@ def _process_inline_formatting(text: str) -> str:
         display = _simplify_latex(formula)
         text = text.replace(f"__MATH_FORMULA_{i}__", f'<font size="9.5"><i>{display}</i></font>')
 
-    text = _strip_font_tags(text)
+    text = _strip_escaped_font_tags(text)
 
     # 移除不支持或无意义的标签
     text = re.sub(r'</?\s*nobr\b[^>]*>', '', text, flags=re.IGNORECASE)
@@ -2153,12 +2158,35 @@ class MCPTools:
                 # 改进标题提取逻辑
                 for i, line in enumerate(lines[:30]):  # 检查更多行
                     line = line.strip()
-                    if line and 10 <= len(line) <= 200:  # 更合理的标题长度范围
+                    
+                    # 处理"Title: xxx URL Source: yyy"格式（标题和URL在同一行）
+                    if line.startswith('Title: ') and 'URL Source:' in line:
+                        # 提取Title和URL Source之间的内容
+                        title_part = line.split('URL Source:')[0]
+                        title = title_part.replace('Title: ', '').strip()
+                        # 清理HTML标签
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        if title and len(title) >= 10:
+                            logger.info(f"提取到标题 (行{i + 1}, 同行格式): {title[:50]}...")
+                            break
+                    
+                    # 处理markdown标题格式
+                    if line.startswith('#'):
+                        title = line.strip('# ').strip()[:200]
+                        # 清理HTML标签
+                        title = re.sub(r'<[^>]+>', '', title).strip()
+                        logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
+                        break
+                    
+                    # 处理普通标题（不包含http）
+                    if line and 10 <= len(line) <= 200:
                         if 'http' not in line and not line.startswith('['):
                             title = line.strip()[:200]
                             # 去掉"Title: "前缀（如果存在）
                             if title.startswith('Title: '):
-                                title = title[7:]  # 去掉"Title: "
+                                title = title[7:]
+                            # 清理HTML标签
+                            title = re.sub(r'<[^>]+>', '', title).strip()
                             logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                             break
                     # 处理markdown标题格式
@@ -2260,18 +2288,29 @@ class MCPTools:
                 """
 
             # 构建生成标题、摘要和关键词的prompt - 改进为更明确的格式
-            prompt = f"""请为以下文章生成一个标题、一个简洁的摘要（约200-300字）和5-8个关键词。
+            prompt = f"""请仔细阅读以下文章内容，准确提取或生成标题、摘要和关键词。
 
                 文章内容：
                 {article_content}
 
-                要求：
+                重要提示：
+                - 你的任务是"提取"和"总结"，而不是"创作"。
+                - 摘要必须完全基于文章内容，不得包含文章中未提及的信息。
+
+                具体要求：
                 1. 语言要求：{lang_instruction}
-                2. 标题应该简洁有力，准确反映文章主题，不超过30个字（或20个英文单词）
-                3. 摘要应该准确概括文章的主要内容、核心观点和重要发现
-                4. 摘要应该简洁明了，突出重点
-                5. 关键词应该反映文章的主题和核心概念
-                6. 多个关键词用分号（;）分隔
+                2. 标题：准确反映文章主题，优先提取文章原本的标题。
+                3. 摘要（重点）：
+                      - 优先提取文章原有的摘要/Abstract部分（如果有）。
+                      - 如果没有原有摘要，请仔细阅读全文，生成一个结构化的摘要。
+                      - 摘要应隐含以下四个层次（按此顺序组织内容，但禁止出现层次标题）：
+                         * 第一层：背景与目的
+                         * 第二层：方法与过程  
+                         * 第三层：主要结果与发现
+                         * 第四层：结论与意义
+                      - 明确禁止：禁止使用【】、（）等符号标注章节，禁止出现"背景与目的"、"方法与过程"、"主要结果与发现"、"结论与意义"等层次标题文字。
+                      - 摘要长度控制在300字左右，必须具体、准确，拒绝空泛的套话。
+                4. 关键词：提取5-8个最能代表文章核心主题的关键词，用分号（;）分隔。
 
                 {format_instruction}
                 """
@@ -2286,7 +2325,7 @@ class MCPTools:
                 json={
                     "model": model_name,
                     "messages": [
-                        {"role": "system", "content": "你是一位专业的学术编辑，擅长为文章生成精准的标题、摘要和关键词。请严格按照用户要求的格式输出。"},
+                        {"role": "system", "content": "你是一位严谨的学术分析师。你的核心职责是基于给定的文本内容提取准确的信息。请务必客观、真实，严禁编造原文中不存在的内容。"},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.3
@@ -3006,34 +3045,50 @@ class MCPTools:
             file_analysis_data = {}
             file_num_to_path = {}
 
+            # 【智能过滤】基于information_richness字段判断，而不是关键词匹配
             if file_analysis_path.exists():
                 import json
                 try:
+                    # 【关键修复】使用连续编号而不是原始行号
+                    # 因为LLM在生成报告时会重新编号（从1开始连续编号）
+                    continuous_num = 0
                     with open(file_analysis_path, 'r', encoding='utf-8') as f:
                         for line_num, line in enumerate(f, 1):
                             try:
                                 data = json.loads(line.strip())
                                 if 'file_path' in data:
                                     file_path = data['file_path']
+                                    doc_time = data.get('doc_time', '')
+                                    info_richness = data.get('information_richness', '')
+                                    
+                                    # 【关键修复】过滤掉Processing failed的文件
+                                    if doc_time == "Processing failed":
+                                        logger.info(f"跳过处理失败的文件 [原始行号{line_num}]: {file_path}")
+                                        continue
+                                    
+                                    # 【智能过滤】基于information_richness判断
+                                    # 检查明确的负面表述：considered scarce, indicating scarcity, lacks substantive content
+                                    info_richness_lower = info_richness.lower()
+                                    negative_indicators = [
+                                        'considered scarce', 'indicating scarcity', 'is scarce',
+                                        'lacks substantive content', 'no substantive content',
+                                        'very limited information', 'does not provide any substantive'
+                                    ]
+                                    if info_richness and any(indicator in info_richness_lower for indicator in negative_indicators):
+                                        logger.info(f"跳过信息稀缺的文件 [原始行号{line_num}]: {file_path} (richness: {info_richness[:80]})")
+                                        continue
+                                    
+                                    # 有效文件，使用连续编号
+                                    continuous_num += 1
                                     file_analysis_data[file_path] = data
 
-                                    # 【关键修复】使用行号作为主要映射，确保与Writer生成的引用序号一致
-                                    # Writer使用enumerate(key_files, 1)生成引用序号，对应file_analysis.jsonl的行号
-                                    file_num_to_path[line_num] = file_path
-                                    logger.info(f"映射行号 {line_num} 到文件路径: {file_path}")
-
-                                    # 从文件名提取数字作为备用映射（向后兼容）
-                                    filename = os.path.basename(file_path)
-                                    match = re.search(r'(\d+)', filename)
-                                    if match:
-                                        file_num = int(match.group(1))
-                                        # 只有当该序号未被占用时才添加备用映射
-                                        if file_num not in file_num_to_path:
-                                            file_num_to_path[file_num] = file_path
-                                            logger.info(f"备用映射序号 {file_num} 到文件路径: {file_path}")
+                                    # 【关键修复】使用连续编号作为映射，与报告中的引用编号一致
+                                    # 报告中的引用编号是连续的 [1, 2, 3, ...]，不会跳过无效文件的编号
+                                    file_num_to_path[continuous_num] = file_path
+                                    logger.info(f"映射连续编号 {continuous_num} (原始行号{line_num}) 到文件路径: {file_path}")
                             except Exception as e:
                                 logger.warning(f"警告: 无法解析分析数据行 {line_num} - {str(e)}")
-                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射")
+                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射（已过滤无效文件，使用连续编号）")
                 except Exception as e:
                     logger.warning(f"警告: 无法读取文件分析数据 - {str(e)}")
             else:
@@ -3051,23 +3106,14 @@ class MCPTools:
 
             logger.info(f"找到 {len(citation_numbers)} 个引用标记: {citation_numbers}")
 
-            # 【新增】获取所有file_analysis.jsonl中的文件序号，并按文件路径去重
+            # 【关键修复】为所有有效文件生成参考文献（包括未直接引用的文献）
+            # 获取所有file_analysis.jsonl中的文件序号
             all_file_numbers = sorted(file_num_to_path.keys())
-            logger.info(f"file_analysis.jsonl中共有 {len(all_file_numbers)} 个文件序号映射")
-
-            # 按文件路径去重：同一个文件可能有多个序号（被多个章节引用）
-            seen_paths = set()
-            unique_file_numbers = []
-            for num in all_file_numbers:
-                file_path = file_num_to_path.get(num)
-                if file_path and file_path not in seen_paths:
-                    seen_paths.add(file_path)
-                    unique_file_numbers.append(num)
-
-            # 使用去重后的文件序号
-            reference_numbers = unique_file_numbers
-            logger.info(f"去重后共有 {len(reference_numbers)} 个唯一文件")
-            logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（去重后的所有分析文档）")
+            logger.info(f"file_analysis.jsonl中共有 {len(all_file_numbers)} 个有效文件")
+            
+            # 使用所有有效文件的序号
+            reference_numbers = all_file_numbers
+            logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（包含所有分析的有效文献）")
 
             # 构建引用列表 - 分离用户文件和其他文件
             user_file_references = []  # 用户文件引用
@@ -3301,31 +3347,25 @@ class MCPTools:
 
                         # URL显示为完整的来源信息（包含文件名）
                         url_source = full_source_info
-                    elif file_path.startswith('research/'):
-                        research_file_path = self.workspace_path / file_path
-                        if research_file_path.exists():
-                            title, url_source = self._extract_title_from_file_content(research_file_path)
-                        else:
-                            # research文件不存在，尝试从文件名提取标题
-                            title = self._extract_title_from_research_filename(file_path)
-                            logger.warning(f"警告: 研究文件不存在: {research_file_path}")
                     else:
-                        # 其他路径（不在research目录，也不是user_uploads）
-                        # 先尝试直接路径（workspace根目录）
+                        # 通用路径处理：适用于所有其他类型的文件（research/, url_crawler_save_files/, 或未来新增的目录）
+                        # 先尝试直接路径
                         direct_file_path = self.workspace_path / file_path
-                        # 再尝试research目录
-                        research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
-
+                        
                         if direct_file_path.exists():
-                            # 文件在workspace根目录
+                            # 文件存在，提取标题和URL
                             title, url_source = self._extract_title_from_file_content(direct_file_path)
-                        elif research_file_path.exists():
-                            # 文件在research目录
-                            title, url_source = self._extract_title_from_file_content(research_file_path)
+                            logger.info(f"成功从文件提取标题: {file_path}")
                         else:
-                            # 两个位置都找不到，尝试从文件名提取标题
-                            title = self._extract_title_from_research_filename(file_path)
-                            logger.warning(f"警告: 研究文件不存在: {direct_file_path} 或 {research_file_path}")
+                            # 文件不存在，尝试在research目录查找（向后兼容）
+                            research_file_path = self.workspace_path / "research" / os.path.basename(file_path)
+                            if research_file_path.exists():
+                                title, url_source = self._extract_title_from_file_content(research_file_path)
+                                logger.info(f"从research目录找到文件: {research_file_path}")
+                            else:
+                                # 两个位置都找不到，尝试从文件名提取标题
+                                title = self._extract_title_from_research_filename(file_path)
+                                logger.warning(f"警告: 文件不存在: {direct_file_path} 或 {research_file_path}，使用文件名提取标题")
 
                     # 清理标题中的特殊字符，避免显示问题
                     title_cleaned = title.replace('\u2013', '-').replace('\u2014', '-')  # 替换en-dash和em-dash为普通连字符
@@ -3338,20 +3378,6 @@ class MCPTools:
                     # 特别处理破折号：将 "- " 替换为 "—"（em-dash），避免被识别为列表
                     title_cleaned = title_cleaned.replace('- ', '— ')  # 破折号+空格 → em-dash+空格
                     title_cleaned = title_cleaned.replace(' -', ' —')  # 空格+破折号 → 空格+em-dash
-
-                    # 过滤无效标题（错误页面、无效内容等）
-                    invalid_titles = [
-                        '403 forbidden', '404 not found', '500 internal server error',
-                        '502 bad gateway', '503 service unavailable', '504 gateway timeout',
-                        'access denied', 'page not found', 'error', 'just a moment',
-                        'unknown title', 'untitled'
-                    ]
-                    title_lower = title_cleaned.lower().strip()
-                    is_invalid = any(invalid in title_lower for invalid in invalid_titles)
-
-                    if is_invalid:
-                        logger.info(f"跳过无效标题的引用 {num}: {title_cleaned}")
-                        continue  # 跳过此引用，不添加到参考文献列表
 
                     # 优化时间信息显示
                     doc_time_cleaned = doc_time

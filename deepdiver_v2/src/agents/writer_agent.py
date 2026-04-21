@@ -1,5 +1,4 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
 from typing import Dict, Any, List
 import time
@@ -19,7 +18,7 @@ class WriterAgent(BaseAgent):
     local files and memories.
     """
 
-    def __init__(self, config: AgentConfig = None, shared_mcp_client=None):
+    def __init__(self, config: AgentConfig = None, shared_mcp_client=None, task_id: str = None):
         # Set default agent name if not specified
         if config is None:
             config = AgentConfig(agent_name="WriterAgent")
@@ -32,6 +31,9 @@ class WriterAgent(BaseAgent):
         self.tool_schemas = self._build_tool_schemas()
         # Cancellation support
         self._cancellation_token = None
+        # Progress callback support
+        self.task_id = task_id
+        self.progress_callback = None
 
     def set_cancellation_token(self, cancellation_token):
         """
@@ -42,6 +44,23 @@ class WriterAgent(BaseAgent):
             cancellation_token: threading.Event object that will be set when task should be cancelled
         """
         self._cancellation_token = cancellation_token
+
+    def set_progress_callback(self, callback):
+        """设置进度回调函数"""
+        self.progress_callback = callback
+    
+    def _send_progress(self, stage: str, message: str, details: dict = None):
+        """发送进度更新"""
+        if self.progress_callback and self.task_id:
+            import time
+            progress_data = {
+                'type': 'progress',
+                'stage': stage,
+                'message': message,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'details': details or {}
+            }
+            self.progress_callback(self.task_id, progress_data)
 
     def _check_cancellation(self) -> bool:
         """
@@ -234,43 +253,46 @@ For each function call, return a JSON object placed within the [unused11][unused
             return res
 
         key_files_dict = {}
-        # 【关键修复】使用行号作为文件序号，确保和 merge_reports 一致
-        file_path_to_line_num = {}
+        # 【关键修复】使用连续编号作为文件序号，确保和 merge_reports 一致
+        file_path_to_continuous_num = {}
 
         server_analysis_path = f"doc_analysis/file_analysis.jsonl"
         self.logger.debug(f"Loading analysis from MCP server: {server_analysis_path}")
         file_analysis_list = load_json_from_server(server_analysis_path)
 
-        # 【关键修复】用于过滤无效文件的关键词
-        invalid_content_keywords = [
-            '安全验证', 'CAPTCHA', 'captcha', '验证码',
-            '404', '403', 'Forbidden', 'placeholder page', 'error page',
-            'no substantive content', 'lacks substantive content',
-            'does not provide any substantive', '没有实质性的信息',
-            'currently missing', 'content is missing', '内容缺失'
-        ]
-
+        # 【智能过滤】基于information_richness字段判断，而不是关键词匹配
+        continuous_num = 0  # 使用连续编号计数器
         for line_num, file_info in enumerate(file_analysis_list, 1):
             if file_info.get('file_path'):
                 file_path = file_info.get('file_path')
                 doc_time = file_info.get('doc_time', '')
-                core_content = file_info.get('core_content', '')
+                info_richness = file_info.get('information_richness', '')
                 
                 # 跳过处理失败的文件
                 if doc_time == "Processing failed":
-                    self.logger.warning(f"跳过处理失败的文件 [{line_num}]: {file_path}")
+                    self.logger.warning(f"跳过处理失败的文件 [原始行号{line_num}]: {file_path}")
                     continue
                 
-                # 跳过内容无效的文件
-                is_invalid = any(kw.lower() in core_content.lower() for kw in invalid_content_keywords)
-                if is_invalid:
-                    self.logger.warning(f"跳过内容无效的文件 [{line_num}]: {file_path}")
+                # 【智能过滤】基于information_richness判断
+                # 检查明确的负面表述：considered scarce, indicating scarcity, lacks substantive content
+                info_richness_lower = info_richness.lower()
+                negative_indicators = [
+                    'considered scarce', 'indicating scarcity', 'is scarce',
+                    'lacks substantive content', 'no substantive content',
+                    'very limited information', 'does not provide any substantive'
+                ]
+                if info_richness and any(indicator in info_richness_lower for indicator in negative_indicators):
+                    self.logger.warning(f"跳过信息稀缺的文件 [原始行号{line_num}]: {file_path} (richness: {info_richness[:80]})")
                     continue
                 
+                # 有效文件使用连续编号
+                continuous_num += 1
                 key_files_dict[file_path] = file_info
-                file_path_to_line_num[file_path] = line_num
+                file_path_to_continuous_num[file_path] = continuous_num
+                self.logger.debug(f"映射连续编号 {continuous_num} (原始行号{line_num}) 到文件: {file_path}")
 
         file_core_content = ""
+        valid_file_paths = []  # 收集有效文件路径用于推送
         if hasattr(task_input, 'key_files') and task_input.key_files:
             message += "Key Files:\n"
             valid_file_count = 0
@@ -278,19 +300,76 @@ For each function call, return a JSON object placed within the [unused11][unused
                 file_path = file_.get('file_path')
                 if file_path in key_files_dict:
                     valid_file_count += 1
-                    # 【关键修复】使用 file_analysis.jsonl 的行号作为引用序号
-                    line_num = file_path_to_line_num.get(file_path, valid_file_count)
+                    valid_file_paths.append(file_path)  # 记录有效文件路径
+                    # 【关键修复】使用连续编号作为引用序号，与 merge_reports 保持一致
+                    continuous_num = file_path_to_continuous_num.get(file_path, valid_file_count)
                     file_info = key_files_dict[file_path]
                     doc_time = file_info.get('doc_time', 'Not specified')
                     source_authority = file_info.get('source_authority', 'Not assessed')
                     task_relevance = file_info.get('task_relevance', 'Not assessed')
                     information_richness = file_info.get('information_richness', 'Not assessed')
-                    message += f"{line_num}. File: {file_path}\n"
+                    message += f"{continuous_num}. File: {file_path}\n"
 
-                    file_core_content += f"[{str(line_num)}]doc_time:{doc_time}|||source_authority:{source_authority}|||task_relevance:{task_relevance}|||information_richness:{information_richness}|||summary_content:{file_info.get('core_content', '')}\n"
+                    file_core_content += f"[{str(continuous_num)}]doc_time:{doc_time}|||source_authority:{source_authority}|||task_relevance:{task_relevance}|||information_richness:{information_richness}|||summary_content:{file_info.get('core_content', '')}\n"
+            
+            # 【Fallback】只在匹配文件数极少（<3个）且明显异常时才回退
+            # 原因：可能是路径不匹配问题，而非PlannerAgent的正常筛选
+            # 注意：如果PlannerAgent有意只选择少量文件，此fallback可能违背其意图
+            if valid_file_count < 3 and len(key_files_dict) > 10:
+                self.logger.warning(
+                    f"Planner传入的key_files仅匹配到 {valid_file_count} 个文件（阈值: 3），"
+                    f"可能存在路径不匹配问题，回退使用file_analysis.jsonl中全部 {len(key_files_dict)} 个有效文件"
+                )
+                # 重置，使用全部有效文件
+                message = "Key Files:\n"
+                file_core_content = ""
+                valid_file_paths = []
+                valid_file_count = 0
+                for file_path, file_info in key_files_dict.items():
+                    valid_file_count += 1
+                    valid_file_paths.append(file_path)
+                    continuous_num = file_path_to_continuous_num.get(file_path, valid_file_count)
+                    doc_time = file_info.get('doc_time', 'Not specified')
+                    source_authority = file_info.get('source_authority', 'Not assessed')
+                    task_relevance = file_info.get('task_relevance', 'Not assessed')
+                    information_richness = file_info.get('information_richness', 'Not assessed')
+                    message += f"{continuous_num}. File: {file_path}\n"
+                    file_core_content += f"[{str(continuous_num)}]doc_time:{doc_time}|||source_authority:{source_authority}|||task_relevance:{task_relevance}|||information_richness:{information_richness}|||summary_content:{file_info.get('core_content', '')}\n"
+
             message += "\n"
             message += f"file_core_content: {file_core_content}\n"
             self.logger.info(f"Writer 使用 {valid_file_count} 个有效文件（已过滤处理失败和内容无效的文件）")
+            
+            # 推送文件列表进度（WriterAgent实际使用的文件）
+            if valid_file_count > 0 and self.progress_callback:
+                try:
+                    # 提取文件名（去除路径，限制长度）
+                    file_names = []
+                    for file_path in valid_file_paths[:10]:  # 最多显示10个
+                        # 提取文件名
+                        file_name = file_path.split('/')[-1].split('\\')[-1]
+                        # 限制长度为50个字符
+                        if len(file_name) > 50:
+                            file_name = file_name[:47] + '...'
+                        file_names.append(file_name)
+                    
+                    # 统计file_analysis.jsonl中的总文件数（检索到的相关文献总数）
+                    total_retrieved_count = len(key_files_dict)  # 过滤无效后的总数
+                    
+                    # 发送进度更新
+                    self.progress_callback(self.task_id, {
+                        'type': 'progress',
+                        'stage': 'writing_started',
+                        'message': '开始撰写报告',
+                        'details': {
+                            'key_files_count': valid_file_count,
+                            'total_retrieved_count': total_retrieved_count,
+                            'file_names': file_names
+                        }
+                    })
+                    self.logger.info(f"[PROGRESS] 推送文件列表: {valid_file_count}个核心文件（检索到{total_retrieved_count}个相关文献）")
+                except Exception as e:
+                    self.logger.warning(f"[PROGRESS] 推送文件列表失败: {e}，继续执行任务")
         else:
             message += "Key Files: None provided\n"
 
@@ -438,21 +517,45 @@ For each function call, return a JSON object placed within the [unused11][unused
                     for tool_call in tool_calls:
                         # Str
                         arguments = tool_call["arguments"]
+                        tool_name = tool_call["name"]
                         self.logger.debug(f"Arguments is string: {isinstance(arguments, str)}")
 
                         # Check if planning is complete
-                        if tool_call["name"] in ["writer_subjective_task_done"]:
+                        if tool_name in ["writer_subjective_task_done"]:
                             task_completed = True
-                            self.log_action(iteration, tool_call["name"], arguments, arguments)
+                            self.log_action(iteration, tool_name, arguments, arguments)
                             break
-                        if tool_call["name"] in ["think"]:
+                        if tool_name in ["think"]:
                             tool_result = {
                                 "tool_results": "You can proceed to invoke other tools if needed. But the next step cannot call the reflect tool"}
                         else:
                             tool_result = self.execute_tool_call(tool_call)
+                            
+                            # 在工具执行成功后推送章节进度
+                            if tool_name == "section_writer" and tool_result.get("success"):
+                                try:
+                                    # 从 arguments 中提取章节标题
+                                    outline = ""
+                                    if isinstance(arguments, dict):
+                                        outline = arguments.get('current_chapter_outline', '')
+                                    elif isinstance(arguments, str):
+                                        args_dict = json.loads(arguments)
+                                        outline = args_dict.get('current_chapter_outline', '')
+                                    
+                                    # 提取第一行作为章节标题
+                                    if outline:
+                                        chapter_title = outline.split('\n')[0].strip()
+                                        chapter_title = chapter_title.replace('#', '').strip()[:50]
+                                        
+                                        self._send_progress('writing_chapter', f'正在撰写: {chapter_title}', {
+                                            'chapter_title': chapter_title
+                                        })
+                                except Exception as e:
+                                    # 静默失败，不影响主流程
+                                    self.logger.debug(f"Failed to send chapter progress: {e}")
 
                         # Log the action using base class method
-                        self.log_action(iteration, tool_call["name"], arguments, tool_result)
+                        self.log_action(iteration, tool_name, arguments, tool_result)
 
                         # Add tool result to conversation
                         conversation_history.append({
@@ -517,7 +620,8 @@ def create_writer_agent(
         max_iterations: int = 15,  # More iterations for writing tasks
         temperature: Any = None,  # Resolved from env if not provided
         max_tokens: Any = None,
-        shared_mcp_client=None
+        shared_mcp_client=None,
+        task_id: str = None
 ) -> WriterAgent:
     """
     Create a WriterAgent instance with server-managed sessions.
@@ -528,6 +632,7 @@ def create_writer_agent(
         temperature: Temperature setting for creativity
         max_tokens: Maximum tokens for the AI response
         shared_mcp_client: Optional shared MCP client from parent agent (prevents extra sessions)
+        task_id: Optional task ID for progress tracking
 
     Returns:
         Configured WriterAgent instance with writing-focused tools
@@ -545,6 +650,6 @@ def create_writer_agent(
     )
 
     # Create agent instance with shared MCP client (filtered tools for writing)
-    agent = WriterAgent(config=config, shared_mcp_client=shared_mcp_client)
+    agent = WriterAgent(config=config, shared_mcp_client=shared_mcp_client, task_id=task_id)
 
     return agent

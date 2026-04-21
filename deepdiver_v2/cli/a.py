@@ -52,8 +52,10 @@ logging.getLogger('litellm').setLevel(logging.WARNING)
 from typing import List, Dict, Optional, Any, cast
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
+import queue
 
 # 导入原有核心模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -77,6 +79,8 @@ import time
 query_history: List[Dict[str, Any]] = []  # 仅记录查询历史，无会话关联
 batch_results: Dict[str, Any] = {}
 executor = None  # 线程池将在lifespan中初始化
+progress_queues: Dict[str, queue.Queue] = {}  # 进度队列管理器：task_id -> Queue
+progress_history: Dict[str, List[dict]] = {}  # 历史进度消息存储：task_id -> List[progress_data]
 queue_executor = None  # 队列处理线程池
 cancel_executor = None  # 专用取消操作线程池，避免被任务执行阻塞
 MAX_CONCURRENT_TASKS = 4  # 最大并发任务数
@@ -380,6 +384,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         cancellation_token = task_manager.get_cancellation_token(task_id)
         if cancellation_token:
             agent.set_cancellation_token(cancellation_token)
+        
+        # 设置进度推送回调
+        if hasattr(agent, 'set_progress_callback'):
+            agent.set_progress_callback(send_progress_update)
 
         # 下载用户文件到工作区
         _download_user_files(user_files_data, workspace_path)
@@ -621,9 +629,22 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         # 这样前端轮询时可以获取到报告内容
         task_manager.update_task_status(task_id, TaskStatus.COMPLETED, result=result_data)
         
+        # 发送任务完成的SSE进度消息，让前端移除进度容器
+        send_progress_update(task_id, {
+            'type': 'completed',
+            'message': '任务完成',
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
         return result_data
     except Exception as e:
         task_manager.update_task_status(task_id, TaskStatus.FAILED, error=str(e))
+        # 发送任务失败的SSE进度消息
+        send_progress_update(task_id, {
+            'type': 'error',
+            'message': str(e),
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        })
         # 返回符合 QueryResponse 模型的字典结构
         return {
             'success': False,
@@ -1047,6 +1068,127 @@ def get_query_history(limit: int = 10):
         "total": len(query_history),
         "history": query_history[-limit:]
     }
+
+
+# ==================== SSE进度推送相关 ====================
+
+def send_progress_update(task_id: str, progress_data: dict):
+    """
+    发送进度更新到SSE流
+    
+    Args:
+        task_id: 任务ID
+        progress_data: 进度数据字典
+    """
+    logger.info(f"[SSE] send_progress_update called: task_id={task_id}, in_queues={task_id in progress_queues}")
+    
+    # 存储历史进度消息（除了心跳消息）
+    if progress_data.get('type') != 'heartbeat':
+        if task_id not in progress_history:
+            progress_history[task_id] = []
+        progress_history[task_id].append(progress_data)
+        logger.info(f"[SSE] 存储历史进度: task_id={task_id}, 当前历史数量={len(progress_history[task_id])}")
+    
+    if task_id in progress_queues:
+        try:
+            progress_queues[task_id].put(progress_data)
+            logger.info(f"[SSE] 发送进度更新: task_id={task_id}, type={progress_data.get('type')}, message={progress_data.get('message')}")
+        except Exception as e:
+            logger.error(f"[SSE] 发送进度更新失败: {e}")
+    else:
+        logger.warning(f"[SSE] task_id={task_id} 不在 progress_queues 中，无法发送进度")
+
+
+@app.get("/api/query/stream/{task_id}", summary="SSE流式推送任务进度")
+async def stream_task_progress(task_id: str):
+    """
+    SSE端点：实时推送任务进度
+    
+    Args:
+        task_id: 任务ID
+        
+    Returns:
+        StreamingResponse: SSE事件流
+    """
+    
+    async def event_generator():
+        # 为该任务创建进度队列
+        progress_queue = queue.Queue()
+        progress_queues[task_id] = progress_queue
+        
+        logger.info(f"[SSE] 客户端连接: task_id={task_id}")
+        
+        # 先发送历史进度消息（如果存在）
+        if task_id in progress_history:
+            history_messages = progress_history[task_id]
+            logger.info(f"[SSE] 重发历史进度: task_id={task_id}, 历史消息数量={len(history_messages)}")
+            for msg in history_messages:
+                yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+                # 移除延迟，立即发送所有历史消息以加快显示速度
+        
+        # 等待任务创建（最多5秒），允许前端先建立SSE连接再创建任务
+        task_wait_count = 0
+        max_wait_iterations = 10  # 5秒 (10次 * 0.5秒)
+        while task_wait_count < max_wait_iterations:
+            task_info = task_manager.get_task(task_id)
+            if task_info:
+                logger.info(f"[SSE] 任务已找到: task_id={task_id}")
+                break
+            logger.info(f"[SSE] 等待任务创建: task_id={task_id}, 尝试 {task_wait_count + 1}/{max_wait_iterations}")
+            await asyncio.sleep(0.5)
+            task_wait_count += 1
+        
+        try:
+            while True:
+                # 检查任务状态
+                task_info = task_manager.get_task(task_id)
+                if not task_info:
+                    yield f"data: {json.dumps({'type': 'error', 'message': '任务不存在'}, ensure_ascii=False)}\n\n"
+                    break
+                
+                # 从队列获取进度更新
+                try:
+                    progress_data = progress_queue.get(timeout=1)
+                    yield f"data: {json.dumps(progress_data, ensure_ascii=False)}\n\n"
+                    
+                    # 如果任务完成或失败，发送完成信号后退出
+                    if progress_data.get('type') in ['completed', 'error', 'cancelled']:
+                        logger.info(f"[SSE] 任务结束: task_id={task_id}, type={progress_data.get('type')}")
+                        break
+                        
+                except queue.Empty:
+                    # 发送心跳保持连接
+                    yield f": heartbeat\n\n"
+                
+                await asyncio.sleep(0.5)
+                
+        except asyncio.CancelledError:
+            logger.info(f"[SSE] 客户端断开连接: task_id={task_id}")
+        except Exception as e:
+            logger.error(f"[SSE] 流式推送异常: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            # 清理队列
+            if task_id in progress_queues:
+                del progress_queues[task_id]
+                logger.info(f"[SSE] 清理进度队列: task_id={task_id}")
+            
+            # 如果任务已完成，清理历史进度消息
+            task_info = task_manager.get_task(task_id)
+            if task_info and task_info.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+                if task_id in progress_history:
+                    del progress_history[task_id]
+                    logger.info(f"[SSE] 清理历史进度消息: task_id={task_id}")
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # 禁用nginx缓冲
+        }
+    )
 
 
 @app.post("/api/task/{task_id}/cancel", summary="取消正在运行的任务")
