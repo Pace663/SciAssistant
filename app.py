@@ -466,10 +466,8 @@ def get_chat_sessions_by_userid(connection, user_id):
         sql = "SELECT * FROM chat_list WHERE user_id = %s order by update_time desc;"
         cursor.execute(sql, (user_id,))
         session = cursor.fetchall()
-        if session:
-            return jsonify(session)
-        else:
-            return jsonify({'error': 'User not found'}), 404
+        # 即使没有记录也返回空数组，而不是404错误
+        return jsonify(session if session else [])
 
 
 @app.route('/api/chat/sessions/<session_id>', methods=['PUT'])
@@ -532,6 +530,48 @@ def delete_chat_session(connection, session_id):
 
         except Exception as e:
             connection.rollback()  # Rollback on any error
+            return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/chat/sessions/batch-delete', methods=['POST'])
+@db_operation
+def batch_delete_chat_sessions(connection):
+    """批量删除多个会话及其详情"""
+    data = request.get_json()
+    
+    if not data or 'session_ids' not in data:
+        return jsonify({'error': '缺少必要字段: session_ids'}), 400
+    
+    session_ids = data['session_ids']
+    
+    if not isinstance(session_ids, list) or len(session_ids) == 0:
+        return jsonify({'error': 'session_ids必须是非空数组'}), 400
+    
+    with connection.cursor() as cursor:
+        try:
+            # 使用IN语句批量删除conversation_detail
+            placeholders = ','.join(['%s'] * len(session_ids))
+            sql_detail = f"DELETE FROM conversation_detail WHERE session_id IN ({placeholders})"
+            cursor.execute(sql_detail, tuple(session_ids))
+            
+            # 使用IN语句批量删除chat_list
+            sql_history = f"DELETE FROM chat_list WHERE session_id IN ({placeholders})"
+            cursor.execute(sql_history, tuple(session_ids))
+            deleted_count = cursor.rowcount
+            
+            if deleted_count == 0:
+                connection.rollback()
+                return jsonify({'error': '未找到要删除的会话'}), 404
+            
+            connection.commit()
+            return jsonify({
+                'message': f'成功删除 {deleted_count} 个会话',
+                'deleted_count': deleted_count
+            })
+        
+        except Exception as e:
+            connection.rollback()
+            logger.error(f"批量删除会话失败: {e}")
             return jsonify({'error': str(e)}), 500
 
 #-----------------会话详情相关接口------------------
