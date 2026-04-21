@@ -438,28 +438,51 @@ def _simplify_latex(latex_text: str) -> str:
     return result
 
 
+def _escape_url_for_html_attr(url: str) -> str:
+    """转义 URL 中的特殊字符，使其可以安全地用于 HTML href 属性"""
+    if not url:
+        return url
+    # 转义 & 为 &amp;（必须首先处理，避免重复转义）
+    url = url.replace('&', '&amp;')
+    # 转义引号
+    url = url.replace('"', '&quot;')
+    return url
+
+
 def _process_inline_formatting(text: str) -> str:
     """
     将 Markdown 行内格式转换为 ReportLab 可解析的安全 HTML，
     保证标签平衡，避免 PDF 生成时的解析错误。
     """
-
+    
+    # 先将 id 转换为 name
     text = re.sub(r'<a\s+id="([^"]+)"', r'<a name="\1"', text)
 
+    # 处理带 style 属性的链接，转义 URL 中的特殊字符
+    def fix_styled_link(m):
+        url = m.group(1)
+        safe_url = _escape_url_for_html_attr(url)
+        return f'<a href="{safe_url}" color="#04B5BB">'
+    
     text = re.sub(
         r'<a\s+href="([^"]+)"\s+style="[^"]*">',
-        r'<a href="\1" color="#04B5BB">',
+        fix_styled_link,
         text
     )
 
-    # 3. 为没有颜色属性的 href 链接添加颜色
+    # 3. 为没有颜色属性的 href 链接添加颜色，同时转义 URL
     # 匹配: <a href="..."> (但不匹配已有color属性的)
+    def fix_uncolored_link(m):
+        url = m.group(1)
+        safe_url = _escape_url_for_html_attr(url)
+        return f'<a href="{safe_url}" color="#04B5BB">'
+    
     text = re.sub(
         r'<a\s+href="([^"]+)"(?!\s+color)>',
-        r'<a href="\1" color="#04B5BB">',
+        fix_uncolored_link,
         text
     )
-
+    
     # 恢复并增强Unicode上下标处理
     # 这一步非常关键，因为用户经常直接复制粘贴包含Unicode上标（如 ⁻¹⁶）的文本
     # 而这些字符在标准中文字体（如宋体）中通常不支持，导致显示为空白
@@ -555,7 +578,9 @@ def _process_inline_formatting(text: str) -> str:
         else:
             date_part = ''
         # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        return f'[{num}] <font name="EmojiFont">📎</font> {title}, <a href="{url}" color="#04B5BB">{url}</a>{date_part}'
+        # 转义 URL 中的特殊字符
+        safe_url = _escape_url_for_html_attr(url)
+        return f'[{num}] <font name="EmojiFont">📎</font> {title}, <a href="{safe_url}" color="#04B5BB">{url}</a>{date_part}'
 
     # 辅助函数：判断URL是否为PDF链接
     def is_pdf_url(url):
@@ -601,7 +626,9 @@ def _process_inline_formatting(text: str) -> str:
         else:
             date_part = ''
         # 使用font标签指定emoji字体来显示图标，ReportLab会自动回退到支持该字符的字体
-        return f'[{num}] <font name="EmojiFont">🌐</font> {title}, <a href="{url}" color="#04B5BB">{url}</a>{date_part}'
+        # 转义 URL 中的特殊字符
+        safe_url = _escape_url_for_html_attr(url)
+        return f'[{num}] <font name="EmojiFont">🌐</font> {title}, <a href="{safe_url}" color="#04B5BB">{url}</a>{date_part}'
 
     # 改进的正则表达式2：匹配非PDF的URL引用（网页引用）
     text = re.sub(r'\[(\d+)\]\s*(.+?)，(https?://[^\s，]+?)(?:，(.+?))?(?=\s*\n|\s*$)',
@@ -611,8 +638,9 @@ def _process_inline_formatting(text: str) -> str:
     def replace_markdown_link(match):
         link_text = match.group(1)
         link_url = match.group(2)
-        # ReportLab 的 <a> 标签格式
-        return f'<a href="{link_url}" color="#04B5BB">{link_text}</a>'
+        # ReportLab 的 <a> 标签格式，转义 URL 中的特殊字符
+        safe_url = _escape_url_for_html_attr(link_url)
+        return f'<a href="{safe_url}" color="#04B5BB">{link_text}</a>'
 
     # 处理Markdown链接，支持URL中包含括号（如wiki链接、论文DOI等）
     # 匹配模式：URL可包含一层嵌套括号，如 https://example.com/page(1).html
@@ -673,17 +701,45 @@ def _process_inline_formatting(text: str) -> str:
     text = re.sub(r'</br>', '', text, flags=re.IGNORECASE)
     text = text.replace('<br/>', ' <br/> ')
 
-    for attr in ['color', 'size', 'name', 'href', 'face', 'backColor']:
-        text = re.sub(rf'\b{attr}=([^"\s>]+)', rf'{attr}="\1"', text)
+    # 修复 HTML 标签中没有引号的属性值（仅处理标签级属性，不处理 href 值内的 URL 参数）
+    # 使用负向前瞻确保不在引号内匹配
+    # 只匹配：空格 + 属性名 + = + 非引号值（不在已有引号属性值内）
+    def fix_unquoted_attr_safe(text_val):
+        # 先保护所有已有的引号属性值
+        protected = []
+        def protect(m):
+            protected.append(m.group(0))
+            return f'__PROTECTED_ATTR_{len(protected)-1}__'
+        
+        # 保护 attr="value" 和 attr='value' 格式
+        text_val = re.sub(r'(\w+)="[^"]*"', protect, text_val)
+        text_val = re.sub(r"(\w+)='[^']*'", protect, text_val)
+        
+        # 现在修复未引号的属性（只在标签内，且前面是空格）
+        for attr in ['color', 'size', 'name', 'href', 'face', 'backColor']:
+            text_val = re.sub(rf'(\s){attr}=([^\s>"\']+)', rf'\1{attr}="\2"', text_val, flags=re.IGNORECASE)
+        
+        # 恢复保护的属性
+        for i, val in enumerate(protected):
+            text_val = text_val.replace(f'__PROTECTED_ATTR_{i}__', val)
+        
+        return text_val
+    
+    # 只对 HTML 标签应用修复
+    text = re.sub(r'<[^>]+>', lambda m: fix_unquoted_attr_safe(m.group(0)), text)
 
     def _sanitize_reportlab_links(value: str) -> str:
         def repl(m: re.Match) -> str:
             href = (m.group(1) or '').strip()
             body = m.group(2) or ''
+            full_tag = m.group(0)
             if re.match(r'^(https?://|mailto:|#)', href, flags=re.IGNORECASE):
-                return m.group(0)
+                # 对于有效的 URL，确保转义特殊字符
+                safe_href = _escape_url_for_html_attr(href)
+                # 替换原始 href 为转义后的版本
+                return full_tag.replace(f'href="{href}"', f'href="{safe_href}"')
             if re.match(r'^www\.', href, flags=re.IGNORECASE) or re.match(r'^[\w.-]+\.[a-z]{2,}([/?#]|$)', href, flags=re.IGNORECASE):
-                safe_href = f'https://{href}'
+                safe_href = _escape_url_for_html_attr(f'https://{href}')
                 return f'<a href="{safe_href}" color="#04B5BB">{body}</a>'
             return body
 
@@ -693,6 +749,20 @@ def _process_inline_formatting(text: str) -> str:
 
     text = re.sub(r'<(font|b|i|sub|sup)\b[^>]*>\s*</\1>', '', text, flags=re.IGNORECASE)
     text = re.sub(r'<a(?![^>]*\bname=)[^>]*>\s*</a>', '', text, flags=re.IGNORECASE)
+
+    # 在 _sanitize_reportlab_links 之后保护 HTML 标签中的属性值
+    # 避免 _apply_english_font_markup 等后续处理影响锚点名称
+    protected_attrs = []
+    def protect_attr_value(m):
+        attr_name = m.group(1)
+        attr_value = m.group(2)
+        # 使用不包含下划线的占位符，避免被下标转换影响
+        placeholder = f"PROTECTEDATTRVAL{len(protected_attrs)}ENDPROTECTED"
+        protected_attrs.append((attr_name, attr_value))
+        return f'{attr_name}="{placeholder}"'
+    
+    # 保护 name, href 属性值
+    text = re.sub(r'(name|href)="([^"]*)"', protect_attr_value, text, flags=re.IGNORECASE)
 
     text = _apply_english_font_markup(text)
 
@@ -736,6 +806,10 @@ def _process_inline_formatting(text: str) -> str:
             parts.append(f'</{stack.pop()}>')
         return ''.join(parts)
 
+    # 恢复被保护的属性值
+    for i, (attr_name, attr_value) in enumerate(protected_attrs):
+        text = text.replace(f'PROTECTEDATTRVAL{i}ENDPROTECTED', attr_value)
+    
     return balance_inline_tags(text)
 
 
@@ -745,6 +819,7 @@ _EN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._@/+\-]*")
 def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
     parts = re.split(r'(<[^>]+>)', text)
     font_stack: List[bool] = []
+    in_anchor: int = 0  # 跟踪是否在 <a> 标签内（支持嵌套计数）
 
     def in_locked_font() -> bool:
         return any(font_stack)
@@ -757,6 +832,12 @@ def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
         if not part:
             continue
         if part.startswith('<') and part.endswith('>'):
+            # 跟踪 <a> 标签的开始和结束
+            if re.match(r'<\s*a\b', part, flags=re.IGNORECASE) and not part.rstrip().endswith('/>'):
+                in_anchor += 1
+            elif re.match(r'</\s*a\s*>', part, flags=re.IGNORECASE):
+                in_anchor = max(0, in_anchor - 1)
+            
             if re.match(r'<\s*font\b', part, flags=re.IGNORECASE) and not part.rstrip().endswith('/>'):
                 locked = bool(re.search(r'\b(name|face)\s*=', part, flags=re.IGNORECASE))
                 font_stack.append(locked)
@@ -766,7 +847,8 @@ def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
             out.append(part)
             continue
 
-        out.append(part if in_locked_font() else wrap_tokens(part))
+        # 在 <a> 标签内或已锁定字体时，不进行英文字体包裹
+        out.append(part if (in_locked_font() or in_anchor > 0) else wrap_tokens(part))
 
     return ''.join(out)
 
@@ -970,6 +1052,18 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
             pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
 
+        # 从 Markdown 内容中提取第一个标题作为 PDF 标题元数据
+        pdf_title = ''
+        for md_line in markdown_content.split('\n'):
+            md_line_stripped = md_line.strip()
+            if md_line_stripped.startswith('# '):
+                pdf_title = md_line_stripped[2:].strip()
+                break
+
+        # 如果没有找到 H1 标题，使用文件名（去掉扩展名）作为标题
+        if not pdf_title:
+            pdf_title = output_path.stem if hasattr(output_path, 'stem') else Path(str(output_path)).stem
+
         # 创建 PDF 文档
         doc = SimpleDocTemplate(
             str(output_path),
@@ -977,8 +1071,22 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             rightMargin=2 * cm,
             leftMargin=2 * cm,
             topMargin=2 * cm,
-            bottomMargin=2 * cm
+            bottomMargin=2.5 * cm,  # 增加底部边距以容纳页码
+            title=pdf_title,
+            author='PanguAI'
         )
+
+        # 定义页码回调函数
+        def add_page_number(canvas, doc):
+            """
+            在每页底部中央添加页码
+            """
+            page_num = canvas.getPageNumber()
+            text = f"第 {page_num} 页"
+            canvas.saveState()
+            canvas.setFont('SimSun', 9)
+            canvas.drawCentredString(A4[0] / 2, 1.2 * cm, text)
+            canvas.restoreState()
 
         # 定义样式
         styles = getSampleStyleSheet()
@@ -1501,8 +1609,8 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
 
             i += 1
 
-        # 生成 PDF
-        doc.build(story)
+        # 生成 PDF（应用页码回调函数）
+        doc.build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
         return True
 
     except Exception as e:
@@ -2246,16 +2354,32 @@ class MCPTools:
             # PANGU 模型配置
             PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
-            # 语言检测：决定生成语言
-            sample_text = article_content[:5000]
-            zh_count = len(re.findall(r'[\u4e00-\u9fff]', sample_text))
-            en_count = len(re.findall(r'[a-zA-Z]', sample_text))
-
+            # 语言检测：优先根据user_query判断，其次根据文章内容判断
+            # Priority: user_query language > article content language
             is_english_content = False
-            if zh_count < 50 and en_count > 200:
-                is_english_content = True
-            elif en_count > 0 and (zh_count / en_count) < 0.05:
-                is_english_content = True
+            
+            # 首先检查user_query的语言
+            if user_query:
+                query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', user_query))
+                query_en_count = len(re.findall(r'[a-zA-Z]', user_query))
+                # 如果query包含中文，则使用中文
+                if query_zh_count > 0:
+                    is_english_content = False
+                    logger.info(f"Language detection: user_query contains Chinese ({query_zh_count} chars), using Chinese")
+                # 如果query纯英文，则使用英文
+                elif query_en_count > 10 and query_zh_count == 0:
+                    is_english_content = True
+                    logger.info(f"Language detection: user_query is English only, using English")
+            
+            # 如果user_query为空或无法判断，则根据文章内容判断
+            if not user_query:
+                sample_text = article_content[:5000]
+                zh_count = len(re.findall(r'[\u4e00-\u9fff]', sample_text))
+                en_count = len(re.findall(r'[a-zA-Z]', sample_text))
+                if zh_count < 50 and en_count > 200:
+                    is_english_content = True
+                elif en_count > 0 and (zh_count / en_count) < 0.05:
+                    is_english_content = True
 
             # 根据内容语言定制 Prompt
             if is_english_content:
@@ -4395,15 +4519,20 @@ OUTLINE TO ORGANIZE CONTENT:
 Other points to note::
 - If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.  
 - CONTENT LENGTH: Each section should contain approximately 2500 words to ensure comprehensive coverage.
-- **CRITICAL TITLE PRESERVATION RULE:** You MUST preserve the exact format, structure, and content of chapter titles as provided in the current_chapter_outline. This includes:
-  * DO NOT change any markdown formatting symbols (# ## ### ** etc.)
-  * DO NOT add, remove, or rearrange any part of the title structure
-  * Copy the title lines EXACTLY as they appear in current_chapter_outline
-  * Only write content under the provided title structure - never modify the titles themselves
-  * When the title symbols in the current chapter outline are inconsistent with those in the overall outline, use the overall outline's title symbols as the standard and maintain symbol consistency throughout the writing process
+- **CRITICAL HEADING FORMAT RULES:**
+  * **Level 1 章节标题**: 使用 Markdown '##' 格式，如 "## 2. Molecular Mechanisms" 或 "## 2. 分子机制"
+  * **Level 2 子标题**: 必须是**纯文本格式**，不能使用任何markdown符号（不要用 ###、**、* 等）
+    - **错误格式**: "### 2.1 Title" 或 "**### 2.1 Title**" 或 "**2.1 Title**"（包含markdown符号）
+    - **正确格式**: "2.1 Title" 或 "2.1 标题"（纯文本，只有数字+空格+标题）
+  * 如果 current_chapter_outline 中的子标题包含markdown符号，你必须**移除这些符号**，只保留纯文本格式
+  * 这对于PDF目录识别至关重要
 - Note that in Chapter 1, omit any mention of research objectives, methodology, or procedural details.
-- Be sure to ensure that the language of your output is consistent with the language of the user's question. For example, if the user's question is in Chinese, your reply should also be in Chinese.
-- **LANGUAGE RULE**: If the user's question contains ANY Chinese characters, you MUST write the ENTIRE chapter in Chinese (except for specific English technical terms). Even if the user uses English technical terms (like "deep learning") or the source material is in English, the explanation and narrative MUST be in Chinese. If the user's question is entirely in English, then write in English.
+- **🌐 CRITICAL LANGUAGE RULES (MUST FOLLOW)**:
+  * **English query (no Chinese characters) → Write ENTIRE chapter in English**, including title, all headings, and all content.
+  * **Chinese query (contains ANY Chinese characters) → Write ENTIRE chapter in Chinese (中文)**, including title, all headings, and all content. Even if source materials are in English, translate and write in Chinese.
+  * **Mixed Chinese-English query → Write ENTIRE chapter in Chinese (中文)**.
+  * This rule applies to Chapter 1's title generation as well - the title MUST match the query language.
+  * Technical terms may remain in English (e.g., "PINK1/Parkin pathway"), but all explanatory text must follow the language rule.
 
 Strictly follow the following format for output:
 <chapter_content>xxx</chapter_content>

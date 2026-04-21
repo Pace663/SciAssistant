@@ -1,5 +1,4 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
 from typing import Dict, Any, List
 import time
@@ -17,7 +16,7 @@ class InformationSeekerAgent(BaseAgent):
     thinks interleaved (reasoning -> action -> reasoning -> action),
     uses MCP tools to gather information, and returns structured results.
     """
-
+    
     def __init__(self, config: AgentConfig = None, shared_mcp_client=None):
         # Set default agent name if not specified
         if config is None:
@@ -98,6 +97,13 @@ class InformationSeekerAgent(BaseAgent):
         current_date = datetime.now().strftime("%Y-%m-%d")
         
         system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
+
+## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**Detect the language of the user's query/task and respond accordingly:**
+- **English query → Respond in English**
+- **Chinese query (中文) → Respond in Chinese (中文回复)**
+- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
+This rule applies to ALL outputs including: task summaries, findings, and any content in task_done reports.
         
 **IMPORTANT - Current Date: {current_date}**
 When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
