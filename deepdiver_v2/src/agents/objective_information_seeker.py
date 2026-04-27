@@ -35,6 +35,7 @@ class InformationSeekerAgent(BaseAgent):
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
         use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
+        use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'True').lower() == 'true'
         use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         
@@ -55,6 +56,7 @@ class InformationSeekerAgent(BaseAgent):
             'arxiv': ['arxiv'],
             'google_scholar': ['google_scholar', 'scholar'],
             'scihub': ['scihub'],
+			'rag': ['search_rag_knowledge', 'rag_knowledge'],
             # 'springer': ['springer']  # DISABLED
         }
         
@@ -77,11 +79,13 @@ class InformationSeekerAgent(BaseAgent):
                 is_enabled = True
             elif use_scihub and any(pattern in tool_lower for pattern in tool_category_patterns['scihub']):
                 is_enabled = True
+            elif use_rag and any(pattern in tool_lower for pattern in tool_category_patterns['rag']):
+                is_enabled = True
             # elif use_springer and any(pattern in tool_lower for pattern in tool_category_patterns['springer']):
             #     is_enabled = True
             
             # Categorize tool
-            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar'] + tool_category_patterns['scihub']):
+            if any(pattern in tool_lower for pattern in tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar'] + tool_category_patterns['scihub']+ tool_category_patterns['rag']):
                 if is_enabled:
                     enabled_tools.append(tool_name)
                 else:
@@ -90,9 +94,40 @@ class InformationSeekerAgent(BaseAgent):
         # Build search source guidance message
         search_source_guidance = ""
         if enabled_tools:
+            # Check if RAG is enabled
+            has_rag = any('rag' in tool.lower() or 'search_rag_knowledge' in tool.lower() for tool in enabled_tools)
+            # Check if other search sources are enabled (only check actual search tools, not document processing tools)
+            search_tool_patterns = tool_category_patterns['websearch'] + tool_category_patterns['pubmed'] + tool_category_patterns['arxiv'] + tool_category_patterns['google_scholar']
+            has_other_sources = any(
+                tool for tool in enabled_tools 
+                if any(pattern in tool.lower() for pattern in search_tool_patterns)
+            )
+            
             search_source_guidance = f"\n\n**📚 AVAILABLE SEARCH TOOLS:**\n"
             search_source_guidance += f"You have access to the following search tools: **{', '.join(enabled_tools)}**\n"
             search_source_guidance += f"These tools are fully functional and ready to use. Focus on using these tools effectively to gather comprehensive information.\n"
+            
+            # Dynamic search strategy based on available tools
+            if has_rag and has_other_sources:
+                # Multiple sources available - require comprehensive strategy
+                search_source_guidance += f"\n**CRITICAL - COMPREHENSIVE SEARCH STRATEGY (Multiple Sources Available):**\n"
+                search_source_guidance += f"- **MANDATORY:** You MUST use MULTIPLE search sources to gather comprehensive information\n"
+                search_source_guidance += f"- **RAG Knowledge Base:** ALWAYS call RAG multiple times (3-5 times minimum) with detailed, precise query terms from different angles\n"
+                search_source_guidance += f"- **Other Search Tools:** Use WebSearch, PubMed, arXiv, Springer as appropriate\n"
+                search_source_guidance += f"- **INTEGRATION REQUIREMENT:** Combine results from RAG AND other search sources, cross-reference findings\n"
+            elif has_rag and not has_other_sources:
+                # Only RAG available - focus on RAG optimization
+                search_source_guidance += f"\n**CRITICAL - RAG-FOCUSED SEARCH STRATEGY (RAG Only Mode):**\n"
+                search_source_guidance += f"- **MANDATORY:** Call RAG multiple times (3-5 times minimum) with different query formulations\n"
+                search_source_guidance += f"- Use detailed, precise query terms (e.g., 'sodium-ion battery cathode P2-type layered oxide rate performance K+ doping')\n"
+                search_source_guidance += f"- Search from different angles: material types, modification strategies, performance metrics, synthesis methods\n"
+                search_source_guidance += f"- RAG contains high-quality academic papers - maximize its value through comprehensive multi-angle searches\n"
+            elif not has_rag and has_other_sources:
+                # No RAG, only other sources
+                search_source_guidance += f"\n**SEARCH STRATEGY (Non-RAG Sources):**\n"
+                search_source_guidance += f"- Use available search tools (WebSearch, PubMed, arXiv, Springer) comprehensively\n"
+                search_source_guidance += f"- Generate multiple search queries from different angles\n"
+            
             if disabled_tools:
                 search_source_guidance += f"\nNote: Some search tools ({', '.join(disabled_tools)}) are not available in this session. If you attempt to use them, you will receive an error - simply use the available tools instead.\n"
         else:
@@ -135,6 +170,40 @@ When searching for recent information or papers, be aware that the current date 
            - For important URLs, use `url_crawler` to:
                 a) Extract full content from the webpage
                 b) Save the content to a file in the workspace
+           - For important articles searched with pubmed, medrxiv, arxiv, or springer, use the corresponding retrieval tools:
+                a) PubMed: "get_pubmed_article" (requires PMID from search results)
+                b) medRxiv: "medrxiv_read_paper" (requires paper_id from search results)
+                c) arXiv: "arxiv_read_paper" (requires paper_id from search results)
+                d) Springer Nature: "springer_get_article" (requires DOI from search results)
+           - **⚠️ CRITICAL - NO FAKE CITATIONS RULE:**
+                a) You MUST ONLY use PMIDs, paper IDs, and DOIs that are **actually returned** by search tools
+                b) If a search tool returns 0 results, do NOT invent or fabricate any identifiers
+                c) NEVER generate fake PMIDs, fake DOIs, or fake paper IDs under any circumstances
+                d) If PubMed returns no results for a non-biomedical topic, simply skip PubMed and use other sources
+                e) It is better to have fewer real references than to include any fake ones
+           - **CRITICAL: For RAG knowledge base search results from `search_rag_knowledge`, you MUST use `rag_document_saver` to download documents (similar to how `url_crawler` works for web pages):**
+                a) Download complete documents from OBS (Object Storage Service)
+                b) Save documents to workspace with proper metadata (title, journal, DOI, etc.)
+                c) Enable proper citation generation in the final report
+                d) **MANDATORY:** Always call `rag_document_saver` immediately after `search_rag_knowledge`
+                e) **Usage (similar to url_crawler):**
+                   ```
+                   # Step 1: Search RAG - returns documents_for_download list
+                   search_rag_knowledge(content="catalyst performance")
+                   # Result contains: {{"doc_list": [...], "documents_for_download": [{{"obs_path": ..., "title": ...}}, ...]}}
+                   
+                   # Step 2: Pass the documents_for_download list to rag_document_saver
+                   rag_document_saver(documents=[
+                       {{"obs_path": "uploads/xxx/xxx.md", "title": "Document 1"}},
+                       {{"obs_path": "uploads/yyy/yyy.md", "title": "Document 2"}}
+                   ])
+                   # Or simply call without arguments to download all:
+                   rag_document_saver()
+                   ```
+                f) Documents will be saved under `rag_downloads/research/` with metadata preserved
+           - Store results with meaningful file paths that reflect content type and topic
+             (e.g., `url_crawler_save_files/ai_trends_2024.txt` for web content,
+              `research/summary_2024.txt` for analysis results)
            - For Google Scholar results, use `google_scholar_get_paper` to download and analyze papers
            - For Sci-Hub results, use `scihub_get_paper` with DOI to download and analyze papers (especially useful for paywalled content)
            - Store results with meaningful file paths (e.g., \"research/ai_trends_2024.txt\")

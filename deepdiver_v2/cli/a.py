@@ -106,6 +106,7 @@ class SearchSources(BaseModel):
     websearch: bool = True
     pubmed: bool = True
     arxiv: bool = True
+    rag: bool = True
     google_scholar: bool = True
     scihub: bool = True
 
@@ -458,11 +459,13 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
             os.environ['SEARCH_SOURCE_GOOGLE_SCHOLAR'] = str(search_sources_dict.get('google_scholar', False))
             os.environ['SEARCH_SOURCE_SCIHUB'] = str(search_sources_dict.get('scihub', False))
+            os.environ['SEARCH_SOURCE_RAG'] = str(search_sources_dict.get('rag', False))
             logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', False)}, "
                        f"PubMed: {search_sources_dict.get('pubmed', False)}, "
                        f"arXiv: {search_sources_dict.get('arxiv', False)}, "
                        f"GoogleScholar: {search_sources_dict.get('google_scholar', False)}, "
-                       f"SciHub: {search_sources_dict.get('scihub', False)}, "
+                       f"RAG: {search_sources_dict.get('rag', False)}, "
+					   f"SciHub: {search_sources_dict.get('scihub', False)} "
                       )
 
         agent = create_planner_agent(
@@ -1234,6 +1237,7 @@ async def handle_single_query(request: SingleQueryRequest):
             'websearch': request.search_sources.websearch,
             'pubmed': request.search_sources.pubmed,
             'arxiv': request.search_sources.arxiv,
+			'rag': request.search_sources.rag,
             'google_scholar': request.search_sources.google_scholar,
             'scihub': request.search_sources.scihub
         }
@@ -1368,7 +1372,8 @@ async def handle_single_query_sync(request: SingleQueryRequest):
             'pubmed': request.search_sources.pubmed,
             'arxiv': request.search_sources.arxiv,
             'google_scholar': request.search_sources.google_scholar,
-            'scihub': request.search_sources.scihub
+            'scihub': request.search_sources.scihub,
+			'rag': request.search_sources.rag
         }
 
     # 判断是立即执行还是加入队列
