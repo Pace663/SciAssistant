@@ -35,7 +35,7 @@ class InformationSeekerAgent(BaseAgent):
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
         use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
         use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
-        use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'True').lower() == 'true'
+        use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'False').lower() == 'true'
         use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
         

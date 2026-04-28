@@ -106,7 +106,7 @@ class SearchSources(BaseModel):
     websearch: bool = True
     pubmed: bool = True
     arxiv: bool = True
-    rag: bool = True
+    rag: bool = False
     google_scholar: bool = True
     scihub: bool = True
 
