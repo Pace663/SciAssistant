@@ -3385,6 +3385,41 @@ class MCPTools:
                     error="URL crawler not configured"
                 )
 
+            def _is_blocked_or_verification_page(text: str) -> bool:
+                """
+                Detect anti-bot / verification / access denied pages.
+                These pages should not be treated as valid academic sources.
+                """
+                if not text:
+                    return True
+
+                content_lower = text.lower()
+                blocked_patterns = [
+                    "enable cookies",
+                    "cookies are turned off",
+                    "security check",
+                    "verifying you are human",
+                    "just a moment",
+                    "access denied",
+                    "403 forbidden",
+                    "forbidden",
+                    "captcha",
+                    "cloudflare",
+                    "performing security checks",
+                    "malicious bots",
+                    "bot verification",
+                ]
+
+                if any(pattern in content_lower for pattern in blocked_patterns):
+                    return True
+
+                # Extremely short pages are often placeholders/error pages.
+                # Keep the threshold conservative to reduce false positives.
+                if len(content_lower.split()) < 120:
+                    return True
+
+                return False
+
             def process_single_document(doc: Dict) -> Dict[str, Any]:
                 """Process a single document: extract content and save to file"""
                 url = doc['url']
@@ -3421,6 +3456,15 @@ class MCPTools:
                     content = content_result.data
                     if not content:
                         result_base['error'] = "Extracted content is empty"
+                        return result_base
+
+                    if _is_blocked_or_verification_page(content):
+                        result_base['error'] = "Blocked/verification page detected"
+                        if include_metadata:
+                            result_base['metadata'] = {
+                                'blocked_page': True,
+                                'reason': 'anti-bot or access-denied content detected'
+                            }
                         return result_base
 
                     # Save content to file
@@ -4349,7 +4393,7 @@ class MCPTools:
                     # 检查是否是标题格式（# 开头或 **粗体**）
                     heading_match = re.match(r'^(#+\s*|\*\*)(.+)', first_line)
                     if heading_match:
-                        # 【关键修复】检查是否是章节标题(如"## 1. xxx", "## 2. xxx")
+                        # 【关键修复】检查是否是章节标题(如 "## 1. xxx", "## 2. xxx")
                         # 章节标题不应该被删除,只删除真正重复的文档标题
                         is_chapter_heading = re.match(r'^##\s+\d+\.', first_line)
                         
@@ -4433,8 +4477,8 @@ class MCPTools:
         - 检测并转换非Markdown格式的章节标题
         - 确保第一个非空行是二级标题（章节标题）
         - 规范化所有子标题层级
-        - 修复错误使用###的二级标题(如"### 2.4 标题" -> "2.4 标题")
-        - 智能修复小节编号不匹配问题(如"## 1. xxx"下的"2.1"自动修复为"1.1")
+        - 修复错误使用###的二级标题(如 "### 2.4 标题" -> "2.4 标题")
+        - 智能修复小节编号不匹配问题(如 "## 1. xxx"下的"2.1"自动修复为"1.1")
 
         Args:
             content: 章节内容
@@ -4471,20 +4515,20 @@ class MCPTools:
                 heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
                 numbered_heading_match = re.match(r'^(\d+(?:\.\d+)*)\s+', heading_text_clean)
 
-                # 【关键修复1】提取章节号(如"## 1. xxx" -> 章节号为1)
+                # 【关键修复】提取章节号(如 "## 1. xxx" -> 章节号为1)
                 if current_level == 2 and numbered_heading_match:
                     chapter_num_str = numbered_heading_match.group(1)
-                    # 检查是否是一级编号(如"1", "2", "3"等,没有点)
+                    # 检查是否是一级编号(如 "1", "2", "3"，没有点)
                     if '.' not in chapter_num_str:
                         current_chapter_number = int(chapter_num_str)
                         logger.info(f"检测到章节标题: {heading_text_clean}, 章节号: {current_chapter_number}")
 
-                # 【关键修复2】检测错误使用###的二级标题(如"### 2.4 标题")
+                # 【关键修复】检测错误使用###的二级标题(如 "### 2.4 标题")
                 # 二级标题应该是纯文本,不应该有###前缀
                 if numbered_heading_match and current_level == 3:
-                    # 这是一个编号标题(如"2.1 xxx"),且使用了###
+                    # 这是一个编号标题(如 "2.1 xxx"),且使用了###
                     number_part = numbered_heading_match.group(1)
-                    # 检查是否是二级编号(如2.1, 2.2, 3.1等,只有一个点)
+                    # 检查是否是二级编号(如 1.1, 2.2, 3.1，只有一个点)
                     if number_part.count('.') == 1:
                         # 这是错误的二级标题格式,应该转换为纯文本
                         # 同时修复编号不匹配问题
@@ -4547,7 +4591,7 @@ class MCPTools:
                     first_content_line = False
                     normalized_lines.append(line)
             else:
-                # 【关键修复3】检测纯文本格式的小节标题(如"2.1 xxx")并修复编号
+                # 【关键修复】检测纯文本格式的小节标题(如 "2.1 xxx")并修复编号
                 # 检查是否是纯文本的小节标题(格式: 数字.数字 标题)
                 plain_subsection_match = re.match(r'^(\d+)\.(\d+)\s+(.+)$', stripped_line)
                 if plain_subsection_match and current_chapter_number is not None:
@@ -4986,6 +5030,26 @@ class MCPTools:
 
                         # URL显示为完整的来源信息（包含文件名）
                         url_source = full_source_info
+                    elif file_path.startswith('research/'):
+                        research_file_path = self.workspace_path / file_path
+                        if research_file_path.exists():
+                            title, url_source = self._extract_title_from_file_content(research_file_path)
+                        else:
+                            # research文件不存在，尝试从文件名提取标题
+                            title = self._extract_title_from_research_filename(file_path)
+                            logger.warning(f"警告: 研究文件不存在: {research_file_path}")
+                    elif file_path.startswith('pubmed_articles/') or file_path.startswith('arxiv_articles/'):
+                        # 【新增】PubMed 和 arXiv 文章处理
+                        article_file_path = self.workspace_path / file_path
+                        if article_file_path.exists():
+                            title, url_source = self._extract_title_from_file_content(article_file_path)
+                            logger.info(
+                                f"[ACADEMIC_ARTICLE] 提取学术文章引用: {file_path}, title={title[:50]}..., url={url_source[:50]}...")
+                        else:
+                            # 文件不存在，使用默认值
+                            title = os.path.basename(file_path).replace('.txt', '').replace('_', ' ')
+                            url_source = "Academic Article"
+                            logger.warning(f"警告: 学术文章文件不存在: {article_file_path}")
                     # elif file_path.startswith('rag_downloads/'):
                     #     # RAG知识库文档（路径格式：rag_downloads/research/xxx.md）
                     #     # 从analysis_data中提取RAG元数据
@@ -5244,6 +5308,20 @@ class MCPTools:
                     title_cleaned = title_cleaned.replace('- ', '— ')  # 破折号+空格 → em-dash+空格
                     title_cleaned = title_cleaned.replace(' -', ' —')  # 空格+破折号 → 空格+em-dash
 
+                    # 过滤无效标题（错误页面、无效内容等）
+                    invalid_titles = [
+                        '403 forbidden', '404 not found', '500 internal server error',
+                        '502 bad gateway', '503 service unavailable', '504 gateway timeout',
+                        'access denied', 'page not found', 'error', 'just a moment',
+                        'unknown title', 'untitled'
+                    ]
+                    title_lower = title_cleaned.lower().strip()
+                    is_invalid = any(invalid in title_lower for invalid in invalid_titles)
+
+                    if is_invalid:
+                        logger.info(f"跳过无效标题的引用 {num}: {title_cleaned}")
+                        continue  # 跳过此引用，不添加到参考文献列表
+
                     # 优化时间信息显示
                     doc_time_cleaned = doc_time
                     show_time = True
@@ -5307,30 +5385,39 @@ class MCPTools:
                             else:
                                 reference_entry = f"[{num}] {file_icon} {title_cleaned}，{url_source}"
 
-                    # 根据文件类型分类
-                    if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
+                    # 根据文件类型分类：RAG > 用户文件 > 其他
+                    if file_path.startswith('rag_downloads/'):
+                        # 【优化】如果 RAG 引用没有可点击的 URL（无 DOI、无网页链接），则跳过
+                        # 因为用户无法通过点击参考来源查看原文，展示"RAG知识库"没有实际价值
+                        if not url_source.startswith('http://') and not url_source.startswith('https://'):
+                            logger.info(f"跳过无URL的RAG引用 {num}: url_source={url_source}, title={title_cleaned[:50]}")
+                            continue
+                        rag_references.append((num, reference_entry))
+                        logger.info(f"添加 RAG 知识库引用 {num}: {reference_entry}")
+                    elif 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                         user_file_references.append((num, reference_entry))
                         logger.info(f"添加用户文件引用 {num}: {reference_entry}")
                     else:
                         other_references.append((num, reference_entry))
                         logger.info(f"添加其他引用 {num}: {reference_entry}")
-
                 else:
                     # 默认引用条目
                     default_entry = f"[{num}] Unknown Title，Unknown URL，Unknown Time"
                     other_references.append((num, default_entry))
                     logger.warning(f"警告: 找不到引用 {num} 对应的文件")
 
-            # 重新排序：用户文件在前，其他文件在后
-            # 先按序号排序用户文件
+            # 重新排序：RAG 来源在最前，用户文件次之，其他文件在后
+            # 先按序号排序 RAG 来源
+            rag_references.sort(key=lambda x: x[0])
+            # 再按序号排序用户文件
             user_file_references.sort(key=lambda x: x[0])
-            # 再按序号排序其他文件
+            # 最后按序号排序其他文件
             other_references.sort(key=lambda x: x[0])
 
             # 创建原始序号到连续序号的映射，使参考文献序号连续
-            # 用户文件在前，其他文件在后
+            # RAG 来源优先，用户文件次之，其他文件在后
             old_to_new_num = {}
-            all_sorted_refs = user_file_references + other_references  # 用户文件优先
+            all_sorted_refs = rag_references + user_file_references + other_references  # RAG 优先
 
             for new_num, (old_num, _) in enumerate(all_sorted_refs, 1):
                 old_to_new_num[old_num] = new_num
@@ -5770,7 +5857,11 @@ class MCPTools:
             key_files_dict = {}
             # Create full path relative to workspace
             full_analysis_path = self.workspace_path / "doc_analysis/file_analysis.jsonl"
-            file_analysis_list = load_json(full_analysis_path)
+            try:
+                file_analysis_list = load_json(full_analysis_path)
+            except Exception as e:
+                logger.warning(f"Failed to load file_analysis.jsonl: {e}, using empty list")
+                file_analysis_list = []
 
             for file_info in file_analysis_list:
                 if file_info.get('file_path'):
@@ -6413,8 +6504,12 @@ OUTLINE TO ORGANIZE CONTENT:
             key_files_dict = {}
             # Create full path relative to workspace using config
             analysis_path = storage_config.get('document_analysis_path', './doc_analysis')
-            file_analysis_list = self.load_json(f"{analysis_path}/file_analysis.jsonl").data
-            logger.debug("File analysis loaded successfully")
+            load_result = self.load_json(f"{analysis_path}/file_analysis.jsonl")
+            file_analysis_list = load_result.data if load_result.success else []
+            if not load_result.success:
+                logger.warning(f"Failed to load file_analysis.jsonl: {load_result.error}, using empty list")
+            else:
+                logger.debug("File analysis loaded successfully")
 
             for i, file_info in enumerate(file_analysis_list, 1):
                 file_info['index'] = i  # 在这里给网页进行编号， 从1开始
@@ -6942,6 +7037,7 @@ CURRENT CHAPTER CONTENT:
                     "2. Authority: According to the information of the document, judge the source of the web page to confirm the credibility of the web page.\n"
                     "3. Relevance: According to the current task (task_content) and the given document, judge whether the current document is related to the current task.\n"
                     "4. Core content: Based on this document, you make a core content summary to ensure the richness of information, with a word count of about 200 words.\n"
+                    "5. Paper metadata extraction: Extract paper title, author(s), abstract, and journal when available. If any field cannot be determined, set it to an empty string.\n"
                     "Information richness: Estimate the total word count of substantive content in the document. Less than 200 words indicates scarcity; over 800 words suggests high richness; between these thresholds denotes moderate richness. Be careful not to just give the word count results, but also give a corresponding text description of how informative the content is.\n"
 
                     "Note:\n1. Ensure the document's language aligns with the extracted dimensions (e.g., Chinese content requires Chinese extraction).\n2. For **source_authority** and **task_relevance**, first provide a brief description before concluding.  \n"
@@ -6954,7 +7050,11 @@ CURRENT CHAPTER CONTENT:
                     "  \"source_authority\": \"xxx\",\n"
                     "  \"task_relevance\": \"xxx\",\n"
                     "  \"core_content\": \"xxx\",\n"
-                    "  \"information_richness\": \"xxx\"\n"
+                    "  \"information_richness\": \"xxx\",\n"
+                    "  \"title\": \"\",\n"
+                    "  \"author\": \"\",\n"
+                    "  \"abstract\": \"\",\n"
+                    "  \"journal\": \"\"\n"
                     "}\n\n"
                     "Important: Return ONLY the JSON object, no additional text or formatting."
                 )
@@ -7124,10 +7224,298 @@ CURRENT CHAPTER CONTENT:
             #         logger.info(f"[RAG_METADATA] 从文件内容提取元数据: {file_path} -> {metadata}")
             #         return metadata
             #     return None
-            #
-            # def parse_answer_to_structured_data(answer_text: str, file_path: str, rag_metadata: dict = None) -> Dict[
-            #     str, str]:
-            def parse_answer_to_structured_data(answer_text: str, file_path: str) -> Dict[str, str]:
+
+            def normalize_text_field(value: Any) -> str:
+                """Normalize arbitrary field values to a clean string."""
+                if value is None:
+                    return ""
+
+                if isinstance(value, str):
+                    return value.strip()
+
+                if isinstance(value, list):
+                    normalized_parts = []
+                    for item in value:
+                        item_text = normalize_text_field(item)
+                        if item_text:
+                            normalized_parts.append(item_text)
+                    return ", ".join(normalized_parts)
+
+                if isinstance(value, dict):
+                    for key in ("name", "author", "authors", "text", "value"):
+                        if key in value:
+                            nested_text = normalize_text_field(value.get(key))
+                            if nested_text:
+                                return nested_text
+                    return ""
+
+                return str(value).strip()
+
+            crossref_cache: Dict[str, Dict[str, str]] = {}
+            openalex_cache: Dict[str, Dict[str, str]] = {}
+
+            def extract_doi_from_text(text: str) -> str:
+                """Extract DOI from arbitrary text."""
+                if not text:
+                    return ""
+
+                doi_pattern = r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+'
+                match = re.search(doi_pattern, text, re.IGNORECASE)
+                if not match:
+                    return ""
+
+                doi = match.group(0).strip().rstrip(".,);]}")
+                return doi
+
+            def fetch_crossref_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from Crossref by DOI.
+                Return empty dict when unavailable.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip()
+                if doi in crossref_cache:
+                    return crossref_cache[doi]
+
+                try:
+                    api_url = f"https://api.crossref.org/works/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        crossref_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json().get("message", {})
+                    title_list = payload.get("title") or []
+                    title = title_list[0].strip() if title_list and isinstance(title_list[0], str) else ""
+
+                    author_objs = payload.get("author") or []
+                    authors = []
+                    for a in author_objs:
+                        given = normalize_text_field(a.get("given"))
+                        family = normalize_text_field(a.get("family"))
+                        name = normalize_text_field(a.get("name"))
+                        full_name = f"{given} {family}".strip() if (given or family) else name
+                        if full_name:
+                            authors.append(full_name)
+                    author_text = ", ".join(authors)
+
+                    abstract = normalize_text_field(payload.get("abstract"))
+                    if abstract:
+                        # Crossref abstract may contain JATS tags.
+                        abstract = re.sub(r"<[^>]+>", " ", abstract)
+                        abstract = re.sub(r"\s+", " ", abstract).strip()
+
+                    journal_list = payload.get("container-title") or []
+                    journal = journal_list[0].strip() if journal_list and isinstance(journal_list[0], str) else ""
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": author_text,
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    crossref_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    crossref_cache[doi] = {}
+                    return {}
+
+            def fetch_openalex_metadata(doi: str) -> Dict[str, str]:
+                """
+                Fetch metadata from OpenAlex by DOI.
+                OpenAlex often has better abstract coverage than Crossref.
+                """
+                if not doi:
+                    return {}
+
+                doi = doi.strip().lower()
+                if doi in openalex_cache:
+                    return openalex_cache[doi]
+
+                try:
+                    api_url = f"https://api.openalex.org/works/https://doi.org/{doi}"
+                    resp = requests.get(api_url, timeout=12)
+                    if resp.status_code != 200:
+                        openalex_cache[doi] = {}
+                        return {}
+
+                    payload = resp.json()
+                    title = normalize_text_field(payload.get("title"))
+
+                    authorships = payload.get("authorships") or []
+                    authors = []
+                    for authorship in authorships:
+                        author_name = normalize_text_field((authorship or {}).get("author", {}).get("display_name"))
+                        if author_name:
+                            authors.append(author_name)
+
+                    journal = normalize_text_field(
+                        (payload.get("primary_location") or {}).get("source", {}).get("display_name")
+                    )
+
+                    abstract = ""
+                    abstract_inverted_index = payload.get("abstract_inverted_index") or {}
+                    if isinstance(abstract_inverted_index, dict) and abstract_inverted_index:
+                        words_with_positions = []
+                        for word, positions in abstract_inverted_index.items():
+                            for pos in positions:
+                                if isinstance(pos, int):
+                                    words_with_positions.append((pos, word))
+                        if words_with_positions:
+                            words_with_positions.sort(key=lambda item: item[0])
+                            abstract = " ".join(word for _, word in words_with_positions).strip()
+
+                    parsed = {
+                        "doi": doi,
+                        "title": title,
+                        "author": ", ".join(authors),
+                        "abstract": abstract,
+                        "journal": journal
+                    }
+                    openalex_cache[doi] = parsed
+                    return parsed
+                except Exception:
+                    openalex_cache[doi] = {}
+                    return {}
+
+            def extract_abstract_from_content(content: str) -> str:
+                """
+                Try to recover the abstract from local document content.
+                Prefer explicit Abstract sections; otherwise use a conservative heuristic.
+                """
+                if not content:
+                    return ""
+
+                normalized_content = content.replace("\r\n", "\n")
+
+                abstract_patterns = [
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?abstract\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:keywords?|introduction|1\.|i\.|background)\b)',
+                    r'(?is)(?:^|\n)\s*(?:#+\s*)?摘要\s*[:：]?\s*\n+(.*?)(?=\n\s*(?:#+\s*)?(?:关键词|关键字|引言|前言|1\.|一、))',
+                    r'(?is)-\s*\*\*abstract\*\*:\s*(.*?)(?=\n-\s*\*\*|\n\s*---|\n\s*##\s+)'
+                ]
+
+                for pattern in abstract_patterns:
+                    match = re.search(pattern, normalized_content)
+                    if match:
+                        candidate = re.sub(r'\s+', ' ', match.group(1)).strip()
+                        if len(candidate) >= 80:
+                            return candidate
+
+                # Conservative fallback: use the first substantial paragraph after metadata/header.
+                lines = normalized_content.split("\n")
+                paragraphs = []
+                buffer = []
+                start_collecting = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not start_collecting:
+                        if stripped in {"## Content", "Abstract", "摘要"} or stripped.lower() == "## content":
+                            start_collecting = True
+                        continue
+
+                    if not stripped:
+                        if buffer:
+                            paragraphs.append(" ".join(buffer).strip())
+                            buffer = []
+                        continue
+
+                    # Skip headings and metadata bullets.
+                    if stripped.startswith("#") or stripped.startswith("- **"):
+                        continue
+
+                    buffer.append(stripped)
+
+                if buffer:
+                    paragraphs.append(" ".join(buffer).strip())
+
+                for paragraph in paragraphs[:3]:
+                    normalized_paragraph = re.sub(r'\s+', ' ', paragraph).strip()
+                    if 150 <= len(normalized_paragraph) <= 2500:
+                        return normalized_paragraph
+
+                return ""
+
+            def summarize_metadata_status(structured_data: Dict[str, Any]) -> Dict[str, Any]:
+                """
+                Compute metadata completeness markers.
+                """
+                fields = ["title", "author", "abstract", "journal"]
+                missing_fields = [f for f in fields if not normalize_text_field(structured_data.get(f))]
+                structured_data["missing_fields"] = missing_fields
+                if not missing_fields:
+                    structured_data["metadata_status"] = "complete"
+                elif len(missing_fields) == len(fields):
+                    structured_data["metadata_status"] = "missing"
+                else:
+                    structured_data["metadata_status"] = "partial"
+                return structured_data
+
+            def enrich_paper_metadata(
+                    structured_data: Dict[str, Any],
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    parsed_data: Optional[Dict[str, Any]] = None
+            ) -> Dict[str, Any]:
+                """
+                Ensure paper metadata fields always exist.
+                Priority: parsed_data explicit fields > rag_metadata > existing value > empty string.
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+                parsed_data = parsed_data if isinstance(parsed_data, dict) else {}
+
+                def first_non_empty(*candidates) -> str:
+                    for candidate in candidates:
+                        normalized = normalize_text_field(candidate)
+                        if normalized:
+                            return normalized
+                    return ""
+
+                structured_data["title"] = first_non_empty(
+                    parsed_data.get("title"),
+                    parsed_data.get("Title"),
+                    rag_metadata.get("title"),
+                    rag_metadata.get("Title"),
+                    structured_data.get("title")
+                )
+                structured_data["author"] = first_non_empty(
+                    parsed_data.get("author"),
+                    parsed_data.get("authors"),
+                    parsed_data.get("Author"),
+                    parsed_data.get("Authors"),
+                    rag_metadata.get("author"),
+                    rag_metadata.get("authors"),
+                    rag_metadata.get("Author"),
+                    rag_metadata.get("Authors"),
+                    structured_data.get("author")
+                )
+                structured_data["abstract"] = first_non_empty(
+                    parsed_data.get("abstract"),
+                    parsed_data.get("Abstract"),
+                    rag_metadata.get("abstract"),
+                    rag_metadata.get("Abstract"),
+                    structured_data.get("abstract")
+                )
+                structured_data["journal"] = first_non_empty(
+                    parsed_data.get("journal"),
+                    parsed_data.get("Journal"),
+                    rag_metadata.get("journal"),
+                    rag_metadata.get("Journal"),
+                    structured_data.get("journal")
+                )
+
+                structured_data["doi"] = first_non_empty(
+                    parsed_data.get("doi"),
+                    parsed_data.get("DOI"),
+                    rag_metadata.get("doi"),
+                    rag_metadata.get("DOI"),
+                    structured_data.get("doi")
+                )
+                return structured_data
+
+            def parse_answer_to_structured_data(answer_text: str, file_path: str, rag_metadata: dict = None) -> Dict[
+                str, str]:
                 """Parse the AI JSON response into structured data"""
                 # Default structure
                 structured_data = {
@@ -7136,7 +7524,15 @@ CURRENT CHAPTER CONTENT:
                     "source_authority": "Unknown",
                     "task_relevance": "Unknown",
                     "information_richness": "Unknown",
-                    "core_content": "Unknown"
+                    "core_content": "Unknown",
+                    "title": "",
+                    "author": "",
+                    "abstract": "",
+                    "journal": "",
+                    "doi": "",
+                    "metadata_status": "missing",
+                    "metadata_source": "",
+                    "missing_fields": []
                 }
 
                 # # 如果有RAG元数据，保存到structured_data中
@@ -7144,6 +7540,13 @@ CURRENT CHAPTER CONTENT:
                 #     structured_data["rag_metadata"] = rag_metadata
 
                 if not answer_text:
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    structured_data["doi"] = normalize_text_field(structured_data.get("doi"))
+                    if not structured_data["doi"]:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False) if rag_metadata else "")
+                    summarize_metadata_status(structured_data)
+                    if rag_metadata and any(normalize_text_field(rag_metadata.get(k)) for k in ["title", "authors", "journal", "doi"]):
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 try:
@@ -7179,18 +7582,123 @@ CURRENT CHAPTER CONTENT:
                             "core_content": parsed_data.get("core_content", "Unknown"),
                             "information_richness": parsed_data.get("information_richness", "Unknown")
                         })
+                        enrich_paper_metadata(
+                            structured_data,
+                            rag_metadata=rag_metadata,
+                            parsed_data=parsed_data
+                        )
+                        structured_data["metadata_source"] = "llm"
+                    else:
+                        enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
 
+                    # DOI completion (from text/rag if needed)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+
+                    # Crossref backfill by DOI
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                structured_data["metadata_source"] = "crossref"
+
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
 
                 except json.JSONDecodeError as e:
                     # If JSON parsing fails, return default with error info
                     structured_data[
                         "core_content"] = f"JSON parsing error: {str(e)}. Raw response: {answer_text[:200]}..."
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                        structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                    doi = normalize_text_field(structured_data.get("doi"))
+                    if doi:
+                        crossref_meta = fetch_crossref_metadata(doi)
+                        if crossref_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                            structured_data["metadata_source"] = "crossref"
+                    summarize_metadata_status(structured_data)
+                    if not normalize_text_field(structured_data.get("metadata_source")) and rag_metadata:
+                        structured_data["metadata_source"] = "rag_metadata"
                     return structured_data
                 except Exception as e:
                     # Handle any other parsing errors
                     structured_data["core_content"] = f"Parsing error: {str(e)}"
+                    enrich_paper_metadata(structured_data, rag_metadata=rag_metadata)
+                    if not normalize_text_field(structured_data.get("doi")):
+                        structured_data["doi"] = extract_doi_from_text(answer_text)
+                    summarize_metadata_status(structured_data)
                     return structured_data
+
+            def apply_external_metadata_backfill(
+                    structured_data: Dict[str, Any],
+                    answer_text: str = "",
+                    rag_metadata: Optional[Dict[str, Any]] = None,
+                    file_content: str = ""
+            ) -> Dict[str, Any]:
+                """
+                Second-stage metadata completion:
+                1) recover DOI
+                2) Crossref
+                3) OpenAlex
+                4) local abstract extraction from content
+                """
+                rag_metadata = rag_metadata if isinstance(rag_metadata, dict) else {}
+
+                if not normalize_text_field(structured_data.get("doi")):
+                    structured_data["doi"] = extract_doi_from_text(answer_text)
+                if not normalize_text_field(structured_data.get("doi")) and rag_metadata:
+                    structured_data["doi"] = extract_doi_from_text(json.dumps(rag_metadata, ensure_ascii=False))
+                if not normalize_text_field(structured_data.get("doi")) and file_content:
+                    structured_data["doi"] = extract_doi_from_text(file_content)
+
+                doi = normalize_text_field(structured_data.get("doi"))
+                sources_used = []
+
+                if doi:
+                    crossref_meta = fetch_crossref_metadata(doi)
+                    if crossref_meta:
+                        for field_name in ["title", "author", "abstract", "journal"]:
+                            if not normalize_text_field(structured_data.get(field_name)):
+                                structured_data[field_name] = normalize_text_field(crossref_meta.get(field_name))
+                        if any(normalize_text_field(crossref_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                            sources_used.append("crossref")
+
+                    # OpenAlex is especially useful when Crossref lacks abstract.
+                    if not normalize_text_field(structured_data.get("abstract")) or not normalize_text_field(structured_data.get("author")):
+                        openalex_meta = fetch_openalex_metadata(doi)
+                        if openalex_meta:
+                            for field_name in ["title", "author", "abstract", "journal"]:
+                                if not normalize_text_field(structured_data.get(field_name)):
+                                    structured_data[field_name] = normalize_text_field(openalex_meta.get(field_name))
+                            if any(normalize_text_field(openalex_meta.get(f)) for f in ["title", "author", "abstract", "journal"]):
+                                sources_used.append("openalex")
+
+                # Final fallback for abstract: extract from the saved content itself.
+                if not normalize_text_field(structured_data.get("abstract")) and file_content:
+                    extracted_abstract = extract_abstract_from_content(file_content)
+                    if extracted_abstract:
+                        structured_data["abstract"] = extracted_abstract
+                        sources_used.append("content_extract")
+
+                if sources_used:
+                    structured_data["metadata_source"] = "+".join(dict.fromkeys(sources_used))
+
+                summarize_metadata_status(structured_data)
+                return structured_data
 
             # Transform results into the desired format
             structured_results = []
@@ -7226,7 +7734,11 @@ CURRENT CHAPTER CONTENT:
                         "source_authority": "Processing failed",
                         "task_relevance": "Processing failed",
                         "information_richness": "Unknown",
-                        "core_content": f"Error: {result.get('error', 'Unknown error')}"
+                        "core_content": f"Error: {result.get('error', 'Unknown error')}",
+                        "title": "",
+                        "author": "",
+                        "abstract": "",
+                        "journal": ""
                     })
 
             # Save structured results to JSON file
@@ -7315,6 +7827,12 @@ CURRENT CHAPTER CONTENT:
             other_files = []
 
             for file_data in existing_data.values():
+                # Ensure old historical records also carry required paper metadata fields
+                enrich_paper_metadata(
+                    file_data,
+                    rag_metadata=file_data.get("rag_metadata"),
+                    parsed_data=file_data
+                )
                 file_path = file_data.get('file_path', '')
                 if 'user_uploads' in file_path or file_path.startswith('./user_uploads/'):
                     user_uploaded_files.append(file_data)
@@ -7371,13 +7889,21 @@ CURRENT CHAPTER CONTENT:
             tasks: List of task dictionaries containing:
                 - file_path: Relative path to the file (relative to workspace root) to read
                 - question: Question to ask about this file
-            model: AI model to use for generating answers
+            model: AI model to use for generating answers (defaults to MODEL_NAME from config)
             temperature: Creativity level for the AI response (0-1)
             max_tokens: Maximum tokens for the AI response
             max_workers: Maximum number of concurrent model API requests
         """
         try:
             logger.info(f"我现在开始调用document_qa了：{tasks}")
+
+            # 获取自定义LLM配置
+            model_config = get_config().get_custom_llm_config()
+            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
+            model_name = model or model_config.get('model') or os.getenv('MODEL_NAME', '')
+            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
+            model_timeout = model_config.get('timeout', 180)
+            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
 
             # 处理单个任务
             def process_single_task(task: Dict) -> Dict:
@@ -7405,15 +7931,7 @@ CURRENT CHAPTER CONTENT:
                     "CONTEXT:\n{context}"
                 ).format(context=content)
 
-                # 3. 调用大模型API（使用requests.post直接调用，与document_extract一致）
-                # Get model URL and token from config
-                config = get_config()
-                model_config = config.get_custom_llm_config()
-                
-                model_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-                model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-                headers = {'Content-Type': 'application/json', 'csb-token': model_token}
-                
+                # 3. 调用自定义大模型API
                 try:
                     # Add retry logic for AI model call
                     max_retries = 5
@@ -7422,10 +7940,10 @@ CURRENT CHAPTER CONTENT:
                     for attempt in range(max_retries):
                         try:
                             response = requests.post(
-                                url=model_url,
+                                url=PANGU_URL,
                                 headers=headers,
                                 json={
-                                    "model": model_config.get('model', model),
+                                    "model": model_name,
                                     "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
                                     "messages": [
                                         {"role": "system", "content": system_prompt},
@@ -10711,7 +11229,15 @@ CURRENT CHAPTER CONTENT:
             'sortBy': 'submittedDate',
             'sortOrder': 'descending'
         }
-        response = requests.get(BASE_URL, params=params, verify=False, proxies=proxy)
+        request_timeout = int(os.environ.get("ARXIV_SEARCH_TIMEOUT_SECONDS", "30"))
+        response = requests.get(
+            BASE_URL,
+            params=params,
+            verify=False,
+            proxies=proxy,
+            timeout=request_timeout
+        )
+        response.raise_for_status()
         feed = feedparser.parse(response.content)
         papers = []
         for entry in feed.entries:
