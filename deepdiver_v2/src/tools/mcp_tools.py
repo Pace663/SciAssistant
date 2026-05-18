@@ -3653,6 +3653,24 @@ class MCPTools:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
 
+                # # 拼接完整内容用于 Metadata 段的整体匹配（DOI / OBS Path 等）
+                # content = ''.join(lines)
+                #
+                # # 【新增】优先从 Metadata 部分提取 DOI（针对 RAG 文件）
+                # # 检查是否有 Metadata 部分（RAG 和 rag_document_saver 保存的文件格式）
+                # doi_match = re.search(r'-\s*\*\*DOI\*\*:\s*(10\.\d+/[^\s\n]+)', content)
+                # if doi_match:
+                #     doi = doi_match.group(1).strip()
+                #     url_source = f"https://doi.org/{doi}"
+                #     logger.info(f"[METADATA_DOI] 从 Metadata 提取 DOI: {url_source}")
+                #
+                # # 【新增】如果有 OBS Path，标记为 RAG 来源
+                # if url_source == "Unknown URL":
+                #     obs_match = re.search(r'-\s*\*\*OBS Path\*\*:\s*(.+)', content)
+                #     if obs_match:
+                #         url_source = "RAG知识库"
+                #         logger.info(f"[METADATA_OBS] 检测到 OBS Path，标记为 RAG 来源")
+                
                 # 改进标题提取逻辑
                 for i, line in enumerate(lines[:30]):  # 检查更多行
                     line = line.strip()
@@ -3679,20 +3697,6 @@ class MCPTools:
                         title = re.sub(r'<[^>]+>', '', title).strip()
                         logger.info(f"提取到标题 (行{i + 1}): {title[:50]}...")
                         break
-                    # # 【新增】优先从 Metadata 部分提取 DOI（针对 RAG 文件）
-                    # # 检查是否有 Metadata 部分（RAG 和 rag_document_saver 保存的文件格式）
-                    # doi_match = re.search(r'-\s*\*\*DOI\*\*:\s*(10\.\d+/[^\s\n]+)', content)
-                    # if doi_match:
-                    #     doi = doi_match.group(1).strip()
-                    #     url_source = f"https://doi.org/{doi}"
-                    #     logger.info(f"[METADATA_DOI] 从 Metadata 提取 DOI: {url_source}")
-                    #
-                    # # 【新增】如果有 OBS Path，标记为 RAG 来源
-                    # if url_source == "Unknown URL":
-                    #     obs_match = re.search(r'-\s*\*\*OBS Path\*\*:\s*(.+)', content)
-                    #     if obs_match:
-                    #         url_source = "RAG知识库"
-                    #         logger.info(f"[METADATA_OBS] 检测到 OBS Path，标记为 RAG 来源")
                     
                     # 处理普通标题（不包含http）
                     if line and 10 <= len(line) <= 200:
@@ -4798,7 +4802,7 @@ class MCPTools:
             logger.info(f"将生成 {len(reference_numbers)} 个参考文献条目（包含所有分析的有效文献）")
 
             # # 构建引用列表 - 分离 RAG 来源、用户文件和其他文件
-            # rag_references = []  # RAG 知识库引用
+            rag_references = []  # RAG 知识库引用
             user_file_references = []  # 用户文件引用
             other_references = []  # 其他引用
 
