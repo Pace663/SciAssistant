@@ -584,6 +584,8 @@ For each function call, return a JSON object placed within the [unused11][unused
 
                 iteration += 1
                 self.logger.info(f"Writing iteration {iteration}")
+                # 重置连续错误计数器（每个新迭代都是新的机会）
+                self._consecutive_errors = 0
 
                 try:
                     # Get LLM response (reasoning + potential tool calls) with retry
@@ -643,6 +645,12 @@ For each function call, return a JSON object placed within the [unused11][unused
                         if len(tool_call_str) > 0:
                             try:
                                 tool_calls = json.loads(tool_call_str[0])
+                                # 防护：JSON 解析结果可能是 null（None）
+                                if tool_calls is None:
+                                    return []
+                                if not isinstance(tool_calls, list):
+                                    # 单个对象转为列表统一处理
+                                    tool_calls = [tool_calls]
                             except:
                                 return []
                         else:
@@ -661,11 +669,11 @@ For each function call, return a JSON object placed within the [unused11][unused
                     if len(tool_calls) == 0:
                         self.logger.warning(f"[工具调用] 第{iteration}次迭代未解析到任何工具调用")
                         # 记录原始内容的前500字符用于调试
-                        content_preview = assistant_message["content"][:500] if assistant_message.get("content") else "None"
+                        content_preview = str(assistant_message.get("content") or "")[:500] or "None"
                         self.logger.debug(f"[工具调用] 原始响应内容预览: {content_preview}")
                         
                         # 智能检测：如果Reasoning中提到section_writer但未成功调用，立即重试
-                        content = assistant_message.get("content", "")
+                        content = assistant_message.get("content") or ""
                         has_tool_marker = "[unused11]" in content and "[unused12]" in content
                         mentions_section_writer = "section_writer" in content
                         
@@ -851,18 +859,40 @@ For each function call, return a JSON object placed within the [unused11][unused
 
                     # If no tool calls, encourage continued writing
                     if len(tool_calls) == 0:
-                        # Add follow-up prompt to encourage action or completion
-                        followup_prompt = (
-                            "Continue your writing process. If you need to research more, use available tools. "
-                            "If you need to write or edit content, use file operations. "
-                            "If your writing is complete and meets requirements, call writer_subjective_task_done. /no_think"
-                        )
+                        # 上下文感知的引导提示，明确告知期望的下一步动作
+                        if not self._has_merged_final_report:
+                            if self._written_chapters:
+                                chapter_hint = f"已写完第{sorted(self._written_chapters)}章，请继续写第{self._expected_next_chapter}章"
+                            else:
+                                chapter_hint = "还没有完成任何章节"
+                            followup_prompt = (
+                                f"你的响应中没有工具调用。{chapter_hint}。\n"
+                                "请使用以下格式调用合适的工具：\n"
+                                "- 写下一章：调用 section_writer\n"
+                                "- 全部写完：调用 concat_section_files\n"
+                                "格式：[unused11][{\"name\": \"工具名\", \"arguments\": {...}}][unused12] /no_think"
+                            )
+                        else:
+                            followup_prompt = "所有章节已合并，请调用 writer_subjective_task_done 完成任务。 /no_think"
                         conversation_history.append({"role": "user", "content": followup_prompt})
 
                 except Exception as e:
                     error_msg = f"Error in writing iteration {iteration}: {e}"
                     self.log_error(iteration, error_msg)
-                    break
+                    # 不直接放弃，尝试重试当前迭代（最多连续失败3次）
+                    self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
+                    if self._consecutive_errors <= 3:
+                        retry_prompt = (
+                            f"An error occurred: {e}. "
+                            "Please continue your writing process. "
+                            "If you were about to call a tool, please use the correct format: "
+                            "[unused11][{\"name\": \"tool_name\", \"arguments\": {...}}][unused12] /no_think"
+                        )
+                        conversation_history.append({"role": "user", "content": retry_prompt})
+                        continue
+                    else:
+                        self.logger.error(f"连续失败{self._consecutive_errors}次，放弃当前写作任务")
+                        break
 
             # 【降级兜底A】writer agent 异常退出或超时时，尝试自动合并已有的 part_*.md
             # 采用分级降级策略：根据章节数决定是否合并以及如何标注

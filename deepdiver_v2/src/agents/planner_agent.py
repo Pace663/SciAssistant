@@ -1199,6 +1199,11 @@ For each function call, return a JSON object placed within the [unused11][unused
                         if len(tool_call_str) > 0:
                             try:
                                 tool_calls = json.loads(tool_call_str[0].strip())
+                                # 防护：JSON 解析结果可能是 null（None）
+                                if tool_calls is None:
+                                    return []
+                                if not isinstance(tool_calls, list):
+                                    tool_calls = [tool_calls]
                             except:
                                 return []
                         else:
