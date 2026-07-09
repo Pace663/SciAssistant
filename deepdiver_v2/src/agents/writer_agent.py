@@ -179,13 +179,16 @@ class WriterAgent(BaseAgent):
             language_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
 **You MUST write the ENTIRE article in Chinese (中文).**
 This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
+**DO NOT use English, Korean (한국어), Japanese (日本語), or any other language for explanatory text.**
+Technical terms may remain in English, but all explanatory text MUST be in Chinese.
 **所有内容必须使用中文撰写，包括：大纲生成、章节内容、摘要和最终文章。**"""
         else:
             language_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
 **You MUST write the ENTIRE article in English.**
 This rule applies to ALL outputs including: outline generation, chapter content, summaries, and the final article.
-**DO NOT use Chinese characters in the article content.**"""
-        
+**DO NOT use Chinese (中文), Korean (한국어), Japanese (日本語), or any other language.**
+All content including headings, body text, tables, and citations MUST be in English only."""
+
         if is_phase2:
             # Phase 2: 用户已确认大纲，完全跳过大纲生成步骤
             system_prompt_template = f"""You are a professional writing master. The user has already confirmed an outline. Your task is to classify files into sections based on the PROVIDED outline, and iteratively call section_writer tool to create comprehensive content.

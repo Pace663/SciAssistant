@@ -3931,6 +3931,32 @@ class MCPTools:
                 Keywords:
                 [Keyword1; Keyword2; Keyword3]
                 """
+                prompt = f"""Please carefully read the following article content and accurately extract or generate the title, abstract, and keywords.
+
+                Article Content:
+                {article_content}
+
+                Important Notes:
+                - Your task is to "extract" and "summarize", NOT to "create".
+                - The abstract must be entirely based on the article content, and must not include information not mentioned in the article.
+
+                Specific Requirements:
+                1. Language Requirement: {lang_instruction}
+                2. Title: Accurately reflect the article's topic. Prioritize extracting the original title of the article.
+                3. Abstract (Key Point):
+                      - Prioritize extracting the original Abstract section of the article (if available).
+                      - If there is no original abstract, read the full text carefully and generate a structured abstract.
+                      - The abstract should implicitly contain the following four layers (organize content in this order, but DO NOT include layer headings):
+                         * Layer 1: Background and Objectives
+                         * Layer 2: Methods and Process
+                         * Layer 3: Main Results and Findings
+                         * Layer 4: Conclusions and Significance
+                      - Explicitly Prohibited: Do NOT use 【】, (), or other symbols to mark sections. Do NOT include heading text such as "Background and Objectives", "Methods and Process", "Main Results and Findings", "Conclusions and Significance".
+                      - Abstract length should be around 300 words. Must be specific and accurate, avoid vague generalities.
+                4. Keywords: Extract 5-8 keywords that best represent the core themes of the article, separated by semicolons (;).
+
+                {format_instruction}
+                """
             else:
                 lang_instruction = "文章内容包含中文，请务必用中文生成。"
                 format_instruction = """
@@ -3945,9 +3971,7 @@ class MCPTools:
                 关键词：
                 [关键词1; 关键词2; 关键词3]
                 """
-
-            # 构建生成标题、摘要和关键词的prompt - 改进为更明确的格式
-            prompt = f"""请仔细阅读以下文章内容，准确提取或生成标题、摘要和关键词。
+                prompt = f"""请仔细阅读以下文章内容，准确提取或生成标题、摘要和关键词。
 
                 文章内容：
                 {article_content}
@@ -3964,7 +3988,7 @@ class MCPTools:
                       - 如果没有原有摘要，请仔细阅读全文，生成一个结构化的摘要。
                       - 摘要应隐含以下四个层次（按此顺序组织内容，但禁止出现层次标题）：
                          * 第一层：背景与目的
-                         * 第二层：方法与过程  
+                         * 第二层：方法与过程
                          * 第三层：主要结果与发现
                          * 第四层：结论与意义
                       - 明确禁止：禁止使用【】、（）等符号标注章节，禁止出现"背景与目的"、"方法与过程"、"主要结果与发现"、"结论与意义"等层次标题文字。
@@ -6570,6 +6594,21 @@ OUTLINE TO ORGANIZE CONTENT:
             if max_tokens is None:
                 max_tokens = model_config.get('max_tokens', 8192)
 
+            # ============================================================
+            # LANGUAGE DETECTION: explicitly detect query language at the
+            # Python level instead of relying on the LLM to "detect" it.
+            # This is the PRIMARY fix for the bug where English queries
+            # produce Chinese table content/headings and occasional Korean.
+            # ============================================================
+            import re as _re_lang
+            _query_zh_count = len(_re_lang.findall(r'[一-鿿]', user_query or ''))
+            is_english_query = (_query_zh_count == 0)
+
+            logger.info(
+                f"[section_writer] Language detection: query_zh_count={_query_zh_count}, "
+                f"is_english_query={is_english_query}"
+            )
+
             key_files_dict = {}
             # Create full path relative to workspace using config
             analysis_path = storage_config.get('document_analysis_path', './doc_analysis')
@@ -6610,8 +6649,25 @@ OUTLINE TO ORGANIZE CONTENT:
                         doc_time = file_info.get('doc_time', 'Not specified')
                         source_authority = file_info.get('source_authority', 'Not specified')
                         task_relevance = file_info.get('task_relevance', 'Not specified')
-                        # 开始组装这些字段的值
-                        prompt_files += f"\n[webpaeg{index} begin]网页时间: {doc_time}|||网页权威性：{source_authority}|||网页相关性：{task_relevance}|||网页内容：{file_content}[webpaeg{index} end]"
+                        # Build metadata labels in the SAME language as the query
+                        if is_english_query:
+                            prompt_files += (
+                                f"\n[webpage{index} begin]"
+                                f"Web Time: {doc_time}|||"
+                                f"Source Authority: {source_authority}|||"
+                                f"Task Relevance: {task_relevance}|||"
+                                f"Web Content: {file_content}"
+                                f"[webpage{index} end]"
+                            )
+                        else:
+                            prompt_files += (
+                                f"\n[webpage{index} begin]"
+                                f"网页时间: {doc_time}|||"
+                                f"网页权威性：{source_authority}|||"
+                                f"网页相关性：{task_relevance}|||"
+                                f"网页内容：{file_content}"
+                                f"[webpage{index} end]"
+                            )
 
             # 设计system prompt
             # 检查是否有用户上传的文件
@@ -6636,22 +6692,97 @@ OUTLINE TO ORGANIZE CONTENT:
 - **IMPORTANT**: When user-uploaded files contain relevant information, failure to cite them will result in them not appearing in the references section, which is incorrect. You MUST ensure every user-uploaded file that provides relevant information receives citations.
 
 """
+            else:
+                user_file_count = 0
+
+            # --- Build language-conditional prompt sections ---
+            if is_english_query:
+                language_instruction_section_writer = (
+                    "**The user's query is in English. You MUST write this ENTIRE chapter in English.**\n"
+                    "This includes all headings, body text, table titles, table content, and citations.\n"
+                    "**DO NOT use Chinese, Korean, or any other language.** "
+                    "Technical terms may remain in their original form, "
+                    "but all explanatory text MUST be in English."
+                )
+                table_instruction_section_writer = (
+                    "**📊 TABLE USAGE STRATEGY (MUST FOLLOW):**\n"
+                    "- **Extract and plan table data**: Before writing, extract the interrelated data from the provided web information and plan out tables. When there are comparisons of indicators, dataset sizes, ablation experiments, enumerations of hyperparameters, or any structured data, plan to present them in table form.\n"
+                    "- **Proactively use tables**: Do NOT wait for data to \"perfectly fit\" a table format. Whenever you encounter 2+ items being compared, contrasted, or listed with multiple attributes, USE A TABLE.\n"
+                    "- **Applicable scenarios include but are not limited to**: data comparison, technical parameter listing, feature/advantage/disadvantage contrast, chronological events, experimental results, statistical summaries, classification/categorization, multi-dimensional analysis, and policy/regulation comparisons.\n"
+                    '- **Table title format**: Every table MUST have a title line above it in the format "**Table X: Table Title**" (English), where X is the sequential table number within the chapter (starting from 1). For example: "**Table 1: Performance Comparison of Different Methods**".\n'
+                    "- **Minimum expectation**: Each chapter (except Abstract/Introduction) should contain at least 1-2 tables when the source materials contain comparable or structured data. Actively look for opportunities to present information as tables.\n"
+                    "- **Table quality**: Tables must have clear headers, consistent formatting, and meaningful content. Do not create tables with only 1 column or 1 data row."
+                )
+                heading_instruction_section_writer = (
+                    "Other points to note:\n"
+                    "- If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.\n"
+                    "- CONTENT LENGTH: Each section should contain approximately 2500 words to ensure comprehensive coverage.\n"
+                    "- **CRITICAL HEADING FORMAT RULES:**\n"
+                    '  * **Level 1 chapter headings**: Use Markdown "##" format, e.g. "## 2. Molecular Mechanisms"\n'
+                    '  * **Level 2 sub-headings**: MUST be **plain text format** without any markdown symbols (do NOT use ###, **, *, etc.)\n'
+                    '    - **WRONG format**: "### 2.1 Title" or "**### 2.1 Title**" or "**2.1 Title**" (contains markdown symbols)\n'
+                    '    - **CORRECT format**: "2.1 Title" (plain text, only number + space + title)\n'
+                    "  * If sub-headings in current_chapter_outline contain markdown symbols, you MUST **remove those symbols** and keep only plain text format.\n"
+                    "  * When heading symbols in current_chapter_outline differ from overall_outline, follow overall_outline for consistency.\n"
+                    "  * This is CRITICAL for PDF table of contents recognition.\n"
+                    "- Note that in Chapter 1, omit any mention of research objectives, methodology, or procedural details."
+                )
+                language_rules_section_writer = (
+                    "**🌐 CRITICAL LANGUAGE RULES (MUST FOLLOW):**\n"
+                    "  * **English query → Write ENTIRE chapter in English**, including title, all headings, and all content.\n"
+                    "  * This rule applies to Chapter 1's title generation as well - the title MUST be in English.\n"
+                    "  * **DO NOT use Chinese (中文), Korean (한국어), Japanese (日本語), or any other language.**\n"
+                    "  * Technical terms may remain in their original form (e.g., 'PINK1/Parkin pathway'), but all explanatory text must be in English."
+                )
+            else:
+                language_instruction_section_writer = (
+                    "**The user's query contains Chinese. You MUST write this ENTIRE chapter in Chinese (中文).**\n"
+                    "This includes all headings, body text, table titles, table content, and citations.\n"
+                    "**DO NOT use English, Korean, or any other language for explanatory text.** "
+                    "Technical terms may remain in English (e.g., 'PINK1/Parkin pathway'), "
+                    "but all explanatory text MUST be in Chinese."
+                )
+                table_instruction_section_writer = (
+                    "**📊 表格使用策略（必须遵循）：**\n"
+                    "- **提取并规划表格数据**：在写作前，从提供的网页信息中提取相互关联的数据并规划表格。当有指标对比、数据集规模、消融实验、超参数枚举或任何结构化数据时，务必使用表格呈现。\n"
+                    '- **主动使用表格**：不要等待数据“完美契合”表格格式。每当遇到2个以上项目被比较、对比或列出多个属性时，请使用表格。\n'
+                    "- **适用场景包括但不限于**：数据对比、技术参数列举、特性/优势/劣势对比、时间线事件、实验结果、统计摘要、分类/归类、多维分析和政策/法规对比。\n"
+                    '- **表格标题格式**：每个表格上方必须有一行标题，格式为"**表X: 表格标题**"，其中X是本章内表格的序号（从1开始）。例如："**表1: 不同方法的性能对比**"。\n'
+                    "- **最低期望**：当源材料包含可比或结构化数据时，每个章节（摘要/引言除外）应至少包含1-2个表格。积极寻找以表格形式呈现信息的机会。\n"
+                    "- **表格质量**：表格必须有清晰的表头、一致的格式和有意义的内容。不要创建只有1列或1行数据的表格。"
+                )
+                heading_instruction_section_writer = (
+                    "其他注意事项：\n"
+                    "- 如果第一章是**摘要**或**引言**，不要包含子标题（二级或更细的要点）——直接在二级标题下开始内容。\n"
+                    "- 内容长度：每个章节应包含约2500字，以确保全面覆盖。\n"
+                    "- **关键标题格式规则：**\n"
+                    '  * **一级章节标题**：使用 Markdown "##" 格式，如 "## 2. 分子机制"\n'
+                    '  * **二级子标题**：必须是**纯文本格式**，不能使用任何markdown符号（不要用 ###、**、* 等）\n'
+                    '    - **错误格式**："### 2.1 标题" 或 "**### 2.1 标题**" 或 "**2.1 标题**"（包含markdown符号）\n'
+                    '    - **正确格式**："2.1 标题"（纯文本，只有数字+空格+标题）\n'
+                    "  * 如果 current_chapter_outline 中的子标题包含markdown符号，你必须**移除这些符号**，只保留纯文本格式。\n"
+                    "  * 当 current_chapter_outline 中的标题符号与 overall_outline 不一致时，以 overall_outline 的标题符号为准，保持全文符号一致性。\n"
+                    "  * 这对于PDF目录识别至关重要。\n"
+                    "- 注意在第一章中，省略任何关于研究目标、方法论或程序细节的提及。"
+                )
+                language_rules_section_writer = (
+                    "**🌐 关键语言规则（必须遵循）：**\n"
+                    "  * **中文查询 → 整章用中文撰写**，包括标题、所有标题和所有内容。\n"
+                    "  * 此规则也适用于第一章的标题生成——标题必须与查询语言一致。\n"
+                    "  * **不要使用英文、韩文、日文或其他语言进行解释性文字。**\n"
+                    "  * 技术术语可以保留英文（例如 'PINK1/Parkin pathway'），但所有解释性文字必须是中文。"
+                )
 
             system_prompt = f"""You are a writing master. Next, you will receive web page information, user questions, and the structure of the current chapter. You need to integrate the user's questions with the provided web content and write the chapter based on its given structure, and plan out tables based on the content of the current chapter to make the content more comprehensive and intuitive. Additionally, an overall outline and summaries of previously completed chapters will be provided for reference to avoid repetition or contradictions and ensure logical consistency within the broader framework. Specific requirements will be detailed below.
 
 ## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-**Detect the language of the user's query and write this chapter accordingly:**
-- **English query → Write this chapter in English**
-- **Chinese query (中文) → Write this chapter in Chinese (中文撰写)**
-- **Mixed Chinese-English query → Write this chapter in Chinese (中文撰写)**
-This rule applies to ALL chapter content including: headings, body text, tables, and citations.
-**IMPORTANT**: Maintain language consistency with other chapters. If previous chapters were written in Chinese, continue in Chinese. If in English, continue in English.
+{language_instruction_section_writer}
 
 {user_file_priority_note}When drafting the current chapter content, strictly comply with the following requirements:
 - ⚠️ **CRITICAL CITATION REQUIREMENT - CITE ALL FILES**: In the web page information I gave you, each result is in the format of [webpage X begin]...[webpage X end], where X represents the numerical index of each article. **YOU MUST cite ALL provided webpages at least once in your chapter**. This is NON-NEGOTIABLE. Please cite the context at the end of the sentence when appropriate. Please cite the context in the corresponding part of the answer in the format of the reference number [X]. If a sentence comes from multiple contexts, please list all relevant reference numbers, such as [3][5]. Remember not to collect the references at the end and return the reference numbers, but list them in the corresponding part of the answer. **MANDATORY VERIFICATION**: Before submitting your chapter, verify that you have cited EVERY webpage (1 through {len(key_files) if key_files else 0}) at least once. Count your citations: webpage 1 [✓/✗], webpage 2 [✓/✗], etc. If any webpage is not cited, GO BACK and find appropriate places to cite it. **SPECIAL EMPHASIS**: User-uploaded files (typically webpages 1-{user_file_count if has_user_files else 0}) MUST be cited multiple times (3-5 times each) when they contain relevant information.
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
 - You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
-- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work. 
+- You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work.
 - **ABSOLUTE OUTLINE LOCK**: You MUST reproduce all heading lines from CURRENT CHAPTER OUTLINE in the exact same order (same numbering, same wording). Do NOT add, delete, or rename any heading line. Do NOT insert extra heading levels.
 - Be careful to ensure that the narrative content is highly relevant and does not contain any common sense errors, note that although you are asked to ensure the richness of information when writing, you must ensure that the content you write is highly relevant and that the context is logically coherent and readable.
 - Proceeding to explain the roles of other specified fields:
@@ -6660,32 +6791,11 @@ This rule applies to ALL chapter content including: headings, body text, tables,
     * overall_outline: The purpose of giving an overall outline is to let you understand the summary of the article and avoid content inconsistent with other parts during your writing. In short, focus on writing the current chapter.
     * task_content: The task_content may provide the requirements for writing the current chapter as well as prompts for what to avoid. You can refer to this content when drafting.
 
-**📊 TABLE USAGE STRATEGY (MUST FOLLOW):**
-- **Extract and plan table data**: Before writing, extract the interrelated data from the provided web information and plan out tables. When there are comparisons of indicators, dataset sizes, ablation experiments, enumerations of hyperparameters, or any structured data, plan to present them in table form.
-- **Proactively use tables**: Do NOT wait for data to "perfectly fit" a table format. Whenever you encounter 2+ items being compared, contrasted, or listed with multiple attributes, USE A TABLE.
-- **Applicable scenarios include but are not limited to**: data comparison, technical parameter listing, feature/advantage/disadvantage contrast, chronological events, experimental results, statistical summaries, classification/categorization, multi-dimensional analysis, and policy/regulation comparisons.
-- **Table title format**: Every table MUST have a title line above it in the format "**表X: 表格标题**" (Chinese) or "**Table X: Table Title**" (English), where X is the sequential table number within the chapter (starting from 1). For example: "**表1: 不同方法的性能对比**" or "**Table 1: Performance Comparison of Different Methods**".
-- **Minimum expectation**: Each chapter (except Abstract/Introduction) should contain at least 1-2 tables when the source materials contain comparable or structured data. Actively look for opportunities to present information as tables.
-- **Table quality**: Tables must have clear headers, consistent formatting, and meaningful content. Do not create tables with only 1 column or 1 data row.
+{table_instruction_section_writer}
 
-Other points to note::
-- If the first chapter is an **Abstract** or **Introduction**, do not include subheadings (level-2 or finer bullet points)—begin the content directly under the level-1 heading.  
-- CONTENT LENGTH: Each section should contain approximately 2500 words to ensure comprehensive coverage.
-- **CRITICAL HEADING FORMAT RULES:**
-  * **Level 1 章节标题**: 使用 Markdown '##' 格式，如 "## 2. Molecular Mechanisms" 或 "## 2. 分子机制"
-  * **Level 2 子标题**: 必须是**纯文本格式**，不能使用任何markdown符号（不要用 ###、**、* 等）
-    - **错误格式**: "### 2.1 Title" 或 "**### 2.1 Title**" 或 "**2.1 Title**"（包含markdown符号）
-    - **正确格式**: "2.1 Title" 或 "2.1 标题"（纯文本，只有数字+空格+标题）
-  * 如果 current_chapter_outline 中的子标题包含markdown符号，你必须**移除这些符号**，只保留纯文本格式
-  * 当 current_chapter_outline 中的标题符号与 overall_outline 不一致时，以 overall_outline 的标题符号为准，保持全文符号一致性
-  * 这对于PDF目录识别至关重要
-- Note that in Chapter 1, omit any mention of research objectives, methodology, or procedural details.
-- **🌐 CRITICAL LANGUAGE RULES (MUST FOLLOW)**:
-  * **English query (no Chinese characters) → Write ENTIRE chapter in English**, including title, all headings, and all content.
-  * **Chinese query (contains ANY Chinese characters) → Write ENTIRE chapter in Chinese (中文)**, including title, all headings, and all content. Even if source materials are in English, translate and write in Chinese.
-  * **Mixed Chinese-English query → Write ENTIRE chapter in Chinese (中文)**.
-  * This rule applies to Chapter 1's title generation as well - the title MUST match the query language.
-  * Technical terms may remain in English (e.g., "PINK1/Parkin pathway"), but all explanatory text must follow the language rule.
+{heading_instruction_section_writer}
+
+{language_rules_section_writer}
 
 Strictly follow the following format for output:
 <chapter_content>xxx</chapter_content>

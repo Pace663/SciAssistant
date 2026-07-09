@@ -188,16 +188,27 @@ class InformationSeekerAgent(BaseAgent):
         from datetime import datetime
         current_date = datetime.now().strftime("%Y-%m-%d")
 
+        # Use pre-detected language flag to make EXPLICIT language instruction
+        _is_cn = getattr(self, '_is_chinese_query', True)
+        if _is_cn:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**你正在处理的是中文查询的任务，必须使用中文回复。**
+这条规则适用于所有输出：任务总结、研究发现、task_done报告等所有交付内容。
+**禁止使用英文、韩文、日文或其他语言生成解释性文字。**
+技术术语可以保留英文，但所有解释性文字必须使用中文。"""
+        else:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**You are handling an English-query task and MUST respond in English ONLY.**
+This rule applies to ALL outputs: task summaries, findings, and task_done reports.
+**DO NOT use Chinese, Korean, Japanese, or any other language.**
+Under NO circumstances should you produce Chinese text in your response.
+All reasoning, findings, and outputs MUST be in English exclusively."""
+
         system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
 
-        ## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-        **Detect the language of the user's query/task and respond accordingly:**
-        - **English query → Respond in English**
-        - **Chinese query (中文) → Respond in Chinese (中文回复)**
-        - **Mixed Chinese-English query → Respond in Chinese (中文回复)**
-        This rule applies to ALL outputs including: task summaries, findings, and any content in task_done reports.
+{lang_instruction}
 
-        **IMPORTANT - Current Date: {current_date}**
+**IMPORTANT - Current Date: {current_date}**
         When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
 
         Your role is to:

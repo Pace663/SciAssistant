@@ -99,14 +99,25 @@ class PlannerAgent(BaseAgent):
         """Build the system prompt for the planner agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
 
+        # Use pre-detected language flag to make EXPLICIT language instruction
+        _is_cn = getattr(self, '_is_chinese_query', False)
+        if _is_cn:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**你正在处理中文查询，必须使用中文回复。**
+这条规则适用于所有输出：任务规划、最终答案、摘要等任何交付给用户的内容。
+**禁止使用英文、韩文、日文或其他语言进行解释性文字。**
+技术术语可以保留英文，但所有解释性文字必须使用中文。"""
+        else:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**You are handling an English query and MUST respond in English ONLY.**
+This rule applies to ALL outputs: task planning, final answers, summaries, and any content delivered to the user.
+**DO NOT use Chinese, Korean, Japanese, or any other language.**
+Under NO circumstances should you produce Chinese text in your response.
+All reasoning, planning, and outputs MUST be in English exclusively."""
+
         auto_system_prompt_template = """# PlannerAgent: Multi-Agent Task Coordinator
 
-## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-**Detect the language of the user's query and respond accordingly:**
-- **English query → Respond in English**
-- **Chinese query (中文) → Respond in Chinese (中文回复)**
-- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
-This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+$lang_instruction
 
 **Role:** Analyze complex queries, first distinguish query type (long-form writing type/objective question type), then create structured plans, and coordinate specialized agents to deliver comprehensive solutions—call corresponding tools based on query type, and only invoke writer for long-form writing type queries.
 
@@ -190,14 +201,9 @@ $tool_schemas
 For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
-        writing_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+        writing_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator
 
-## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-**Detect the language of the user's query and respond accordingly:**
-- **English query → Respond in English**
-- **Chinese query (中文) → Respond in Chinese (中文回复)**
-- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
-This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+$lang_instruction
 
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
@@ -286,14 +292,9 @@ $tool_schemas
 For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
 [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
-        qa_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator  
+        qa_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator
 
-## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-**Detect the language of the user's query and respond accordingly:**
-- **English query → Respond in English**
-- **Chinese query (中文) → Respond in Chinese (中文回复)**
-- **Mixed Chinese-English query → Respond in Chinese (中文回复)**
-This rule applies to ALL outputs including: task planning, final answers, summaries, and any content delivered to the user.
+$lang_instruction
 
 **Role:** Analyze complex queries, create structured plans, and coordinate specialized agents to deliver comprehensive solutions.  
 
@@ -367,7 +368,7 @@ For each function call, return a JSON object placed within the [unused11][unused
             "qa": qa_system_prompt_template
         }
 
-        system_prompt = planner_mode_system_prompt_map[self.config.planner_mode].replace("$tool_schemas", tool_schemas_str)
+        system_prompt = planner_mode_system_prompt_map[self.config.planner_mode].replace("$tool_schemas", tool_schemas_str).replace("$lang_instruction", lang_instruction)
 
         return system_prompt
 
@@ -446,10 +447,12 @@ For each function call, return a JSON object placed within the [unused11][unused
                     # 【关键修复】传递取消令牌给子 Agent
                     if self._cancellation_token:
                         info_seeker.set_cancellation_token(self._cancellation_token)
+                    # 传递语言标志给子 Agent
+                    info_seeker._is_chinese_query = getattr(self, '_is_chinese_query', True)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 
-                    
+
                     # Execute the task
                     response = info_seeker.execute_task(task_input)
 
@@ -469,14 +472,14 @@ For each function call, return a JSON object placed within the [unused11][unused
                             "success": False,
                             "error": response.error,
                             "agent_name": response.agent_name
-                        }                    
-                    
+                        }
+
                     # Thread-safe result collection
                     with lock:
                         results.append(response_data)
-                    
+
                     return response_data
-                    
+
                 except Exception as e:
                     error_msg = f"Task processing failed: {str(e)}"
                     self.logger.error(error_msg)
@@ -591,6 +594,8 @@ For each function call, return a JSON object placed within the [unused11][unused
                     # 【关键修复】传递取消令牌给子 Agent
                     if self._cancellation_token:
                         info_seeker.set_cancellation_token(self._cancellation_token)
+                    # 传递语言标志给子 Agent
+                    info_seeker._is_chinese_query = getattr(self, '_is_chinese_query', True)
 
                     self.logger.info(f"Assigning task to InformationSeekerAgent: {task['task_content'][:8000]}...")
 

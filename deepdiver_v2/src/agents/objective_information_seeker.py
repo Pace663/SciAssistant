@@ -16,20 +16,20 @@ class InformationSeekerAgent(BaseAgent):
     thinks interleaved (reasoning -> action -> reasoning -> action),
     uses MCP tools to gather information, and returns structured results.
     """
-    
+
     def __init__(self, config: AgentConfig = None, shared_mcp_client=None):
         # Set default agent name if not specified
         if config is None:
             config = AgentConfig(agent_name="InformationSeekerAgent")
         elif config.agent_name == "base_agent":
             config.agent_name = "InformationSeekerAgent"
-            
+
         super().__init__(config, shared_mcp_client)
-    
+
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the ReAct agent"""
         tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
-        
+
         # Read search source preferences from environment variables
         use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
         use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
@@ -38,7 +38,7 @@ class InformationSeekerAgent(BaseAgent):
         use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'True').lower() == 'true'
         use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
-        
+
         # Get all available tools from MCP
         # Tool schemas have structure: {'type': 'function', 'function': {'name': '...', ...}}
         available_tools = []
@@ -48,7 +48,7 @@ class InformationSeekerAgent(BaseAgent):
                     available_tools.append(tool['function']['name'])
                 elif 'name' in tool:
                     available_tools.append(tool['name'])
-        
+
         # Define tool category patterns (only need to maintain this mapping when adding new sources)
         tool_category_patterns = {
             'websearch': ['batch_web_search', 'web_search'],
@@ -59,15 +59,15 @@ class InformationSeekerAgent(BaseAgent):
 			'rag': ['search_rag_knowledge', 'rag_knowledge'],
             # 'springer': ['springer']  # DISABLED
         }
-        
+
         # Dynamically filter tools based on environment variables
         enabled_tools = []
         disabled_tools = []
-        
+
         for tool_name in available_tools:
             tool_lower = tool_name.lower()
             is_enabled = False
-            
+
             # Check if tool belongs to any enabled category
             if use_websearch and any(pattern in tool_lower for pattern in tool_category_patterns['websearch']):
                 is_enabled = True
@@ -139,14 +139,25 @@ class InformationSeekerAgent(BaseAgent):
         from datetime import datetime
         current_date = datetime.now().strftime("%Y-%m-%d")
 
+        # Use pre-detected language flag to make EXPLICIT language instruction
+        _is_cn = getattr(self, '_is_chinese_query', True)
+        if _is_cn:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**你正在处理的是中文查询的任务，必须使用中文回复。**
+这条规则适用于所有输出：任务总结、研究发现、task_done报告等所有交付内容。
+**禁止使用英文、韩文、日文或其他语言生成解释性文字。**
+技术术语可以保留英文，但所有解释性文字必须使用中文。"""
+        else:
+            lang_instruction = """## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
+**You are handling an English-query task and MUST respond in English ONLY.**
+This rule applies to ALL outputs: task summaries, findings, and task_done reports.
+**DO NOT use Chinese, Korean, Japanese, or any other language.**
+Under NO circumstances should you produce Chinese text in your response.
+All reasoning, findings, and outputs MUST be in English exclusively."""
+
         system_prompt_template = f"""You are an Information Seeker Agent that follows the ReAct pattern (Reasoning + Acting).
 
-        ## 🌐 CRITICAL: Response Language Rules (MUST FOLLOW)
-        **Detect the language of the user's query/task and respond accordingly:**
-        - **English query → Respond in English**
-        - **Chinese query (中文) → Respond in Chinese (中文回复)**
-        - **Mixed Chinese-English query → Respond in Chinese (中文回复)**
-        This rule applies to ALL outputs including: task summaries, findings, and any content in task_done reports.
+{lang_instruction}
 
         **IMPORTANT - Current Date: {current_date}**
         When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
