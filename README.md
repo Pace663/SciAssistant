@@ -1,12 +1,12 @@
 
-##  项目简介
+## 项目简介
 
 SciAssistant 是一个基于大语言模型的智能研究助手系统，通过多智能体协作架构，帮助用户进行深度信息检索、文档分析和研究报告生成。
 
 ###  核心特点
 
 - **多智能体协作** - Planner、Information Seeker、Writer 三大智能体协同工作
-- **智能文档处理** - 本地文件库创建，支持 PDF、Word、txt等多种格式
+- **智能文档处理** - 本地文件库创建，支持 PDF、DOC、DOCX、TXT等多种格式
 - **深度信息检索** - 批量网络搜索、网页爬取
 - **专业报告生成** - 自动生成结构化研究报告，支持 Markdown 和 PDF 导出
 - **会话管理** - 多会话支持，历史记录追溯
@@ -22,13 +22,17 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 核心特性：
 * 智能体协同编排 - Planner、Information Seeker、Writer 三大智能体
 
-* 服务化封装 - RESTful API + WebSocket 实时通信
+* 服务化封装 - RESTful API + SSE 实时进度推送
 
 * 前后端一体 - Flask/FastAPI 后端 + 现代化 Web 前端
 
 * 支持用户管理、会话管理、文档处理
 
-  盘古DeepDiver-V2参考链接：https://ai.gitcode.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver
+盘古DeepDiver-V2参考链接(包含模型推理服务)：https://ai.gitcode.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver
+
+也可以下二选其一的模型推理服务：
+- 模型1：https://ai.gitcode.com/ascend-tribe/openPangu-R-72B-2512-Int8
+- 模型2：https://gitcode.com/ascend-tribe/openPangu-2.0-Infer
 
 ---
 
@@ -62,10 +66,10 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 
 ###  文档处理能力
 
-| 功能 | 说明 |
-|------|------|
-| **多格式支持** | PDF, Word,  TXT|
-| **文档库** | 用户专属文档空间，支持批量管理 |
+| 功能 | 说明               |
+|------|------------------|
+| **多格式支持** | PDF、DOC、DOCX、TXT |
+| **文档库** | 用户专属文档空间，支持批量管理  |
 
 ### 信息检索
 
@@ -99,9 +103,10 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 
 ### 环境要求
 
-- Python 3.8+
-- MySQL 5.7+ / 8.0+
-- 操作系统：Windows / Linux 
+- Python 3.10 或更高版本
+- MySQL 8.0+（初始化脚本使用了 MySQL 8.0 的排序规则）
+- 操作系统：Windows / Linux
+- 如需联网研究：对应的搜索和网页抓取服务凭据
 
 ### 安装
 
@@ -111,24 +116,27 @@ git clone <repository-url>
 cd SciAssistant
 
 # 2. 安装依赖
-pip install -r requirements.txt
+pip install -r deepdiver_v2/requirements.txt
 
 # 3. 配置环境变量
-cp config/env.template config/.env
-# 编辑 config/.env 文件，配置数据库和 API 密钥
+cp deepdiver_v2/env.template deepdiver_v2/config/.env
+# 编辑 deepdiver_v2/config/.env，配置模型、搜索和爬虫服务
 
 # 4. 初始化数据库
-mysql -u root -p < database/schema.sql
+mysql -u root -p -e "CREATE DATABASE chatai CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+mysql -u root -p chatai < chatAi/chatai.sql
 
 # 5. 启动 MCP 服务器
-python src/tools/mcp_server_standard.py --config src/tools/server_config.yaml
+python deepdiver_v2/src/tools/mcp_server_standard.py
 
 # 6. 启动 Flask Web API（用户管理、会话管理）
 python app.py
 
 # 7. 启动 PlannerAgent HTTP 服务器（智能体任务处理）
-python cli/a.py
+python deepdiver_v2/cli/a.py
 ```
+
+以上三个服务需要分别启动。前端页面位于 `chatAi/`，其中的请求路径使用 `/5000` 和 `/8000` 前缀；部署前端时，请通过 Nginx 或其他网关将这两个前缀分别反向代理到 Flask 的 `5000` 端口和 FastAPI 的 `8000` 端口；直接打开 HTML 文件不能替代该代理配置。
 
 
 
@@ -150,53 +158,32 @@ python cli/a.py
 
 ### 项目结构
 
-```
-SciAssistant
-
-chatAi/
-├── ai_chat.html               # 主页
-├── forgot-password.html       # 忘记密码
-├── login.html                 # 登录
-├── register.html              # 注册
-
-deepdiver_v2/
-├── app.py                    # Flask Web API 入口（用户管理、会话管理）
-├── requirements.txt          # 项目依赖
-├── LICENSE.txt              # Apache-2.0 许可证
-├── NOTICE                   # 版权声明
-│
-├── cli/                     # 命令行工具和服务
-│   ├── demo.py          	 # 命令行入口
-│   ├── run_demo.sh         
-│   └── a.py                # PlannerAgent HTTP 服务器（FastAPI）
-│
-├── config/                  # 配置文件
-│   ├── config.py           # 配置管理
-│   ├── logging_config.py   # 日志配置
-│   └── .env                # 环境变量
-│
-├── src/
-│   ├── agents/             # 智能体
-│   │   ├── base_agent.py
-│   │   ├── planner_agent.py
-│   │   ├── objective_information_seeker.py
-│   │   ├── subjective_information_seeker.py
-│   │   └── writer_agent.py
-│   │
-│   ├── tools/              # 工具集
-│   │   ├── mcp_tools.py
-│   │   ├── mcp_client.py
-│   │   ├── mcp_server_standard.py
-│   │   └── api_tool.py
-│   │
-│   └── utils/              # 工具函数
-│       ├── status_codes.py
-│       └── task_manager.py  # 任务管理器
-│
-├── workspaces/             # 工作空间（持久化）
-├── uploads/                # 临时上传
-├── user_files/            # 用户文档库
-└── logs/                  # 日志文件
+```text
+SciAssistant/
+├── app.py                         # Flask Web API 入口
+├── chatAi/
+│   ├── ai_chat.html               # 主页面
+│   ├── forgot-password.html       # 重置密码页
+│   ├── login.html                 # 登录页
+│   ├── register.html              # 注册页
+│   └── chatai.sql                 # MySQL 数据库表结构
+├── deepdiver_v2/
+│   ├── requirements.txt          # Python 依赖
+│   ├── env.template              # 环境变量模板
+│   ├── cli/
+│   │   ├── demo.py               # 命令行入口
+│   │   └── a.py                  # PlannerAgent FastAPI 服务
+│   ├── config/                   # 配置与日志
+│   └── src/
+│       ├── agents/               # Planner、Information Seeker、Writer
+│       ├── tools/                # MCP 服务与工具
+│       ├── utils/                # 任务和状态工具
+│       └── workspace/            # 工作空间管理
+├── Font/                    # PDF 导出的后备字体
+├── workspaces/              # 工作空间（运行时生成）
+├── logs/                    # 日志文件（运行时生成）
+├── LICENSE
+└── NOTICE
 ```
 
 ---
@@ -204,7 +191,7 @@ deepdiver_v2/
 
 ## 配置说明
 
-编辑 `config/.env` 文件，参考典型配置如下：
+编辑 `deepdiver_v2/config/.env` 文件，参考典型配置如下：
 
 ```bash
 # ================= LLM 模型配置 =================
@@ -252,18 +239,18 @@ TIMEOUT=30
 
 
 
-编辑`/app.py`文件，参考典型配置如下：
-```bash
+编辑根目录 `app.py` 文件中的数据库配置：
+```python
 # 数据库配置
-MYSQL_HOST=localhost
-MYSQL_USER=root
-MYSQL_PASSWORD=your-password
-MYSQL_DATABASE=chatai
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "your-password"
+MYSQL_DATABASE = "chatai"
 ```
 
 
 
-编辑`src/tools/server_config.yaml`文件，参考典型配置如下：
+编辑 `deepdiver_v2/src/tools/server_config.yaml` 文件，参考典型配置如下：
 
 ```yaml
 # MCP 服务器配置
@@ -283,23 +270,7 @@ tool_rate_limits:
     requests_per_hour: 300
 ```
 
-`\src\tools\mcp_tools.py`文件，找到相关字体放到该目录下：
-
-```python
-mcp_tools字体路径：
-# Linux 字体路径（可能需要安装中文字体包）
-	simsun_path = "/usr/share/fonts/dejavu/SIMSUN.TTC"
-	simhei_path = "/usr/share/fonts/dejavu/SIMHEI.TTF"
-	arial_path = "/usr/share/fonts/dejavu/ARIAL.TTF"  # Linux Arial path (if installed)
-	symbol_path = "/usr/share/fonts/dejavu/DejaVuSans.ttf"  # Linux fallback
-# 使用黑白emoji字体（多个可能的路径）
-	emoji_paths = [
-		"/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",  # Noto Emoji 黑白版本
-		"/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
-		"/usr/share/fonts/google-noto-emoji/NotoEmoji-Regular.ttf",
-		symbol_path  # 最后的备选方案：DejaVuSans
-	]
-```
+PDF 生成会优先使用系统字体，并自动回退到仓库根目录 `Font/` 中附带的开源字体，通常不需要手工修改字体路径。
 
 ---
 
@@ -438,5 +409,3 @@ GET http://localhost:8000/api/concurrency
 # 获取服务器状态
 GET http://localhost:8000/api/status
 ```
-
-
