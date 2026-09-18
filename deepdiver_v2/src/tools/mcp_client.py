@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
+from .. import get_thread_search_source, get_thread_session_id
 from ..utils.status_codes import JsonRpcErr
 from http import HTTPStatus
 
@@ -77,13 +78,19 @@ class MCPClient:
     - All tool operations use server-managed workspaces
     """
     
-    def __init__(self, server_url: str = "http://localhost:6274/mcp", retry_config: Optional[RetryConfig] = None):
+    def __init__(
+        self,
+        server_url: str = "http://localhost:6274/mcp",
+        retry_config: Optional[RetryConfig] = None,
+        session_id: Optional[str] = None,
+    ):
         self.server_url = server_url.rstrip('/')
         self.retry_config = retry_config or RetryConfig()
         self._tools: Dict[str, MCPTool] = {}
         self._connected = False
         self._request_id = 0
-        self._session_id = None
+        self._session_id = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        self._session_id_is_explicit = self._session_id is not None
         
         if not MCP_AVAILABLE:
             logger.warning("HTTP client not available. Some functionality may be limited.")
@@ -337,12 +344,12 @@ class MCPClient:
             return
         
         try:
-            # Check if session ID is already set via environment variable
-            import os
-            env_session_id = os.environ.get('AGENT_SESSION_ID')
-            if env_session_id:
+            # An explicitly supplied session belongs to this client instance and
+            # must never be replaced by another task's process-wide environment.
+            env_session_id = get_thread_session_id()
+            if not self._session_id and env_session_id:
                 self._session_id = env_session_id
-                logger.info(f"Using existing session ID from environment: {self._session_id}")
+                logger.info(f"Using existing session ID from request context: {self._session_id}")
             
             # Initialize session (server will use existing session if X-Session-ID header is provided)
             init_result = self._make_request("initialize", {
@@ -517,7 +524,7 @@ class MCPClient:
         # A tool can belong to multiple sources; it's allowed if ANY source is enabled
         tool_to_sources = {}
         for source_key, config in SEARCH_SOURCE_CONFIG.items():
-            is_enabled = os.environ.get(config['env_var'], 'True').lower() == 'true'
+            is_enabled = get_thread_search_source(source_key.lower(), True)
             for tool in config['tools']:
                 if tool not in tool_to_sources:
                     tool_to_sources[tool] = []
@@ -896,7 +903,8 @@ def create_agent_mcp_tools(
 
 def create_mcp_client(
     server_url: str = "http://localhost:6274/mcp",
-    retry_config: Optional[RetryConfig] = None
+    retry_config: Optional[RetryConfig] = None,
+    session_id: Optional[str] = None,
 ) -> MCPClient:
     """
     Factory function to create a generic MCP Client with optional retry configuration
@@ -908,7 +916,11 @@ def create_mcp_client(
     Returns:
         MCPClient instance for direct tool calling with automatic retry on rate limits
     """
-    return MCPClient(server_url=server_url, retry_config=retry_config)
+    return MCPClient(
+        server_url=server_url,
+        retry_config=retry_config,
+        session_id=session_id,
+    )
 
 
 def create_mcp_tools_adapter(

@@ -5,6 +5,7 @@ import random
 import subprocess
 import requests
 import re
+import unicodedata
 import shutil
 from typing import Dict, Any, List, Optional, Union
 from pathlib import Path
@@ -32,8 +33,20 @@ from typing import Optional
 
 import feedparser
 from .paper import Paper
+from ..utils.report_paths import (
+    resolve_final_report_path,
+    suggested_canonical_part_path,
+    validate_section_file_sequence,
+)
+from ..utils.report_quality import (
+    normalize_and_validate_report, normalize_report_artifacts,
+    protect_numeric_math, restore_numeric_math,
+    protect_document_numbers, restore_document_numbers,
+)
 from config.logging_config import get_logger
 logger = get_logger()
+# Centralized LLM client
+from src.utils.llm_client import llm_chat
 # from markdown_pdf import MarkdownPdf, Section  # 改用 ReportLab
 
 # ReportLab imports for PDF generation
@@ -81,12 +94,22 @@ except ImportError:
     logger.warning("警告: matplotlib 未安装，数学公式将以文本形式显示。安装: pip install matplotlib")
 
 try:
-    from config.config import get_config
+    from config.config import (
+        get_config,
+        build_model_request_headers,
+        get_model_provider,
+        is_pangu_ultra_moe_compat_enabled,
+    )
 except ImportError:
     import sys
 
     sys.path.append(str(Path(__file__).parent.parent.parent))
-    from config.config import get_config
+    from config.config import (
+        get_config,
+        build_model_request_headers,
+        get_model_provider,
+        is_pangu_ultra_moe_compat_enabled,
+    )
 
 # Import the optimized Faiss-based manager (fallback to JSON if Faiss not available)
 try:
@@ -235,6 +258,9 @@ def _simplify_latex(latex_text: str) -> str:
     """
  
     latex_text = _strip_all_font_tags(latex_text)
+
+    # 尖括号的尺寸修饰先去除，避免旧的 \\le 规则提前匹配 \\left。
+    latex_text = re.sub(r'\\(?:left|right)\s*(?=\\(?:langle|rangle)(?![A-Za-z]))', '', latex_text)
  
     # 常见LaTeX命令映射 - 使用有序字典确保处理顺序
     # 重要：必须先处理长命令，再处理短命令，避免部分匹配
@@ -361,6 +387,9 @@ def _simplify_latex(latex_text: str) -> str:
         (r'\\mathrm\{([^}]+)\}', r'\1'),
         (r'\\mathbf\{([^}]+)\}', r'\1'),
         (r'\\mathit\{([^}]+)\}', r'\1'),
+        # PDF 文本回退仅保留变量，不依赖新增花体字形；Markdown 原文不变。
+        (r'\\mathcal\s*\{\s*([A-Z])\s*\}', r'\1'),
+        (r'\\ell(?![A-Za-z])', 'l'),
 
         # 分数(简化显示)
         (r'\\frac\{([^}]+)\}\{([^}]+)\}', r'(\1)/(\2)'),
@@ -374,6 +403,8 @@ def _simplify_latex(latex_text: str) -> str:
         (r'\\vec\{([^}]+)\}', r'<b>\1</b>'),  # 向量使用粗体表示（标准数学记号）
 
         # 括号
+        (r'\\langle(?![A-Za-z])', '<font name="SymbolFont">⟨</font>'),
+        (r'\\rangle(?![A-Za-z])', '<font name="SymbolFont">⟩</font>'),
         (r'\\left\(', '('),
         (r'\\right\)', ')'),
         (r'\\left\[', '['),
@@ -397,6 +428,32 @@ def _simplify_latex(latex_text: str) -> str:
 
     result = latex_text
 
+    # PDF 文本降级：bm/textbf 只去掉样式外壳，保留完整参数给后续公式规则。
+    # 不能用 [^}]+ 提取参数，否则 hat{x}、P_{ij} 等嵌套花括号会被截断。
+    # 仅处理完整且括号配对的命令；Markdown 原文和其他命令不受影响。
+    removed_positions = set()
+    for command in re.finditer(r'\\(?:bm|textbf)\s*\{', result):
+        opening = command.end() - 1
+        depth = 1
+        for position in range(opening + 1, len(result)):
+            # 跳过被奇数个反斜杠转义的字面花括号。
+            if result[position] not in '{}':
+                continue
+            backslashes = 0
+            previous = position - 1
+            while previous >= 0 and result[previous] == '\\':
+                backslashes += 1
+                previous -= 1
+            if backslashes % 2:
+                continue
+            depth += 1 if result[position] == '{' else -1
+            if depth == 0:
+                removed_positions.update(range(command.start(), opening + 1))
+                removed_positions.add(position)
+                break
+    if removed_positions:
+        result = ''.join(char for index, char in enumerate(result) if index not in removed_positions)
+
     # 按顺序应用所有替换
     for pattern, replacement in replacements:
         result = re.sub(pattern, replacement, result)
@@ -416,6 +473,10 @@ def _simplify_latex(latex_text: str) -> str:
 
     result = re.sub(r'\_\{([^}]+)\}', convert_subscript, result)
     result = re.sub(r'\_([0-9a-zA-Z])', r'<sub>\1</sub>', result)
+
+    # 在上下标及常见命令展开后处理粗体，避免截断 μ_{ind} 等参数。
+    # 仅匹配完整命令和已展开的花括号参数，不改变其他格式命令。
+    result = re.sub(r'\\boldsymbol\s*\{([^{}]*)\}', r'<b>\1</b>', result)
 
     # 清理剩余的反斜杠和花括号
     # 注意：这里要小心，不要清理掉已经转换好的Unicode符号
@@ -891,6 +952,122 @@ def _process_inline_formatting(text: str) -> str:
 _EN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._@/+\-]*")
 
 
+@dataclass(frozen=True)
+class NumberedReportHeading:
+    """Normalized representation shared by chapter validation and PDF rendering."""
+
+    number: str
+    title: str
+    normalized: str
+    outline_level: int
+
+    @property
+    def chapter_number(self) -> str:
+        return self.number.split('.', 1)[0]
+
+
+def _normalize_report_heading_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    normalized = normalized.replace("\u207a", "+").replace("\u207b", "-")
+    normalized = normalized.replace("\u208a", "+").replace("\u208b", "-")
+    normalized = normalized.replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _parse_numbered_report_heading(
+        line: str,
+        *,
+        allow_list_prefix: bool = True,
+) -> Optional[NumberedReportHeading]:
+    """Parse numbered subsection headings without imposing a display-length limit.
+
+    This function only extracts structure. Callers retain their own acceptance
+    policy: chapter validation compares against the trusted outline, while PDF
+    rendering additionally constrains plain headings to the active chapter.
+    """
+    if not isinstance(line, str):
+        return None
+    clean = _normalize_report_heading_text(line)
+    if not clean:
+        return None
+    clean = re.sub(r'^#+\s*', '', clean).strip()
+    clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', clean).strip()
+    if allow_list_prefix:
+        clean = re.sub(r'^[\*\-\s]+', '', clean)
+        clean = re.sub(r'[\*\s]+$', '', clean).strip()
+    elif re.match(r'^[\*\-]\s+', clean):
+        return None
+    clean = _normalize_report_heading_text(clean)
+    match = re.match(r'^(\d+(?:\.\d+)+)\s+(.+\S|\S)$', clean)
+    if not match:
+        return None
+    number = match.group(1)
+    title = match.group(2).strip()
+    return NumberedReportHeading(
+        number=number,
+        title=title,
+        normalized=f"{number} {title}",
+        outline_level=min(number.count('.') + 1, 5),
+    )
+
+
+def _collect_pdf_plain_heading_candidates(
+        lines: List[str],
+) -> Dict[int, NumberedReportHeading]:
+    """Collect high-confidence plain headings for PDF styling/bookmarks.
+
+    A numbered line is accepted only when its chapter prefix matches the most
+    recent Markdown chapter heading. Fenced code is excluded. There is
+    deliberately no title-length gate: long outline titles remain headings.
+    """
+    candidates: Dict[int, NumberedReportHeading] = {}
+    active_chapter: Optional[str] = None
+    in_code_fence = False
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if stripped.startswith('```'):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        markdown_heading_match = re.match(r'^(#{1,6})\s+(.+)$', stripped)
+        if markdown_heading_match:
+            if markdown_heading_match.group(1) == '##':
+                chapter_match = re.match(
+                    r'^(\d+)\.\s+\S+',
+                    markdown_heading_match.group(2),
+                )
+                active_chapter = chapter_match.group(1) if chapter_match else None
+            continue
+        parsed = _parse_numbered_report_heading(
+            stripped,
+            allow_list_prefix=False,
+        )
+        if parsed and active_chapter and parsed.chapter_number == active_chapter:
+            candidates[index] = parsed
+    return candidates
+
+
+def _warn_missing_pdf_bookmarks(
+        expected_titles: List[str],
+        scheduled_titles: List[str],
+) -> List[str]:
+    """Log bookmark degradation without changing report/PDF success semantics."""
+    remaining = Counter(scheduled_titles)
+    missing: List[str] = []
+    for title in expected_titles:
+        if remaining[title] > 0:
+            remaining[title] -= 1
+        else:
+            missing.append(title)
+    if missing:
+        logger.warning(
+            "PDF bookmark completeness warning: missing=%s report_complete=true",
+            missing,
+        )
+    return missing
+
+
 def _apply_english_font_markup(text: str, font_name: str = "Arial") -> str:
     parts = re.split(r'(<[^>]+>)', text)
     font_stack: List[bool] = []
@@ -1003,6 +1180,59 @@ def _find_font_with_priority(font_name: str, system_paths: List[str], fallback_f
     return None
 
 
+def _normalize_pdf_math_delimiters(markdown_content: str) -> str:
+    """Adapt paired LaTeX delimiters only in the PDF copy of Markdown.
+
+    Keep code, links, HTML attributes and existing dollar math verbatim.
+    Unmatched delimiters are left as text rather than swallowing the report.
+    """
+    tokens = re.compile(
+        r'(?P<code>(?<!`)(?P<ticks>`+)(?!`)(?:(?!(?P=ticks)).)*?(?P=ticks)(?!`))'
+        r'|(?P<link>!?\[[^\]\n]*\]\((?:\\.|[^)\\\n])*\))'
+        r'|(?P<html><[^>\n]+>)'
+        r'|(?P<dollar>(?<!\\)\$\$.*?(?<!\\)\$\$|(?<![\\$])\$(?!\$)[^$\n]+\$)'
+        r'|(?<!\\)\\\[(?P<display>.+?)(?<!\\)\\\]'
+        r'|(?<!\\)\\\((?P<inline>[^\n]+?)(?<!\\)\\\)',
+        re.DOTALL,
+    )
+
+    def replace(match):
+        if match.group('display') is not None:
+            line_start = match.string.rfind('\n', 0, match.start()) + 1
+            if match.string[line_start:match.start()].lstrip().startswith('|'):
+                # A cell must stay on one row; use the existing inline path.
+                if '\n' not in match.group('display'):
+                    return '$' + match.group('display').strip() + '$'
+                return match.group(0)
+            return '\n$$\n' + match.group('display').strip() + '\n$$\n'
+        if match.group('inline') is not None:
+            return '$' + match.group('inline') + '$'
+        return match.group(0)
+
+    result = []
+    prose = []
+    fence_char = None
+    fence_length = 0
+    for line in markdown_content.splitlines(keepends=True):
+        stripped = line.strip()
+        if fence_char:
+            result.append(line)
+            if re.fullmatch(re.escape(fence_char) + '{' + str(fence_length) + r',}\s*', stripped):
+                fence_char = None
+            continue
+        fence = re.match(r'^(`{3,}|~{3,})(.*)$', stripped)
+        if fence and not (fence.group(1)[0] == '`' and '`' in fence.group(2)):
+            result.append(tokens.sub(replace, ''.join(prose)))
+            prose = []
+            result.append(line)
+            fence_char = fence.group(1)[0]
+            fence_length = len(fence.group(1))
+        else:
+            prose.append(line)
+    result.append(tokens.sub(replace, ''.join(prose)))
+    return ''.join(result)
+
+
 def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> bool:
     """
     使用 ReportLab 将 Markdown 内容转换为 PDF，支持中文字体（黑体标题，宋体正文）
@@ -1019,6 +1249,7 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         return False
 
     try:
+        markdown_content = _normalize_pdf_math_delimiters(markdown_content)
         # 注册字体（优先从系统加载 Arial、SimSun、SimHei，回退到项目 Font 目录中的开源字体）
         import platform
         system = platform.system()
@@ -1351,6 +1582,11 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
         # 解析 Markdown 并转换为 ReportLab 元素
         story = []
         lines = markdown_content.split('\n')
+        plain_heading_candidates = _collect_pdf_plain_heading_candidates(lines)
+        expected_plain_bookmarks = [
+            heading.normalized for heading in plain_heading_candidates.values()
+        ]
+        scheduled_plain_bookmarks: List[str] = []
 
         i = 0
         in_code_block = False
@@ -1367,7 +1603,7 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
             line = lines[i].strip()
 
             # 处理数学公式块 $$
-            if line == '$$':
+            if line == '$$' and not in_code_block:
                 if not in_math_block:
                     # 开始数学公式块
                     in_math_block = True
@@ -1692,51 +1928,39 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                     story.append(Paragraph(f'\u2022 {text}', style_normal))
             else:
                 # 检测纯文本格式的子标题（如 "2.1 标题" "2.1.1 标题" "3.2 Title"）
-                # 匹配模式：数字.数字[.数字...] 空格 标题文字（非空，且不以标点结尾）
-                plain_heading_match = re.match(r'^(\d+(?:\.\d+)+)\s+(.+)$', line)
-                if plain_heading_match:
-                    heading_number = plain_heading_match.group(1)  # 如 "2.1" 或 "2.1.1"
-                    heading_text_raw = plain_heading_match.group(2).strip()
-                    # 排除误判：如果文字很长（超过80字符）或以句号等结尾，可能不是标题
-                    is_likely_heading = (
-                        len(heading_text_raw) < 80 and
-                        not re.search(r'[。？！.?!,，;；]$', heading_text_raw) and
-                        len(heading_text_raw) > 0
-                    )
-                    if is_likely_heading:
-                        # 根据编号层级确定标题级别：2.1 → h3(level 2), 2.1.1 → h4(level 3)
-                        dot_count = heading_number.count('.')
-                        if dot_count == 1:
-                            sub_style = style_h3
-                            target_level = 2  # h3 → outline level 2
-                        elif dot_count == 2:
-                            sub_style = style_h4
-                            target_level = 3  # h4 → outline level 3
-                        elif dot_count == 3:
-                            sub_style = style_h5
-                            target_level = 4
-                        else:
-                            sub_style = style_h6
-                            target_level = 5
+                # 候选由共享解析器预先提取，并要求编号与当前 Markdown 章节一致。
+                # 不再使用 80 字符上限，避免长标题被静默降级为普通段落。
+                plain_heading = plain_heading_candidates.get(i)
+                if plain_heading:
+                    target_level = plain_heading.outline_level
+                    if target_level == 2:
+                        sub_style = style_h3
+                    elif target_level == 3:
+                        sub_style = style_h4
+                    elif target_level == 4:
+                        sub_style = style_h5
+                    else:
+                        sub_style = style_h6
 
-                        full_title = f"{heading_number} {heading_text_raw}"
-                        text = _process_inline_formatting(full_title)
+                    full_title = plain_heading.normalized
+                    text = _process_inline_formatting(full_title)
 
-                        # 计算安全的大纲层级（与markdown标题逻辑一致）
-                        if target_level <= last_outline_level:
-                            safe_level = target_level
-                        else:
-                            safe_level = min(target_level, last_outline_level + 1)
-                        last_outline_level = safe_level
+                    # 计算安全的大纲层级（与markdown标题逻辑一致）
+                    if target_level <= last_outline_level:
+                        safe_level = target_level
+                    else:
+                        safe_level = min(target_level, last_outline_level + 1)
+                    last_outline_level = safe_level
 
-                        # 创建书签
-                        clean_title = re.sub(r'<[^>]+>', '', full_title)
-                        bookmark_key = f'heading_{len(story)}'
-                        story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
-                        story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', sub_style))
+                    # 创建书签
+                    clean_title = re.sub(r'<[^>]+>', '', full_title)
+                    bookmark_key = f'heading_{len(story)}'
+                    story.append(PDFBookmark(clean_title, safe_level, bookmark_key))
+                    scheduled_plain_bookmarks.append(plain_heading.normalized)
+                    story.append(Paragraph(f'<font name="SimHei"><b>{text}</b></font>', sub_style))
 
-                        i += 1
-                        continue
+                    i += 1
+                    continue
 
                 # 处理行内格式
                 line = _process_inline_formatting(line)
@@ -1750,6 +1974,12 @@ def generate_pdf_with_reportlab(markdown_content: str, output_path: Path) -> boo
                     story.append(Paragraph(line, style_normal))
 
             i += 1
+
+        # 仅记录展示质量降级，不改变 PDF 或最终报告的成功状态。
+        _warn_missing_pdf_bookmarks(
+            expected_plain_bookmarks,
+            scheduled_plain_bookmarks,
+        )
 
         # 生成 PDF（应用页码回调函数）
         try:
@@ -3883,12 +4113,11 @@ class MCPTools:
             包含 'title', 'abstract' 和 'keywords' 的字典
         """
         try:
-            import requests
             config = get_config()
             model_config = config.get_custom_llm_config()
-            # PANGU 模型配置
-            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
+            if not model_name:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env.")
             # 语言检测：优先根据user_query判断，其次根据文章内容判断
             # Priority: user_query language > article content language
             is_english_content = False
@@ -3998,29 +4227,18 @@ class MCPTools:
                 {format_instruction}
                 """
 
-            # 调用 PANGU 模型生成
-            headers = {'Content-Type': 'application/json'}
-
+            # 调用模型生成
             logger.info("正在调用 PANGU 模型生成标题、摘要和关键词...")
-            response = requests.post(
-                url=PANGU_URL,
-                headers=headers,
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": "你是一位严谨的学术分析师。你的核心职责是基于给定的文本内容提取准确的信息。请务必客观、真实，严禁编造原文中不存在的内容。"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.3
-                },
-                verify=False,
-                timeout=300
+            result_text = llm_chat(
+                messages=[
+                    {"role": "system", "content": "你是一位严谨的学术分析师。你的核心职责是基于给定的文本内容提取准确的信息。请务必客观、真实，严禁编造原文中不存在的内容。"},
+                    {"role": "user", "content": prompt},
+                ],
+                model=model_name,
+                temperature=0.3,
+                timeout=300,
+                max_retries=5,
             )
-
-            # 解析响应
-            response.raise_for_status()
-            result_data = response.json()
-            result_text = result_data['choices'][0]['message']['content']
 
             # 打印原始返回结果用于调试
             logger.info("\n" + "=" * 60)
@@ -4028,121 +4246,34 @@ class MCPTools:
             logger.info(result_text)
             logger.info("=" * 60 + "\n")
 
-            # 解析结果 - 使用多种策略
-            title = ""
-            abstract = ""
-            keywords = ""
+            # 只把行首的明确字段标签作为边界，正文中的“Field关键词”或
+            # “Keywords are ...”不是标签。所有字段共用同一组边界，避免
+            # 宽松兜底重新引入正文误截断；支持中英文、独立标签及 Markdown。
+            field_pattern = re.compile(
+                r'^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?'
+                r'(?P<label>标题|Title|摘要|Abstract|关键词|Keywords)'
+                r'(?:\*\*)?[ \t]*'
+                r'(?:[：:][ \t]*(?:\*\*[ \t]*)?|(?=\r?$))',
+                re.MULTILINE | re.IGNORECASE,
+            )
+            field_names = {
+                "标题": "title", "title": "title",
+                "摘要": "abstract", "abstract": "abstract",
+                "关键词": "keywords", "keywords": "keywords",
+            }
+            fields = {"title": "", "abstract": "", "keywords": ""}
+            matches = list(field_pattern.finditer(result_text))
+            for index, match in enumerate(matches):
+                name = field_names[match.group("label").lower()]
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(result_text)
+                value = result_text[match.end():end].strip()
+                if value and not fields[name]:
+                    fields[name] = value
+                    logger.info(f"✓ 按字段边界提取{name}（{len(value)}字符）")
 
-            # 策略1：尝试标准格式提取（标题/Title：...摘要/Abstract：...关键词/Keywords：...）
-            title_match = re.search(r'(?:标题|Title)[：:]\s*(.*?)(?=(?:摘要|Abstract)|(?:关键词|Keywords)|$)', result_text,
-                                    re.DOTALL | re.IGNORECASE)
-            if title_match:
-                title = title_match.group(1).strip()
-                logger.info(f"✓ 策略1成功提取标题（{len(title)}字）")
-
-            abstract_match = re.search(r'(?:摘要|Abstract)[：:]\s*(.*?)(?=(?:关键词|Keywords)|$)', result_text,
-                                       re.DOTALL | re.IGNORECASE)
-            if abstract_match:
-                abstract = abstract_match.group(1).strip()
-                logger.info(f"✓ 策略1成功提取摘要（{len(abstract)}字）")
-
-            keywords_match = re.search(r'(?:关键词|Keywords)[：:]\s*(.*?)$', result_text, re.DOTALL | re.IGNORECASE)
-            if keywords_match:
-                keywords = keywords_match.group(1).strip()
-                logger.info(f"✓ 策略1成功提取关键词")
-
-            # 策略2：如果策略1失败，尝试更宽松的匹配
-            if not title:
-                # 查找 "标题" 后面的内容
-                title_match2 = re.search(r'(?:标题|title)[：:\s]*(.*?)(?=摘要|abstract|关键词|keywords|$)', result_text,
-                                         re.IGNORECASE | re.DOTALL)
-                if title_match2:
-                    title = title_match2.group(1).strip()
-                    logger.info(f"✓ 策略2成功提取标题（{len(title)}字）")
-
-            if not abstract:
-                # 查找 "摘要" 后面的内容，直到遇到 "关键词" 或文本结束
-                abstract_match2 = re.search(r'(?:摘要|abstract)[：:\s]*(.*?)(?=关键词|keywords|$)', result_text,
-                                            re.IGNORECASE | re.DOTALL)
-                if abstract_match2:
-                    abstract = abstract_match2.group(1).strip()
-                    logger.info(f"✓ 策略2成功提取摘要（{len(abstract)}字）")
-
-            if not keywords:
-                # 查找 "关键词" 后面的内容
-                keywords_match2 = re.search(r'(?:关键词|keywords)[：:\s]*(.*?)$', result_text,
-                                            re.IGNORECASE | re.DOTALL)
-                if keywords_match2:
-                    keywords = keywords_match2.group(1).strip()
-                    logger.info(f"✓ 策略2成功提取关键词")
-
-            # 策略3：如果仍然失败，尝试按行分割
-            if not title or not abstract or not keywords:
-                lines = result_text.split('\n')
-                in_title = False
-                in_abstract = False
-                in_keywords = False
-                title_lines = []
-                abstract_lines = []
-                keywords_lines = []
-
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # 检查是否是标题标题
-                    if re.match(r'(?:标题|Title)[：:]?', line, re.IGNORECASE):
-                        in_title = True
-                        in_abstract = False
-                        in_keywords = False
-                        # 如果标题后面直接有内容，提取它
-                        content = re.sub(r'^(?:标题|Title)[：:]?\s*', '', line, flags=re.IGNORECASE)
-                        if content:
-                            title_lines.append(content)
-                        continue
-
-                    # 检查是否是摘要标题
-                    if re.match(r'(?:摘要|Abstract)[：:]?', line, re.IGNORECASE):
-                        in_title = False
-                        in_abstract = True
-                        in_keywords = False
-                        # 如果标题后面直接有内容，提取它
-                        content = re.sub(r'^(?:摘要|Abstract)[：:]?\s*', '', line, flags=re.IGNORECASE)
-                        if content:
-                            abstract_lines.append(content)
-                        continue
-
-                    # 检查是否是关键词标题
-                    if re.match(r'(?:关键词|Keywords)[：:]?', line, re.IGNORECASE):
-                        in_title = False
-                        in_keywords = True
-                        in_abstract = False
-                        # 如果标题后面直接有内容，提取它
-                        content = re.sub(r'^(?:关键词|Keywords)[：:]?\s*', '', line, flags=re.IGNORECASE)
-                        if content:
-                            keywords_lines.append(content)
-                        continue
-
-                    # 收集内容
-                    if in_title:
-                        title_lines.append(line)
-                    elif in_abstract:
-                        abstract_lines.append(line)
-                    elif in_keywords:
-                        keywords_lines.append(line)
-
-                if not title and title_lines:
-                    title = ' '.join(title_lines)
-                    logger.info(f"✓ 策略3成功提取标题（{len(title)}字）")
-
-                if not abstract and abstract_lines:
-                    abstract = ' '.join(abstract_lines)
-                    logger.info(f"✓ 策略3成功提取摘要（{len(abstract)}字）")
-
-                if not keywords and keywords_lines:
-                    keywords = ' '.join(keywords_lines)
-                    logger.info(f"✓ 策略3成功提取关键词")
+            title = fields["title"]
+            abstract = fields["abstract"]
+            keywords = fields["keywords"]
 
             # 清理提取的内容
             if title:
@@ -4185,10 +4316,6 @@ class MCPTools:
                     else:
                         title = "研究报告"
                         logger.info(f"  使用备用方案：设置默认标题")
-
-                if not abstract and len(result_text) > 50:
-                    abstract = result_text[:300].strip()
-                    logger.info(f"  使用备用方案：提取前300字符作为摘要")
 
                 if not keywords:
                     keywords = "未能提取关键词"
@@ -4268,6 +4395,10 @@ class MCPTools:
                         logger.warning(f"Failed to process file: {e}")
                         continue
 
+            if full_path.name == 'file_analysis.jsonl':
+                from src.utils.source_provenance import annotate_sources
+                res = annotate_sources(res, self.workspace_path)
+
             return MCPToolResult(
                 success=True,
                 data=res,
@@ -4293,11 +4424,10 @@ class MCPTools:
             包含 'author', 'title', 'source' 的字典
         """
         try:
-            import requests
             model_config = get_config().get_custom_llm_config()
-            # PANGU 模型配置
-            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
+            if not model_name:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env.")
             # 提取文章开头的500个字符
             content_excerpt = article_content[:500] if len(article_content) > 500 else article_content
 
@@ -4326,30 +4456,20 @@ class MCPTools:
 {source_info if source_info else "未提供"}
 """
 
-            # 调用 PANGU 模型生成
-            headers = {'Content-Type': 'application/json'}
-
+            # 调用模型生成
             logger.info("正在调用 PANGU 模型提取作者和标题信息...")
-            response = requests.post(
-                url=PANGU_URL,
-                headers=headers,
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system",
-                         "content": "你是一位专业的文献管理专家，擅长从文章内容中提取作者和标题信息，并整理为规范的参考文献格式。请严格按照用户要求的格式输出。"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.3
-                },
-                verify=False,
-                timeout=300
+            result_text = llm_chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是一位专业的文献管理专家，擅长从文章内容中提取作者和标题信息，并整理为规范的参考文献格式。请严格按照用户要求的格式输出。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=model_name,
+                temperature=0.3,
+                timeout=300,
             )
-
-            # 解析响应
-            response.raise_for_status()
-            result_data = response.json()
-            result_text = result_data['choices'][0]['message']['content']
 
             # 打印原始返回结果用于调试
             logger.info("\n" + "=" * 60)
@@ -4584,9 +4704,29 @@ class MCPTools:
         current_chapter_level = 0
         first_content_line = True
         current_chapter_number = None  # 当前章节号
+        fence_char = None
+        fence_length = 0
+        number = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?'
+        numeric_row = re.compile(rf'{number}(?:\s+{number})+')
 
         for line in lines:
             stripped_line = line.strip()
+
+            # 章号识别启用后，也不能改写代码示例或把示例章号带入正文。
+            if fence_char:
+                normalized_lines.append(line)
+                if re.fullmatch(re.escape(fence_char) + '{' + str(fence_length) + r',}\s*', stripped_line):
+                    fence_char = None
+                continue
+            fence = re.match(r'^(`{3,}|~{3,})(.*)$', stripped_line)
+            if fence and not (fence.group(1)[0] == '`' and '`' in fence.group(2)):
+                fence_char = fence.group(1)[0]
+                fence_length = len(fence.group(1))
+                normalized_lines.append(line)
+                continue
+            if line.startswith(('    ', '\t')) or numeric_row.fullmatch(stripped_line):
+                normalized_lines.append(line)
+                continue
 
             # 跳过空行，直到找到第一个内容行
             if first_content_line and not stripped_line:
@@ -4607,12 +4747,11 @@ class MCPTools:
                 heading_text_clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', heading_text)
                 numbered_heading_match = re.match(r'^(\d+(?:\.\d+)*)\s+', heading_text_clean)
 
-                # 【关键修复】提取章节号(如 "## 1. xxx" -> 章节号为1)
-                if current_level == 2 and numbered_heading_match:
-                    chapter_num_str = numbered_heading_match.group(1)
-                    # 检查是否是一级编号(如 "1", "2", "3"，没有点)
-                    if '.' not in chapter_num_str:
-                        current_chapter_number = int(chapter_num_str)
+                # 单独识别章号末尾的句点，不改变原有标题层级推断。
+                if current_level == 2:
+                    chapter_match = re.match(r'^(\d+)\.?\s+\S', heading_text_clean)
+                    current_chapter_number = int(chapter_match.group(1)) if chapter_match else None
+                    if current_chapter_number is not None:
                         logger.info(f"检测到章节标题: {heading_text_clean}, 章节号: {current_chapter_number}")
 
                 # 【关键修复】检测错误使用###的二级标题(如 "### 2.4 标题")
@@ -4745,41 +4884,11 @@ class MCPTools:
         if unique_id is None:
             import time
             unique_id = f"msg_{int(time.time() * 1000)}"
-        report_files = []
-        for section_content in section_contents:
-            # Handle both dict format (expected) and string format (fallback)
-            if isinstance(section_content, dict):
-                file_path = section_content.get('file_path')
-            else:
-                # Fallback for direct string paths
-                file_path = section_content
-
-            if file_path:
-                full_path = self.workspace_path / file_path
-                report_files.append(full_path)
-
-        # 提取文件名中的数字索引并排序
-        def extract_index(file_path):
-            """从文件名中提取数字索引"""
-            filename = os.path.basename(file_path)
-            match = re.search(r'part_(\d+)\.md', filename)
-            if match:
-                return int(match.group(1))
-            return None  # 不符合格式的文件
-
-        # 创建(索引, 文件路径)元组列表并排序
-        indexed_files = []
-        for file_path in report_files:
-            idx = extract_index(file_path)
-            if idx is not None:
-                indexed_files.append((idx, file_path))
-
-        # 按索引排序
-        indexed_files.sort(key=lambda x: x[0])
-
-        if not indexed_files:
-            logger.warning("警告: 未找到符合条件的part_*.md文件")
-            return
+        validated_sections = validate_section_file_sequence(section_contents)
+        indexed_files = [
+            (index, self.workspace_path / relative_path)
+            for index, relative_path in validated_sections
+        ]
 
         # 合并文件 - 关键修改：在写入前规范化标题层级
         try:
@@ -4791,6 +4900,18 @@ class MCPTools:
                         with open(file_path, 'r', encoding='utf-8') as infile:
                             # 读取文件内容
                             file_content = infile.read()
+                            if not file_content.strip():
+                                raise ValueError(f"章节文件为空: {filename}")
+
+                            # section_writer 与通用 file_write 最终都会走到这里；
+                            # 合并阶段再次清洗，覆盖任何直接落盘旁路。
+                            file_content, marker_issues = normalize_and_validate_report(
+                                file_content, source_citations=True
+                            )
+                            if marker_issues:
+                                raise ValueError(
+                                    f"章节 {filename} 仍包含内部标记: {marker_issues[:10]}"
+                                )
 
                             # 规范化标题层级
                             normalized_content = self._normalize_heading_levels(file_content)
@@ -4802,7 +4923,7 @@ class MCPTools:
                             merged_content += normalized_content + "\n\n"
                             logger.info(f"已合并并规范化标题: {filename}")
                     except Exception as e:
-                        logger.warning(f"警告: 无法读取文件 {filename} - {str(e)}")
+                        raise RuntimeError(f"无法读取或校验章节文件 {filename}: {e}") from e
 
             logger.info(f"\n合并完成! 结果保存在: {output_file}")
             logger.info(f"共合并了 {len(indexed_files)} 个文件")
@@ -4812,18 +4933,26 @@ class MCPTools:
             file_analysis_data = {}
             file_num_to_path = {}
 
+            from src.utils.source_provenance import generated_paths
+            generated = generated_paths(self.workspace_path)
+            excluded_generated_ids = set()
             # 【智能过滤】基于information_richness字段判断，而不是关键词匹配
             if file_analysis_path.exists():
+                import json
                 try:
-                    # 【关键修复】使用连续编号而不是原始行号
-                    # 因为LLM在生成报告时会重新编号（从1开始连续编号）
-                    continuous_num = 0
-                    with open(file_analysis_path, 'r', encoding='utf-8') as f:
+                    # 与 Writer 的 load_json + enumerate 一致：只跳过解析失败行，
+                    # 成功解析的记录均占用来源 ID。过滤不能改变后续来源的身份。
+                    source_num = 0
+                    with open(file_analysis_path, 'r', encoding='utf-8', errors='ignore') as f:
                         for line_num, line in enumerate(f, 1):
                             try:
                                 data = json.loads(line.strip())
+                                source_num += 1
                                 if 'file_path' in data:
                                     file_path = data['file_path']
+                                    if str(file_path).replace('\\', '/').removeprefix('./') in generated:
+                                        excluded_generated_ids.add(source_num)
+                                        continue
                                     doc_time = data.get('doc_time', '')
                                     info_richness = data.get('information_richness', '')
                                     
@@ -4844,23 +4973,24 @@ class MCPTools:
                                         logger.info(f"跳过信息稀缺的文件 [原始行号{line_num}]: {file_path} (richness: {info_richness[:80]})")
                                         continue
                                     
-                                    # 有效文件，使用连续编号
-                                    continuous_num += 1
                                     file_analysis_data[file_path] = data
 
-                                    # 【关键修复】使用连续编号作为映射，与报告中的引用编号一致
-                                    # 报告中的引用编号是连续的 [1, 2, 3, ...]，不会跳过无效文件的编号
-                                    file_num_to_path[continuous_num] = file_path
-                                    logger.info(f"映射连续编号 {continuous_num} (原始行号{line_num}) 到文件路径: {file_path}")
+                                    # 显示编号在构建参考文献后统一生成，这里保留来源 ID。
+                                    file_num_to_path[source_num] = file_path
+                                    logger.info(f"映射来源编号 {source_num} (原始行号{line_num}) 到文件路径: {file_path}")
                             except Exception as e:
                                 logger.warning(f"警告: 无法解析分析数据行 {line_num} - {str(e)}")
-                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射（已过滤无效文件，使用连续编号）")
+                    logger.info(f"成功加载 {len(file_num_to_path)} 个序号到文件路径的映射（已过滤无效文件，保留 Writer 来源编号）")
                 except Exception as e:
                     logger.warning(f"警告: 无法读取文件分析数据 - {str(e)}")
             else:
                 logger.warning(f"警告: 文件分析数据不存在: {file_analysis_path}")
 
             # 【关键修复】规范化多引用格式 [53, 57] -> [53][57]
+            # 数学参数必须在拆分、编号替换和未知引用清理的整个阶段保持隔离。
+            merged_content, numeric_math = protect_numeric_math(merged_content)
+            # 公文年份不是来源编号，须贯穿引用提取、重排和未知引用清理保护。
+            merged_content, document_numbers = protect_document_numbers(merged_content)
             # AI模型有时会生成逗号分隔的多引用，导致后续提取和替换逻辑无法处理
             def _split_multi_cite_merge(m):
                 nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
@@ -4878,6 +5008,11 @@ class MCPTools:
             citation_numbers.sort()
 
             logger.info(f"找到 {len(citation_numbers)} 个引用标记: {citation_numbers}")
+            unsupported = excluded_generated_ids.intersection(citation_numbers)
+            if unsupported:
+                logger.warning("[SourceProvenance] removing generated-source citations: %s", sorted(unsupported))
+
+
 
             # 【关键修复】为所有有效文件生成参考文献（包括未直接引用的文献）
             # 获取所有file_analysis.jsonl中的文件序号
@@ -4914,16 +5049,26 @@ class MCPTools:
                         logger.error(f"跳过处理失败的文件 {num}: {file_path}")
                         continue
 
-                    # 跳过内容无效的文件（与 Writer 使用相同的关键词列表）
+                    # 跳过明确无效的内容；普通数字或法条编号不代表 HTTP 错误页。
                     invalid_content_keywords = [
                         '安全验证', 'CAPTCHA', 'captcha', '验证码',
-                        '404', '403', 'Forbidden', 'placeholder page', 'error page',
+                        'Forbidden', 'placeholder page', 'error page',
                         'no substantive content', 'lacks substantive content',
                         'does not provide any substantive', '没有实质性的信息',
                         'currently missing', 'content is missing', '内容缺失'
                     ]
                     
                     is_invalid_content = any(kw.lower() in core_content.lower() for kw in invalid_content_keywords)
+                    # 例如 CWA Section 404 是正常法规资料。仅在数字与明确
+                    # HTTP/错误状态描述相连时过滤，保持其他无效内容规则不变。
+                    is_invalid_content = is_invalid_content or bool(re.search(
+                        r'\b(?:http(?:/\d+(?:\.\d+)?)?\s+'
+                        r'(?:(?:error|status(?:\s+code)?)\s*[:：-]?\s*)?'
+                        r'|error(?:\s+code)?\s*[:：-]?\s*)(?:403|404)\b'
+                        r'|\b404\s*[:：-]?\s*not\s+found\b',
+                        core_content,
+                        re.IGNORECASE,
+                    ))
                     if is_invalid_content:
                         logger.warning(f"跳过内容无效的文件 {num}: {file_path}")
                         continue
@@ -5406,31 +5551,38 @@ class MCPTools:
                     invalid_titles = [
                         '403 forbidden', '404 not found', '500 internal server error',
                         '502 bad gateway', '503 service unavailable', '504 gateway timeout',
-                        'access denied', 'page not found', 'error', 'just a moment',
+                        'access denied', 'page not found', 'just a moment',
                         'unknown title', 'untitled'
                     ]
                     title_lower = title_cleaned.lower().strip()
                     is_invalid = any(invalid in title_lower for invalid in invalid_titles)
+                    # error correction / error-correcting 是正常学术主题。
+                    # 泛化的 error 子串会误删这些来源，只额外匹配明确错误标题。
+                    is_invalid = is_invalid or bool(re.fullmatch(
+                        r'(?:http\s+)?error(?:\s*[:\-–—]?\s*[45]\d{2})?[.!]?',
+                        title_lower,
+                    ))
 
                     if is_invalid:
                         logger.info(f"跳过无效标题的引用 {num}: {title_cleaned}")
                         continue  # 跳过此引用，不添加到参考文献列表
 
-                    # 优化时间信息显示
-                    doc_time_cleaned = doc_time
-                    show_time = True
-                    if doc_time in ['Unknown', 'unable to determine the web page time', 'Unknown Time']:
-                        show_time = False
-                    elif 'unable to determine' in doc_time.lower():
-                        show_time = False
-                    elif '无法确定具体月份' in doc_time:
-                        # 如果包含"无法确定具体月份"，只保留年份
-                        # 例如: "2024年无法确定具体月份" -> "2024年"
-                        match = re.search(r'(\d{4})年', doc_time)
-                        if match:
-                            doc_time_cleaned = f"{match.group(1)}年"
-                        else:
-                            doc_time_cleaned = doc_time.replace('无法确定具体月份', '').strip()
+                    # 仅清理日期展示，不过滤来源或推断发布时间。
+                    text = '' if doc_time is None else str(doc_time).strip()
+                    # Retain a stated year only for explicitly missing month/day precision.
+                    partial = re.fullmatch(
+                        r'((?:19|20)\d{2})年\s*[，,（(]?\s*'
+                        r'(?:无法(?:确定|确认)(?:具体)?(?:月份|月日|日期)|(?:具体)?(?:月份|月日)不详)\s*[）)]?',
+                        text,
+                    )
+                    if partial:
+                        text = partial.group(1) + '年'
+                    elif (re.fullmatch(r'(?:unknown(?:\s+(?:time|date))?|n/?a|none|null|not available|未(?:知|提供|注明|标明)|不详|暂无|无|[-—]+)', text, re.I)
+                            or re.search(r'unable to determine|cannot (?:determine|confirm)|date unknown|time unknown', text, re.I)
+                            or re.search(r'无法(?:确定|确认|获取|识别)|未能(?:确定|确认|获取)|(?:时间|日期|年份|月份).*(?:未知|不详|未提供|未注明|未标明)|(?:未知|不详).*(?:时间|日期)', text)):
+                        text = ''
+                    doc_time_cleaned = text
+                    show_time = bool(text)
 
                     # 统一引用格式：根据是否有作者信息决定格式
                     # 如果是用户上传文件或文档库文件且提取了作者信息，使用参考文献格式
@@ -5545,6 +5697,10 @@ class MCPTools:
                     )
                 logger.info(f"已移除 {len(unique_remaining)} 个无效引用")
 
+            # 恢复数学和文号原文后再写文件、生成摘要及 PDF，避免临时标记进入产物。
+            merged_content = restore_numeric_math(merged_content, numeric_math)
+            merged_content = restore_document_numbers(merged_content, document_numbers)
+
             # 重新写入更新后的正文
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(merged_content)
@@ -5650,6 +5806,16 @@ class MCPTools:
                     outfile.write(references_section)
                 logger.info("已添加空的参考来源部分到报告末尾")
 
+            # 标题、摘要、引用追加完成后执行终态门禁，防止任何旁路把
+            # 模型内部标记带到 Markdown、数据库或 PDF。
+            with open(output_file, 'r', encoding='utf-8') as final_report_file:
+                final_report_content = final_report_file.read()
+            final_report_content, marker_issues = normalize_and_validate_report(final_report_content)
+            if marker_issues:
+                raise ValueError(f"最终报告仍包含内部标记: {marker_issues[:10]}")
+            with open(output_file, 'w', encoding='utf-8') as final_report_file:
+                final_report_file.write(final_report_content)
+
             # 生成PDF (确保文件已完全写入并关闭)
             try:
                 with open(output_file, 'r', encoding='utf-8') as mdfile:
@@ -5695,37 +5861,69 @@ class MCPTools:
         try:
             logger.info(f"我现在开始调用concat_section_files了：{section_files}, {final_file_path}")
 
-            # Ensure output directory exists
-            import os
-            output_dir = os.path.dirname(final_file_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
+            # [FIX] 校验 section_files 非空：GLM-5.2 退化导致工具调用参数丢失时，
+            # section_files 可能为空/缺失/非列表，此时不能静默返回 success=True，
+            # 否则会生成空报告并误导上层走降级兜底。
+            if not section_files or not isinstance(section_files, list):
+                error_msg = "合并失败：section_files 为空或缺失（可能是工具调用参数解析失败），请以正确格式重新调用 concat_section_files，并传入非空的 section_files 列表"
+                logger.error(f"[concat_section_files] {error_msg}")
+                return MCPToolResult(success=False, error=error_msg)
 
-            # Convert relative path to absolute if needed
-            if not os.path.isabs(final_file_path):
-                final_file_path = self.workspace_path / final_file_path
+            # 先把输出解析到当前任务 workspace，再创建目录，避免在服务
+            # 进程工作目录意外创建 ./report。
+            final_file_path = resolve_final_report_path(self.workspace_path, final_file_path)
+            final_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            validated_sections = validate_section_file_sequence(section_files)
+            canonical_section_files = [
+                {"file_path": relative_path}
+                for _, relative_path in validated_sections
+            ]
 
             # 读取section_files中的文件内容，并获取摘要和关键词
             # 生成基于时间戳的唯一ID，避免多轮对话中的锚点冲突
             import time
             unique_id = f"msg_{int(time.time() * 1000)}"
-            abstract_keywords = self.merge_reports(section_files, final_file_path, unique_id)
 
-            # 如果没有返回摘要和关键词，设置默认值
+            # [FIX-P0] 合并前校验源文件存在性，避免 merge_reports 静默失败后仍返回 success=True
+            missing_files = []
+            empty_files = []
+            for sf in canonical_section_files:
+                fp = sf.get('file_path', sf) if isinstance(sf, dict) else sf
+                if fp:
+                    full_check_path = self.workspace_path / fp
+                    if not os.path.exists(full_check_path):
+                        missing_files.append(str(fp))
+                    elif not full_check_path.read_text(encoding="utf-8").strip():
+                        empty_files.append(str(fp))
+            if missing_files:
+                error_msg = f"合并失败：以下章节文件不存在: {missing_files}"
+                logger.error(f"[concat_section_files] {error_msg}")
+                return MCPToolResult(success=False, error=error_msg)
+            if empty_files:
+                error_msg = f"合并失败：以下章节文件为空: {empty_files}"
+                logger.error(f"[concat_section_files] {error_msg}")
+                return MCPToolResult(success=False, error=error_msg)
+
+            abstract_keywords = self.merge_reports(canonical_section_files, final_file_path, unique_id)
+
+            # [FIX-P0] merge_reports 返回 None 时返回失败，而非无条件 success=True
             if abstract_keywords is None:
-                abstract_keywords = {"abstract": "", "keywords": ""}
+                error_msg = "合并失败：merge_reports 未生成有效内容，请检查章节文件是否为空或格式异常"
+                logger.error(f"[concat_section_files] {error_msg}")
+                return MCPToolResult(success=False, error=error_msg)
 
             return MCPToolResult(
                 success=True,
                 data={
-                    "merged_files": len(section_files),
+                    "merged_files": len(canonical_section_files),
                     "output_path": str(final_file_path),
                     "abstract": abstract_keywords.get("abstract", ""),
                     "keywords": abstract_keywords.get("keywords", "")
                 },
                 metadata={
                     'final_file_path': str(final_file_path),
-                    'section_count': len(section_files),
+                    'section_count': len(canonical_section_files),
                     'abstract': abstract_keywords.get("abstract", ""),
                     'keywords': abstract_keywords.get("keywords", "")
                 }
@@ -5820,13 +6018,94 @@ class MCPTools:
                 "actual": "N/A"
             }
 
+    @staticmethod
+    def _split_classifier_outline(outline: str) -> List[str]:
+        """Split an outline at first-level chapter headings while preserving lines."""
+        if not isinstance(outline, str) or not outline.strip():
+            return []
+        lines = outline.splitlines()
+        starts = [i for i, line in enumerate(lines) if re.match(r"^\s*##\s+\S", line)]
+        if not starts:
+            starts = [
+                i for i, line in enumerate(lines)
+                if re.match(r"^\s*(?:\*\*)?\d+[\.?]\s*\S", line)
+                and not re.match(r"^\s*(?:\*\*)?\d+\.\d+", line)
+            ]
+        if not starts:
+            return [outline.strip()]
+
+        sections = []
+        prefix = lines[:starts[0]]
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+            section_lines = lines[start:end]
+            if position == 0 and any(line.strip() for line in prefix):
+                section_lines = prefix + section_lines
+            sections.append("\n".join(section_lines).strip())
+        return sections
+
+    @classmethod
+    def _validate_classifier_contract(
+        cls,
+        classification_result: str,
+        outline: str,
+        key_files: List[Dict],
+    ) -> Dict[str, Any]:
+        """Validate classifier output before it may be treated as a business success."""
+        if not isinstance(classification_result, str) or not classification_result.strip():
+            return {"valid": False, "message": "Classifier returned empty formal content."}
+        if not re.search(r"(?im)^\s*paragraph\s+\d+\s*:", classification_result):
+            return {"valid": False, "message": "Missing formal 'paragraph N:' marker."}
+        if not re.search(r"(?im)^\s*file_path_list\s*:", classification_result):
+            return {"valid": False, "message": "Missing formal 'file_path_list:' marker."}
+
+        block_pattern = re.compile(
+            r"(?ims)^\s*paragraph\s+(\d+)\s*:\s*(.*?)"
+            r"^\s*file_path_list\s*:\s*([^\r\n]*)(?=\r?\n\s*paragraph\s+\d+\s*:|\Z)"
+        )
+        blocks = block_pattern.findall(classification_result.strip())
+        expected_sections = cls._split_classifier_outline(outline)
+        if len(blocks) != len(expected_sections):
+            return {
+                "valid": False,
+                "message": f"Chapter count mismatch: expected {len(expected_sections)}, got {len(blocks)}.",
+            }
+
+        known_paths = {
+            item.get("file_path") for item in (key_files or [])
+            if isinstance(item, dict) and isinstance(item.get("file_path"), str)
+        }
+        parsed_sections = []
+        for index, (number_text, outline_text, paths_text) in enumerate(blocks, start=1):
+            if int(number_text) != index:
+                return {"valid": False, "message": "Paragraph numbering must be continuous from 1."}
+            actual_lines = [line.strip() for line in outline_text.strip().splitlines() if line.strip()]
+            expected_lines = [line.strip() for line in expected_sections[index - 1].splitlines() if line.strip()]
+            if actual_lines != expected_lines:
+                return {
+                    "valid": False,
+                    "message": f"Outline mismatch in paragraph {index}; headings/content must match line by line.",
+                }
+            paths = [path.strip() for path in re.split(r"[,\uFF0C]", paths_text) if path.strip()]
+            if not paths:
+                return {"valid": False, "message": f"Paragraph {index} has no assigned files."}
+            unknown_paths = [path for path in paths if path not in known_paths]
+            if unknown_paths:
+                return {
+                    "valid": False,
+                    "message": f"Paragraph {index} contains unknown file paths: {unknown_paths}.",
+                }
+            parsed_sections.append({"outline": "\n".join(actual_lines), "file_paths": paths})
+
+        return {"valid": True, "message": "Classifier output is trustworthy.", "sections": parsed_sections}
+
     def search_result_classifier(
             self,
             outline: str,
             key_files: List[Dict],
-            model: str = "gpt-4o",
+            model: Optional[str] = None,
             temperature: float = 0.3,
-            max_tokens: int = 4000,
+            max_tokens: int = 16384,
             reasoning_text: str = ""
     ) -> MCPToolResult:
         """
@@ -5956,6 +6235,11 @@ class MCPTools:
                 logger.warning(f"Failed to load file_analysis.jsonl: {e}, using empty list")
                 file_analysis_list = []
 
+            from src.utils.source_provenance import annotate_sources, partition_files
+            file_analysis_list = annotate_sources(file_analysis_list, self.workspace_path)
+            original_files, background_files = partition_files(key_files, file_analysis_list)
+            if background_files and original_files:
+                key_files = original_files
             for file_info in file_analysis_list:
                 if file_info.get('file_path'):
                     key_files_dict[file_info.get('file_path')] = file_info
@@ -5968,6 +6252,8 @@ class MCPTools:
                     if file_info.get('file_path') in key_files_dict:
                         file_info = key_files_dict[file_info.get('file_path')]
                         prompt_files += f"\n{i}. File: {file_info.get('file_path', 'Unknown')}\n"
+                        if file_info.get('source_role') == 'generated_background':
+                            prompt_files += "   Role: generated background for drafting only; not independent evidence.\n"
                         prompt_files += f"   Document Time: {file_info.get('doc_time', 'Not specified')}\n"
                         prompt_files += f"   Source Authority: {file_info.get('source_authority', 'Not specified')}\n"
                         prompt_files += f"   Core Content: {file_info.get('core_content', 'Not specified')}\n"
@@ -6268,63 +6554,71 @@ OUTLINE TO ORGANIZE CONTENT:
 """
 
             model_config = get_config().get_custom_llm_config()
-            # PANGU 模型配置
-            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
             model_name = model_config.get('model') or os.getenv("MODEL_NAME", "")
-            headers = {'Content-Type': 'application/json'}
+            if not model_name:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env.")
 
-            import requests
-            import litellm
-            try:
-                # Add retry logic for AI model call
-                max_retries = 5
-                response = None
-
-                for attempt in range(max_retries):
+            provider = (model_config.get("provider") or "").strip().lower()
+            if not provider or provider == "auto":
+                try:
+                    provider = get_model_provider(model_name)
+                except NameError:
                     try:
-                        response = requests.post(
-                            url=PANGU_URL,
-                            headers=headers,
-                            json={
-                                "model": model_name,
-                                "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                "messages": [
-                                    {"role": "system", "content": "system 1"},
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt}
-                                ],
-                                "max_tokens": max_tokens,
-                            },
-                            verify=False
-                        )
-                        response = response.json()
-                        logger.info(response)
-
-                        break  # Success, exit retry loop
+                        from config.config import get_model_provider as _get_model_provider
+                        provider = _get_model_provider(model_name)
                     except Exception as e:
-                        logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
-                        if attempt == max_retries - 1:
-                            raise e  # Last attempt, re-raise the exception
-                        time.sleep(5)  # Simple 1 second delay between retries
+                        logger.warning("get_model_provider unavailable: %s", e)
+                        provider = ""
+                except Exception as e:
+                    logger.warning("get_model_provider failed: %s", e)
+                    provider = ""
 
-                if response is None:
-                    raise Exception("Failed to get response after all retries")
+            if provider == "deepseek":
+                system_prompt += (
+                    "\n\nIMPORTANT (DeepSeek format enforcement): "
+                    "Output MUST use the exact 'paragraph N:' + 'file_path_list:' format. "
+                    "Do NOT output markdown headings (no '##' or '#'). "
+                    "Do NOT add extra commentary or numbering styles outside the required format."
+                )
+            ultra_compat_enabled = is_pangu_ultra_moe_compat_enabled(
+                model_name=model_name,
+                provider=provider,
+                enabled=model_config.get("pangu_ultra_moe_compat_enabled", False),
+            )
+            if ultra_compat_enabled:
+                system_prompt += (
+                    "\n\nIMPORTANT (pangu_ultra_moe format contract): "
+                    "Return ONLY repeated blocks in this exact form:\n"
+                    "paragraph N: <the exact corresponding outline section>\n"
+                    "file_path_list: <comma-separated paths copied exactly from the input>\n"
+                    "Use consecutive N values starting at 1. Do not output analysis, markdown "
+                    "fences, XML tags, headings outside paragraph content, or any other text."
+                )
+            effective_temperature = (
+                float(model_config.get("pangu_ultra_classifier_temperature", 0.0))
+                if ultra_compat_enabled else temperature
+            )
+            try:
+                ai_response = llm_chat(
+                    messages=[
+                        {"role": "system", "content": "system 1"},
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    model=model_name,
+                    temperature=effective_temperature,
+                    max_tokens=max(max_tokens, int(getattr(get_config(), "model_max_tokens", max_tokens) or max_tokens)),
+                    reject_truncated=True,
+                    timeout=model_config.get("timeout", 180),
+                    max_retries=5,
+                )
 
-                # ai_response = response.choices[0].message.content.strip()
-                # 添加防御性检查，避免NoneType错误
-                # 兼容 PANGU 模型：优先使用 content，如果为 None 则使用 reasoning_content
-                message = response.get("choices", [{}])[0].get("message", {})
-                content = message.get("content")
-
-                # 如果 content 为 None，尝试使用 reasoning_content
-                if content is None:
-                    content = message.get("reasoning_content")
-                    if content is not None:
-                        logger.info("Using reasoning_content as content is None")
-
-                if content is None:
-                    raise Exception(f"AI model returned None content and reasoning_content. Response: {response}")
-                ai_response = content.strip()
+                response_preview = ai_response[:500] if isinstance(ai_response, str) else str(ai_response)[:500]
+                logger.info(
+                    "search_result_classifier raw response len=%s preview=%s",
+                    len(ai_response) if isinstance(ai_response, str) else 0,
+                    response_preview
+                )
 
                 import os
                 import json
@@ -6336,13 +6630,95 @@ OUTLINE TO ORGANIZE CONTENT:
                 conversation_history = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": "[unused16][unused17]" + ai_response}
+                    # {"role": "assistant", "content": "[unused16][unused17]" + ai_response}
+                    {"role": "assistant", "content": ai_response}
                 ]
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps({"messages": conversation_history}, ensure_ascii=False) + "\n")
 
-                # 验证文件分配是否符合要求
+                # 验证格式契约。Ultra 只在工具内部进行有限次数的确定性纠错，
+                # 不把同一种格式失败重新交给 Writer 循环调用。
                 classification_result = ai_response.split('think>')[-1].strip()
+                classification_preview = classification_result[:500]
+                logger.info(
+                    "search_result_classifier parsed result len=%s preview=%s",
+                    len(classification_result),
+                    classification_preview
+                )
+                contract_result = self._validate_classifier_contract(
+                    classification_result,
+                    outline,
+                    key_files,
+                )
+                repair_attempts = 0
+                max_format_retries = (
+                    int(model_config.get("pangu_ultra_classifier_max_format_retries", 1))
+                    if ultra_compat_enabled else 0
+                )
+                # P0 scope permits at most one format-only repair call.
+                max_format_retries = max(0, min(max_format_retries, 1))
+                while not contract_result["valid"] and repair_attempts < max_format_retries:
+                    repair_attempts += 1
+                    logger.warning(
+                        "pangu_ultra_moe classifier format repair attempt=%s error=%s",
+                        repair_attempts,
+                        contract_result["message"],
+                    )
+                    repair_response = llm_chat(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a deterministic format repairer. Return only the "
+                                    "corrected classifier blocks. Preserve the outline text and "
+                                    "use only allowed file paths. Do not explain your changes."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    "REQUIRED FORMAT:\nparagraph N: <exact outline section>\n"
+                                    "file_path_list: <comma-separated allowed paths>\n\n"
+                                    f"VALIDATION ERROR:\n{contract_result['message']}\n\n"
+                                    f"ORIGINAL OUTLINE:\n{outline}\n\n"
+                                    f"ALLOWED FILE PATHS:\n"
+                                    + "\n".join(
+                                        str(item.get("file_path", ""))
+                                        for item in key_files
+                                        if isinstance(item, dict) and item.get("file_path")
+                                    )
+                                    + f"\n\nOUTPUT TO REPAIR:\n{classification_result}"
+                                ),
+                            },
+                        ],
+                        model=model_name,
+                        temperature=effective_temperature,
+                        max_tokens=max(
+                            max_tokens,
+                            int(getattr(get_config(), "model_max_tokens", max_tokens) or max_tokens),
+                        ),
+                        reject_truncated=True,
+                        timeout=model_config.get("timeout", 180),
+                        max_retries=1,
+                    )
+                    classification_result = repair_response.split('think>')[-1].strip()
+                    contract_result = self._validate_classifier_contract(
+                        classification_result,
+                        outline,
+                        key_files,
+                    )
+                if not contract_result["valid"]:
+                    logger.error("Classifier trust validation failed: %s", contract_result["message"])
+                    return MCPToolResult(
+                        success=False,
+                        error=f"Untrusted classification result: {contract_result['message']}",
+                        metadata={
+                            "error_type": "pangu_ultra_classifier_format_failure",
+                            "format_attempts": 1 + repair_attempts,
+                            "non_retryable_in_writer": bool(ultra_compat_enabled),
+                        } if ultra_compat_enabled else None,
+                    )
+
                 validation_result = self._validate_file_allocation(
                     classification_result,
                     user_file_count,
@@ -6494,16 +6870,10 @@ OUTLINE TO ORGANIZE CONTENT:
             return None
 
         if line.startswith("## "):
-            return line
+            return _normalize_report_heading_text(line)
 
-        clean = re.sub(r'^#+\s*', '', line).strip()
-        clean = re.sub(r'^\*\*(.+?)\*\*$', r'\1', clean).strip()
-        clean = re.sub(r'^[\*\-\s]+', '', clean)
-        clean = re.sub(r'[\*\s]+$', '', clean).strip()
-
-        if re.match(r'^\d+\.\d+\s+\S+', clean):
-            return clean
-        return None
+        parsed = _parse_numbered_report_heading(line)
+        return parsed.normalized if parsed else None
 
     @classmethod
     def _extract_expected_chapter_headings(cls, current_chapter_outline: str) -> List[str]:
@@ -6519,13 +6889,53 @@ OUTLINE TO ORGANIZE CONTENT:
         return expected
 
     @classmethod
-    def _extract_actual_chapter_headings(cls, content: str) -> List[str]:
+    def _chapter_non_heading_lines(
+        cls, content: str, expected_headings: Optional[List[str]] = None
+    ) -> set:
+        """Mask data/examples only for chapter checks; never change report text.
+
+        Explicit outline headings take precedence over numeric-row filtering.
+        Only closed fenced blocks are masked, so an unfinished fence does not
+        suppress the existing completeness checks on the remaining content.
+        """
+        ignored = set()
+        expected = set(expected_headings or [])
+        number = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?'
+        numeric_row = re.compile(rf'{number}(?:\s+{number})+')
+        fence_char = None
+        fence_length = 0
+        fence_start = 0
+        for index, raw_line in enumerate(content.split('\n')):
+            line = raw_line.strip()
+            if fence_char:
+                if re.fullmatch(re.escape(fence_char) + '{' + str(fence_length) + r',}\s*', line):
+                    ignored.update(range(fence_start, index + 1))
+                    fence_char = None
+                continue
+            fence = re.match(r'^(`{3,}|~{3,})(.*)$', line)
+            if fence and not (fence.group(1)[0] == '`' and '`' in fence.group(2)):
+                fence_char = fence.group(1)[0]
+                fence_length = len(fence.group(1))
+                fence_start = index
+                continue
+            if (numeric_row.fullmatch(_normalize_report_heading_text(line))
+                    and cls._normalize_chapter_heading(line) not in expected):
+                ignored.add(index)
+        return ignored
+
+    @classmethod
+    def _extract_actual_chapter_headings(
+        cls, content: str, expected_headings: Optional[List[str]] = None
+    ) -> List[str]:
         """Extract heading lines from generated chapter content."""
         if not content or not isinstance(content, str):
             return []
 
         actual = []
-        for raw_line in content.split('\n'):
+        ignored = cls._chapter_non_heading_lines(content, expected_headings)
+        for index, raw_line in enumerate(content.split('\n')):
+            if index in ignored:
+                continue
             line = raw_line.strip()
             if not line:
                 continue
@@ -6539,7 +6949,7 @@ OUTLINE TO ORGANIZE CONTENT:
     def _validate_chapter_structure(cls, content: str, current_chapter_outline: str) -> Dict[str, Any]:
         """Validate generated chapter headings strictly match the outline headings."""
         expected = cls._extract_expected_chapter_headings(current_chapter_outline)
-        actual = cls._extract_actual_chapter_headings(content)
+        actual = cls._extract_actual_chapter_headings(content, expected)
 
         if expected == actual:
             return {
@@ -6556,6 +6966,162 @@ OUTLINE TO ORGANIZE CONTENT:
             "actual": actual
         }
 
+    @classmethod
+    def _validate_chapter_body_completeness(
+        cls,
+        content: str,
+        current_chapter_outline: str,
+        min_chars: int = 30,
+        detect_half_sentence: bool = False
+    ) -> Dict[str, Any]:
+        """[方案2] Add-on check on top of _validate_chapter_structure (which only
+        compares heading lines). Verifies each level-2 subsection has non-empty body
+        text and the chapter is not truncated. Chapters without level-2 headings
+        (e.g. Abstract/Introduction) are exempt to avoid false positives.
+        """
+        result = {"valid": True, "empty_sections": [], "truncated": False, "detail": {}}
+        if not content or not isinstance(content, str):
+            return result
+
+        lines = content.split('\n')
+
+        ignored = cls._chapter_non_heading_lines(
+            content, cls._extract_expected_chapter_headings(current_chapter_outline)
+        )
+        # Locate level-2 subsection heading line indices (e.g. "6.4 Title")
+        heading_positions = []
+        for idx, raw in enumerate(lines):
+            if idx in ignored:
+                continue
+            norm = cls._normalize_chapter_heading(raw)
+            if norm and re.match(r'^\d+\.\d+\s+\S+', norm):
+                heading_positions.append((idx, norm))
+
+        def _meaningful_len(body_lines: List[str]) -> int:
+            count = 0
+            for bl in body_lines:
+                s = bl.strip()
+                if not s:
+                    continue
+                # skip markdown table separator rows like |---|:--:|
+                if re.match(r'^\|?[\s\-:|]+\|?$', s):
+                    continue
+                # count only meaningful characters (drop pipes / md symbols / spaces)
+                count += len(re.sub(r'[\s|`*_#>\-]', '', s))
+            return count
+
+        # Per-subsection body emptiness (only when level-2 headings exist)
+        for i, (idx, title) in enumerate(heading_positions):
+            start = idx + 1
+            end = heading_positions[i + 1][0] if i + 1 < len(heading_positions) else len(lines)
+            body_len = _meaningful_len(lines[start:end])
+            result["detail"][title] = body_len
+            if body_len < min_chars:
+                result["empty_sections"].append(title)
+
+        # Trailing truncation detection (conservative, high-confidence signals only)
+        last_nonempty = ""
+        last_index = -1
+        for idx in range(len(lines) - 1, -1, -1):
+            raw = lines[idx]
+            if raw.strip():
+                last_nonempty = raw.strip()
+                last_index = idx
+                break
+        if last_nonempty and last_index not in ignored:
+            if cls._normalize_chapter_heading(last_nonempty):
+                # chapter ends on a heading with no following body
+                result["truncated"] = True
+            elif last_nonempty.startswith('|') and not last_nonempty.endswith('|'):
+                # unclosed table row (e.g. cut mid-cell)
+                result["truncated"] = True
+            elif detect_half_sentence and not last_nonempty.endswith('|'):
+                # 先剥离尾部 markdown 修饰符再判终止标点：既能捕获悬挂标题（如 "**表"）
+                # 与半句截断（如 "...O-N-O键角"），又不误伤 "...。**" / 完整表格行 / 分隔线
+                stripped = last_nonempty.rstrip('*_~')
+                if stripped and stripped[-1] not in '.!?。！？)]}』」”"\'`':
+                    result["truncated"] = True
+
+        if result["empty_sections"] or result["truncated"]:
+            result["valid"] = False
+        return result
+
+    @classmethod
+    def _annotate_incomplete_chapter(cls, content: str, body_validation: Dict[str, Any]) -> str:
+        """[兜底B] 在报告中为未完成部分插入用户可见提示（零 LLM 调用、不改动已有正文）：
+        - 空子节：在对应子节标题下插入提示；
+        - 尾部截断：在章节末尾追加提示。"""
+        if not content or not isinstance(content, str):
+            return content
+        empty_titles = set(body_validation.get("empty_sections") or [])
+        empty_notice = (
+            "> ⚠️ 本小节内容未能完整生成，建议重试该任务后重新生成本章节。"
+            "(This subsection was not fully generated. Please retry the task.)"
+        )
+        truncated_notice = (
+            "> ⚠️ 本章节末尾内容可能因生成中断而不完整，建议重试该任务后重新生成本章节。"
+            "(The end of this chapter may be incomplete due to interrupted generation. Please retry the task.)"
+        )
+        lines = content.split('\n')
+        annotated: List[str] = []
+        for raw in lines:
+            annotated.append(raw)
+            if empty_titles:
+                norm = cls._normalize_chapter_heading(raw)
+                if norm in empty_titles:
+                    annotated.append("")
+                    annotated.append(empty_notice)
+                    empty_titles.discard(norm)
+        result = '\n'.join(annotated)
+        if body_validation.get("truncated"):
+            result = result.rstrip() + "\n\n" + truncated_notice + "\n"
+        return result
+
+    @classmethod
+    def _repair_chapter_structure_once(
+        cls, content, current_chapter_outline, overall_outline,
+        *, model, timeout, max_tokens
+    ):
+        """Single structure-repair LLM call: fix heading structure only, keep body.
+
+        Returns the repaired chapter text after _correct_title_format. Shared by
+        section_writer's first-round structure repair and the direction-D completion
+        acceptance gate (single source of the repair prompt).
+
+        This method does NOT catch exceptions, retry or sleep; retry/backoff/logging
+        are owned by the caller's loop. On LLM failure the exception propagates.
+        """
+        repair_system_prompt = """You are a strict markdown structure fixer.
+Your only goal is to fix heading structure.
+Rules:
+1) Keep the chapter body content as much as possible.
+2) Heading lines MUST exactly match EXPECTED CHAPTER OUTLINE headings in the same order.
+3) Do NOT add extra headings.
+4) Keep level-1 heading with ##, and level-2 headings as plain text like '2.1 Title'.
+5) Return only <chapter_content>...</chapter_content>."""
+        repair_user_prompt = f"""EXPECTED CHAPTER OUTLINE:
+{current_chapter_outline}
+
+CURRENT CHAPTER CONTENT:
+{content}
+"""
+        repaired_text = llm_chat(
+            messages=[
+                {"role": "system", "content": repair_system_prompt},
+                {"role": "user", "content": repair_user_prompt + " /no_think"},
+            ],
+            model=model,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            max_retries=1,
+            reject_truncated=True,
+        )
+        repaired_content = repaired_text
+        if "<chapter_content>" in repaired_text:
+            repaired_content = repaired_text.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
+        return cls._correct_title_format(repaired_content, overall_outline)
+
     def section_writer(
             self,
             written_chapters_summary: str,
@@ -6565,7 +7131,7 @@ OUTLINE TO ORGANIZE CONTENT:
             overall_outline: str,
             target_file_path: str,
             key_files: List[Dict],
-            model: str = "pangu_auto",
+            model: Optional[str] = None,
             temperature: Optional[float] = None,
             max_tokens: Optional[int] = None
     ) -> MCPToolResult:
@@ -6591,8 +7157,14 @@ OUTLINE TO ORGANIZE CONTENT:
             # Use config values or defaults
             if temperature is None:
                 temperature = model_config.get('temperature', 0.3)
-            if max_tokens is None:
-                max_tokens = model_config.get('max_tokens', 8192)
+            # 整章输出预算不得被工具 schema 的历史默认值 5000 意外压低。
+            configured_max_tokens = int(model_config.get('max_tokens', 8192) or 8192)
+            requested_max_tokens = int(max_tokens) if max_tokens is not None else configured_max_tokens
+            max_tokens = max(requested_max_tokens, configured_max_tokens)
+            logger.info(
+                '[section_writer] token budget: requested=%s, configured=%s, effective=%s',
+                requested_max_tokens, configured_max_tokens, max_tokens
+            )
 
             # ============================================================
             # LANGUAGE DETECTION: explicitly detect query language at the
@@ -6624,6 +7196,7 @@ OUTLINE TO ORGANIZE CONTENT:
                 if file_info.get('file_path'):
                     key_files_dict[file_info.get('file_path')] = file_info
 
+            source_evidence = {}
             prompt_files = ""
             if key_files:
                 prompt_files += f"Web Information Source(s) As Follows::\n"
@@ -6646,9 +7219,22 @@ OUTLINE TO ORGANIZE CONTENT:
                                 return f"[Error reading file {file_path}: {str(e)}]"
 
                         file_content = get_file_head_content(file_path)
+                        if (file_info.get('doc_time') == 'Processing failed' or not file_content.strip()
+                                or file_content.startswith(('[Error:', '[Error reading file'))):
+                            logger.warning('[SourcePreflight] unusable chapter source: %s', file_path)
+                            continue
+                        if file_info.get('source_role') == 'generated_background':
+                            prompt_files += (
+                                "\nBACKGROUND ONLY (not a citable source):\n" + file_content +
+                                "\nDo not cite this file or copy its numeric citations. "
+                                "If no original evidence is supplied, state the evidence limitation "
+                                "and present recommendations as proposals, not verified facts.\n"
+                            )
+                            continue
                         doc_time = file_info.get('doc_time', 'Not specified')
                         source_authority = file_info.get('source_authority', 'Not specified')
                         task_relevance = file_info.get('task_relevance', 'Not specified')
+                        source_evidence[index] = file_content
                         # Build metadata labels in the SAME language as the query
                         if is_english_query:
                             prompt_files += (
@@ -6779,7 +7365,7 @@ OUTLINE TO ORGANIZE CONTENT:
 {language_instruction_section_writer}
 
 {user_file_priority_note}When drafting the current chapter content, strictly comply with the following requirements:
-- ⚠️ **CRITICAL CITATION REQUIREMENT - CITE ALL FILES**: In the web page information I gave you, each result is in the format of [webpage X begin]...[webpage X end], where X represents the numerical index of each article. **YOU MUST cite ALL provided webpages at least once in your chapter**. This is NON-NEGOTIABLE. Please cite the context at the end of the sentence when appropriate. Please cite the context in the corresponding part of the answer in the format of the reference number [X]. If a sentence comes from multiple contexts, please list all relevant reference numbers, such as [3][5]. Remember not to collect the references at the end and return the reference numbers, but list them in the corresponding part of the answer. **MANDATORY VERIFICATION**: Before submitting your chapter, verify that you have cited EVERY webpage (1 through {len(key_files) if key_files else 0}) at least once. Count your citations: webpage 1 [✓/✗], webpage 2 [✓/✗], etc. If any webpage is not cited, GO BACK and find appropriate places to cite it. **SPECIAL EMPHASIS**: User-uploaded files (typically webpages 1-{user_file_count if has_user_files else 0}) MUST be cited multiple times (3-5 times each) when they contain relevant information.
+- Cite only supplied numbered original sources that support the claim, using their exact [X] identifiers. Background working notes are not independent evidence and must never be cited. Important facts, quantitative data, cases and borrowed methods must cite supporting evidence using the exact global IDs; never restart numbering at 1. Original recommendations may be uncited if clearly presented as proposals. A substantive chapter with supplied evidence should not have zero citations. Do not force a citation to every file. If no numbered sources are available, write without numeric citations. Do not append citation-verification notices or source-availability notices to the report; verification status is recorded separately by the system.
 - You can only use the provided web page information for writing, don't make up any content, ensure the accuracy of the facts. Note that when there are contradictions between the facts described in the above search results, you should use your internal knowledge to reasonably identify the correct information. If identification is impossible, you may select the most factual result based on the authority of the web pages and a voting mechanism (e.g., the description consistent with the majority of web pages). If judgment remains impossible using these methods, you may appropriately list possible differing statements, but you must not conflate different claims—prioritize ensuring factual accuracy!
 - You are only permitted to write content strictly within the provided chapter framework. You are forbidden from creating additional subheadings or bullet points within the framework! However, there is a special exception: **You should proactively and actively use Markdown tables to present structured data**. When encountering data comparisons, technical parameters, multi-dimensional comparisons, statistical data, feature contrasts, timeline events, or any scenario where information can be organized in rows and columns, you MUST use tables instead of pure text narration. Tables greatly improve readability and information density. Furthermore, you are not allowed to use concise or summarizing language for narration! We must strictly ensure the information density of the writing and avoid excessive compression.
 - You cannot make any changes to the structure of the chapter you are currently writing, such as the title content and the bold symbols in the title, you are not allowed to make any changes. **CRITICAL: Sub-heading numbers MUST match the chapter number.** For example, if the current chapter is "## 1. Title", then sub-headings MUST be "1.1 ...", "1.2 ...", NOT "2.1 ...". If the current chapter is "## 3. Title", sub-headings must be "3.1 ...", "3.2 ...", etc. Always derive the sub-heading prefix from the chapter number in current_chapter_outline. **Important Note:** When writing Chapter 1, if you find the chapter lacks article title, you must create one based on user query. However, this rule only applies to Chapter 1 - do not add any titles to any other chapters in the work.
@@ -6812,46 +7398,37 @@ Strictly follow the following format for output:
             # Get model URL and token from config
             config = get_config()
             model_config = config.get_custom_llm_config()
+            request_timeout = int(model_config.get("timeout", 180))
+            configured_model = model_config.get('model')
+            model_override = (model or "").strip()
+            if model_override == "MODEL_NAME":
+                model_override = ""
+            if configured_model and model_override:
+                logger.warning(
+                    "section_writer ignoring tool-supplied model=%s; using configured model=%s",
+                    model_override,
+                    configured_model,
+                )
+            effective_model = configured_model or model_override
+            if not effective_model:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env or pass model explicitly.")
 
-            model_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
             try:
-                max_retries = 5
-                response = None
-                for attempt in range(max_retries):
-                    try:
-                        response = requests.post(
-                            url=model_url,
-                            headers=headers,
-                            json={
-                                "model": model_config.get('model', 'pangu_auto'),
-                                "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                "messages": [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt + " /no_think"}
-                                ],
-                                "spaces_between_special_tokens": False,
-                                "max_tokens": max_tokens,
-                                "temperature": temperature,
-                            },
-                            timeout=model_config.get("timeout", 180)
-                        )
-                        response = response.json()
-                        logger.debug(f"API response received")
-
-                        break  # Success, exit retry loop
-                    except Exception as e:
-                        logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
-                        if attempt == max_retries - 1:
-                            raise e  # Last attempt, re-raise the exception
-                        time.sleep(5)  # Simple 1 second delay between retries
-
-                if response is None:
-                    raise Exception("Failed to get response after all retries")
-
-                # ai_response = response.choices[0].message.content.strip()
-                ai_response = response["choices"][0]["message"]["content"].strip()
+                max_retries = int(getattr(config, "max_retries", 3))
+                logger.info(
+                    f"section_writer generation start, retries={max_retries}, timeout={request_timeout}s")
+                ai_response = llm_chat(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt + " /no_think"},
+                    ],
+                    model=effective_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=request_timeout,
+                    max_retries=max_retries,
+                    reject_truncated=True,
+                )
 
                 # Extract content from first response
                 content = ""
@@ -6859,6 +7436,16 @@ Strictly follow the following format for output:
                     content = ai_response.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
                 else:
                     content = ai_response
+
+                content, marker_issues = normalize_and_validate_report(
+                    content, source_citations=True
+                )
+                if marker_issues:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"section writer 输出仍包含内部标记: {marker_issues[:10]}",
+                        metadata={"internal_marker_issues": marker_issues[:10]},
+                    )
 
                 logger.debug(f"Content before correction: {content[:200]}...")
                 logger.debug(f"Overall outline: {overall_outline[:200]}...")
@@ -6872,46 +7459,14 @@ Strictly follow the following format for output:
                         f"Chapter structure mismatch detected, trying auto-repair. "
                         f"Expected={structure_validation.get('expected')}, Actual={structure_validation.get('actual')}"
                     )
-                    repair_system_prompt = """You are a strict markdown structure fixer.
-Your only goal is to fix heading structure.
-Rules:
-1) Keep the chapter body content as much as possible.
-2) Heading lines MUST exactly match EXPECTED CHAPTER OUTLINE headings in the same order.
-3) Do NOT add extra headings.
-4) Keep level-1 heading with ##, and level-2 headings as plain text like '2.1 Title'.
-5) Return only <chapter_content>...</chapter_content>."""
-                    repair_user_prompt = f"""EXPECTED CHAPTER OUTLINE:
-{current_chapter_outline}
-
-CURRENT CHAPTER CONTENT:
-{content}
-"""
-
-                    repaired_response = None
                     for attempt in range(3):
                         try:
-                            repaired_response = requests.post(
-                                url=model_url,
-                                headers=headers,
-                                json={
-                                    "model": model_config.get('model', 'pangu_auto'),
-                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                    "messages": [
-                                        {"role": "system", "content": repair_system_prompt},
-                                        {"role": "user", "content": repair_user_prompt + " /no_think"}
-                                    ],
-                                    "spaces_between_special_tokens": False,
-                                    "max_tokens": max_tokens,
-                                    "temperature": 0.0,
-                                },
-                                timeout=model_config.get("timeout", 180)
+                            content = self._repair_chapter_structure_once(
+                                content, current_chapter_outline, overall_outline,
+                                model=effective_model,
+                                timeout=request_timeout,
+                                max_tokens=max_tokens,
                             )
-                            repaired_response = repaired_response.json()
-                            repaired_text = repaired_response["choices"][0]["message"]["content"].strip()
-                            repaired_content = repaired_text
-                            if "<chapter_content>" in repaired_text:
-                                repaired_content = repaired_text.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
-                            content = self._correct_title_format(repaired_content, overall_outline)
                             structure_validation = self._validate_chapter_structure(content, current_chapter_outline)
                             if structure_validation.get("valid"):
                                 logger.info("Chapter structure auto-repair succeeded.")
@@ -6930,46 +7485,199 @@ CURRENT CHAPTER CONTENT:
                             f"expected={structure_validation.get('expected')}, actual={structure_validation.get('actual')}"
                         )
                     )
+                # [方案2] 正文完整性校验（空子节 / 截断检测）——仅新增分支，正常章节零影响。
+                # 主力：定向补全（保留已有正文、只补空子节）；兜底：默认 A（显式失败并触发整章重试），仅调试时可显式配置 B 写入告警产物。
+                EMPTY_SECTION_MIN_CHARS = 200
+                BODY_REPAIR_MAX_ATTEMPTS = 2
+                body_incomplete_strategy = str(
+                    (model_config.get("body_incomplete_strategy") if isinstance(model_config, dict) else None)
+                    or os.environ.get("BODY_INCOMPLETE_STRATEGY", "A")
+                ).strip().upper()
+
+                body_validation = self._validate_chapter_body_completeness(
+                    content, current_chapter_outline, min_chars=EMPTY_SECTION_MIN_CHARS,
+                    detect_half_sentence=True
+                )
+                if not body_validation.get("valid"):
+                    logger.warning(
+                        f"[section_writer] 检测到正文不完整: empty_sections={body_validation.get('empty_sections')}, "
+                        f"truncated={body_validation.get('truncated')}, detail={body_validation.get('detail')}"
+                    )
+                    for _body_attempt in range(BODY_REPAIR_MAX_ATTEMPTS):
+                        _empty_list = body_validation.get("empty_sections") or []
+                        completion_system_prompt = (
+                            "You are a chapter completion assistant. The chapter below is INCOMPLETE: "
+                            "some subsections have empty or truncated body text.\n"
+                            "STRICT RULES:\n"
+                            "1) KEEP ALL EXISTING BODY TEXT EXACTLY AS-IS. Do NOT rewrite, summarize, reorder, or delete any existing content.\n"
+                            "2) Only ADD the missing body text for the empty/truncated subsections, and complete any truncated table/sentence.\n"
+                            "3) Keep ALL heading lines identical (same numbering, same wording, same order). Do NOT add or remove headings.\n"
+                            "4) Write in the SAME language as the existing chapter content.\n"
+                            "5) Return the FULL chapter wrapped in <chapter_content>...</chapter_content>."
+                        )
+                        completion_user_prompt = (
+                            f"EMPTY/TRUNCATED SUBSECTIONS TO COMPLETE: {_empty_list}; truncated={body_validation.get('truncated')}\n\n"
+                            f"CURRENT CHAPTER OUTLINE:\n{current_chapter_outline}\n\n"
+                            f"WEB PAGE INFORMATION: {prompt_files}\n\n"
+                            f"CURRENT (INCOMPLETE) CHAPTER CONTENT:\n{content}"
+                        )
+                        try:
+                            completion_response = llm_chat(
+                                messages=[
+                                    {"role": "system", "content": completion_system_prompt},
+                                    {"role": "user", "content": completion_user_prompt + " /no_think"},
+                                ],
+                                model=effective_model,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                timeout=request_timeout,
+                                max_retries=1,
+                                reject_truncated=True,
+                            )
+                            completed_content = completion_response
+                            if "<chapter_content>" in completion_response:
+                                completed_content = completion_response.split("<chapter_content>")[1].split("</chapter_content>")[0].strip()
+                            completed_content = self._correct_title_format(completed_content, overall_outline)
+                            # 补全后必须同时通过“标题结构校验”与“正文完整性校验”，否则丢弃本次补全结果
+                            recheck_structure = self._validate_chapter_structure(completed_content, current_chapter_outline)
+                            recheck_body = self._validate_chapter_body_completeness(
+                                completed_content, current_chapter_outline, min_chars=EMPTY_SECTION_MIN_CHARS,
+                                detect_half_sentence=True
+                            )
+                            # [方向D] 正文已补全但仅标题结构不符 → 不丢弃，先尝试结构自动修复
+                            if recheck_body.get("valid") and not recheck_structure.get("valid"):
+                                logger.info("[section_writer][方向D] 补全正文合格但标题结构不符，尝试结构自动修复而非丢弃")
+                                for _fix_attempt in range(2):
+                                    try:
+                                        repaired = self._repair_chapter_structure_once(
+                                            completed_content, current_chapter_outline, overall_outline,
+                                            model=effective_model,
+                                            timeout=request_timeout,
+                                            max_tokens=max_tokens,
+                                        )
+                                        r_struct = self._validate_chapter_structure(repaired, current_chapter_outline)
+                                        r_body = self._validate_chapter_body_completeness(
+                                            repaired, current_chapter_outline, min_chars=EMPTY_SECTION_MIN_CHARS,
+                                            detect_half_sentence=True
+                                        )
+                                        if r_struct.get("valid") and r_body.get("valid"):
+                                            completed_content = repaired
+                                            recheck_structure = r_struct
+                                            recheck_body = r_body
+                                            logger.info("[section_writer][方向D] 结构自动修复成功，接受补全结果")
+                                            break
+                                        else:
+                                            logger.warning(
+                                                f"[section_writer][方向D] 结构自动修复后仍不达标（第{_fix_attempt + 1}次）："
+                                                f"structure_valid={r_struct.get('valid')}, body_valid={r_body.get('valid')}"
+                                            )
+                                    except Exception as _fix_err:
+                                        logger.warning(f"[section_writer][方向D] 结构自动修复异常（第{_fix_attempt + 1}次）: {_fix_err}")
+                                    if _fix_attempt < 1:
+                                        time.sleep(2)
+                            if recheck_structure.get("valid") and recheck_body.get("valid"):
+                                content = completed_content
+                                structure_validation = recheck_structure
+                                body_validation = recheck_body
+                                logger.info(f"[section_writer] 正文补全成功（第{_body_attempt + 1}次尝试）")
+                                break
+                            else:
+                                logger.warning(
+                                    f"[section_writer] 补全结果未通过校验（第{_body_attempt + 1}次）："
+                                    f"structure_valid={recheck_structure.get('valid')}, body_valid={recheck_body.get('valid')}；丢弃本次结果"
+                                )
+                        except Exception as completion_err:
+                            logger.warning(f"[section_writer] 正文补全异常（第{_body_attempt + 1}次）: {completion_err}")
+                            if _body_attempt == BODY_REPAIR_MAX_ATTEMPTS - 1:
+                                break
+                            time.sleep(2)
+
+                    # 补全后仍不完整 → 按兜底策略处理
+                    if not body_validation.get("valid"):
+                        if body_incomplete_strategy == "A":
+                            return MCPToolResult(
+                                success=False,
+                                error=(
+                                    "section writer failed: chapter body incomplete after completion attempts. "
+                                    f"empty_sections={body_validation.get('empty_sections')}, truncated={body_validation.get('truncated')}"
+                                )
+                            )
+                        else:
+                            logger.warning(
+                                "[section_writer] 正文补全仍不完整，按兜底策略 B 保留已有内容并写盘（标记 body_incomplete）: "
+                                f"empty_sections={body_validation.get('empty_sections')}, truncated={body_validation.get('truncated')}"
+                            )
+                            # [兜底B] 在报告中为未完成部分插入用户可见提示（零 LLM 调用、不改动已有正文）
+                            content = self._annotate_incomplete_chapter(content, body_validation)
+
+                # Check final chapter after all structure/body repairs, before summary and save.
+                from src.utils.chapter_citations import citation_ids, review_chapter_citations
+                cross_evidence = {}
+                previous_ids = citation_ids(str(written_chapters_summary or ''))
+                unresolved = citation_ids(content) - set(source_evidence)
+                # Cross-chapter reuse is allowed only with identifiable previous IDs and actual originals.
+                for source_id in sorted(unresolved & previous_ids)[:4]:
+                    if 1 <= source_id <= len(file_analysis_list):
+                        source_row = file_analysis_list[source_id - 1]
+                        if (source_row.get('source_role') != 'generated_background'
+                                and source_row.get('doc_time') != 'Processing failed'):
+                            try:
+                                original = self._safe_join(source_row['file_path'])
+                                cross_evidence[source_id] = original.read_text(
+                                    encoding='utf-8', errors='ignore')[:10000]
+                            except (OSError, ValueError, KeyError):
+                                pass
+
+                def repair_citations_only(chapter, evidence, issues):
+                    evidence_text = "\n".join(
+                        f"[webpage{number} begin]\n{text}\n[webpage{number} end]"
+                        for number, text in evidence.items())
+                    return llm_chat(
+                        messages=[
+                            {"role": "system", "content": (
+                                "Repair citations only. Preserve every word, heading, table and whitespace "
+                                "of the chapter; only insert, delete or replace numeric citations [X]. "
+                                "Use the exact global IDs from the evidence. Never number sources locally. "
+                                "Cite evidence supporting important factual claims, data, cases and borrowed methods. "
+                                "Do not force every source to be cited or attach unrelated evidence. "
+                                "Cross-chapter sources may be used only if the supplied original text supports the claim. "
+                                "If evidence cannot support a claim, do not invent a citation. "
+                                "Return the full chapter inside <chapter_content> tags, without commentary.")},
+                            {"role": "user", "content": (
+                                f"Issues: {issues}\nOriginal evidence:\n{evidence_text}"
+                                f"\nChapter:\n<chapter_content>{chapter}</chapter_content> /no_think")},
+                        ], model=effective_model, temperature=0,
+                        max_tokens=max_tokens, timeout=request_timeout,
+                        max_retries=1, reject_truncated=True,
+                    )
+
+                content, citation_review = review_chapter_citations(
+                    content, source_evidence, cross_evidence, repair_citations_only,
+                    chinese=not is_english_query,
+                )
+                if citation_review['repair_attempted'] or citation_review['no_original_evidence']:
+                    logger.warning("[ChapterCitations] %s: %s", target_file_path, citation_review)
+                # Summary must describe the accepted content, not the uncorrected initial response.
+                ai_response = "<chapter_content>" + content + "</chapter_content>"
+
                 # Second round: Request summary
                 summary_prompt = "Please give a brief summary of the output chapter content. Be sure to ensure that the language of the summary is consistent with the language of the output chapter content. For example, if the chapter content is in Chinese, your summary should also be in Chinese."
 
-                summary_response = None
-                max_retries = 5
-                for attempt in range(max_retries):
-                    try:
-                        summary_response = requests.post(
-                            url=model_url,
-                            headers=headers,
-                            json={
-                                "model": model_config.get('model', 'pangu_auto'),
-                                "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                "messages": [
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt + " /no_think"},
-                                    {"role": "assistant", "content": ai_response},
-                                    {"role": "user", "content": summary_prompt + " /no_think"}
-                                ],
-                                "max_tokens": max_tokens,
-                                "spaces_between_special_tokens": False,
-                                "temperature": temperature,
-                            },
-                            timeout=model_config.get("timeout", 180)
-                        )
-                        summary_response = summary_response.json()
-                        logger.debug(f"Summary API response received")
-
-                        break  # Success, exit retry loop
-                    except Exception as e:
-                        logger.warning(f"Summary LLM API call attempt {attempt + 1} failed: {e}")
-                        if attempt == max_retries - 1:
-                            raise e  # Last attempt, re-raise the exception
-                        time.sleep(5)  # Simple delay between retries
-
-                if summary_response is None:
-                    raise Exception("Failed to get summary response after all retries")
-
-                # summary_ai_response = summary_response.choices[0].message.content.strip()
-                summary_ai_response = summary_response["choices"][0]["message"]["content"].strip()
+                logger.info(
+                    f"section_writer summary start, retries={max_retries}, timeout={request_timeout}s")
+                summary_ai_response = llm_chat(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt + " /no_think"},
+                        {"role": "assistant", "content": ai_response},
+                        {"role": "user", "content": summary_prompt + " /no_think"},
+                    ],
+                    model=effective_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=request_timeout,
+                    max_retries=max_retries,
+                )
                 summary = summary_ai_response
 
                 session_context = self.get_session_context()
@@ -6986,6 +7694,15 @@ CURRENT CHAPTER CONTENT:
                 ]
 
                 # 把当前内容写入到target_file_path中
+                # [FIX-P1] 写入前先删除已存在的目标文件，防止旧内容残留
+                target_full_path = self._safe_join(target_file_path)
+                if os.path.exists(target_full_path):
+                    try:
+                        os.remove(target_full_path)
+                        logger.info(f"[section_writer] 清理旧章节文件: {target_full_path}")
+                    except Exception as e:
+                        logger.warning(f"[section_writer] 清理旧章节文件失败: {e}")
+
                 write_result = self.file_write(file_path=target_file_path,
                                                content=content,
                                                create_dirs=True)
@@ -7002,7 +7719,11 @@ CURRENT CHAPTER CONTENT:
                     metadata={
                         'content_length': len(content),
                         'summary_length': len(summary),
-                        'structure_valid': structure_validation.get("valid", False)
+                        'citation_review': citation_review,
+                        'structure_valid': structure_validation.get("valid", False),
+                        'body_incomplete': not body_validation.get("valid", True),
+                        'empty_sections': body_validation.get("empty_sections", []),
+                        'truncated': body_validation.get("truncated", False),
                     }
                 )
 
@@ -7017,14 +7738,29 @@ CURRENT CHAPTER CONTENT:
             logger.error(f"section writer failed: {e}")
             return MCPToolResult(success=False, error=str(e))
 
+    def prepare_writer_sources(self, key_files: List[Dict], user_query: str) -> MCPToolResult:
+        """Internal one-shot registration check, before Writer assigns source IDs."""
+        from src.utils.source_preflight import prepare_sources
+        try:
+            result = prepare_sources(
+                self.workspace_path, key_files, user_query,
+                lambda tasks: self.document_extract(
+                    tasks=tasks, max_workers=3, max_tokens=4096, _writer_preflight=True),
+            )
+            logger.info('[SourcePreflight] %s', result['metadata'])
+            return MCPToolResult(success=True, data=result)
+        except Exception as exc:
+            logger.warning('[SourcePreflight] unavailable; preserving handoff: %s', exc)
+            return MCPToolResult(success=False, error=str(exc))
+
     def document_extract(
             self,
-            # save_analysis_file_path: str,
             tasks: List[Dict],
-            model: str = "pangu_auto",
+            model: Optional[str] = None,
             temperature: Optional[float] = None,
             max_tokens: Optional[int] = None,
-            max_workers: int = 5
+            max_workers: int = 5,
+            _writer_preflight: bool = False,
     ) -> MCPToolResult:
         """
         Multi-dimensional analysis of locally stored files using AI models.
@@ -7045,6 +7781,19 @@ CURRENT CHAPTER CONTENT:
             from config.config import get_model_config, get_storage_config
             model_config = get_model_config()
             storage_config = get_storage_config()
+            configured_model = model_config.get('model')
+            model_override = (model or "").strip()
+            if model_override == "MODEL_NAME":
+                model_override = ""
+            if configured_model and model_override:
+                logger.warning(
+                    "document_extract ignoring tool-supplied model=%s; using configured model=%s",
+                    model_override,
+                    configured_model,
+                )
+            effective_model = configured_model or model_override
+            if not effective_model:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env or pass model explicitly.")
 
             # Use config values or defaults
             if temperature is None:
@@ -7111,7 +7860,7 @@ CURRENT CHAPTER CONTENT:
                         continue
 
             # 如果这些目录有文件，则进行补全检查
-            if expected_files:
+            if expected_files and not _writer_preflight:
                 # 智能匹配：基于文件主体名称（保留原始扩展名，移除 .txt 后缀）
                 def get_core_name(path: str) -> str:
                     """
@@ -7285,48 +8034,19 @@ CURRENT CHAPTER CONTENT:
                 config = get_config()
                 model_config = config.get_custom_llm_config()
 
-                model_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-                model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-                headers = {'Content-Type': 'application/json', 'csb-token': model_token}
-
                 try:
-                    # Add retry logic for AI model call
-                    max_retries = 5
-                    response = None
-
-                    for attempt in range(max_retries):
-                        try:
-                            response = requests.post(
-                                url=model_url,
-                                headers=headers,
-                                json={
-                                    "model": model_config.get('model', 'pangu_auto'),
-                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                    "messages": [
-                                        {"role": "system", "content": system_prompt},
-                                        {"role": "user", "content": user_prompt + " /no_think"}
-                                    ],
-                                    "max_tokens": max_tokens,
-                                    "spaces_between_special_tokens": False,
-                                    "temperature": temperature,
-                                },
-                                timeout=model_config.get("timeout", 180)
-                            )
-                            response = response.json()
-                            logger.info(f"LLM API response: {response}")
-
-                            break  # Success, exit retry loop
-                        except Exception as e:
-                            logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
-                            if attempt == max_retries - 1:
-                                raise e  # Last attempt, re-raise the exception
-                            time.sleep(4)  # Simple 1 second delay between retries
-
-                    if response is None:
-                        raise Exception("Failed to get response after all retries")
-
-                    # answer = response.choices[0].message.content
-                    answer = response["choices"][0]["message"]["content"]
+                    answer = llm_chat(
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt + " /no_think"},
+                        ],
+                        model=effective_model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=min(model_config.get("timeout", 180), 180) if _writer_preflight else model_config.get("timeout", 180),
+                        max_retries=1 if _writer_preflight else 5,
+                        retry_sleep=4.0,
+                    )
 
                     session_context = self.get_session_context()
                     session_id = session_context.get("session_id")
@@ -7970,6 +8690,11 @@ CURRENT CHAPTER CONTENT:
                         "journal": ""
                     })
 
+            if _writer_preflight:
+                # The bounded handoff caller owns persistence; never run the
+                # legacy de-duplication/user-upload reorder on this path.
+                return MCPToolResult(success=True, data=structured_results)
+
             # Save structured results to JSON file
             # Create full path relative to workspace
             analysis_path = storage_config.get('document_analysis_path', './doc_analysis')
@@ -8105,7 +8830,8 @@ CURRENT CHAPTER CONTENT:
     def document_qa(
             self,
             tasks: List[Dict],
-            model: str = "pangu_auto",
+            # model: str = "pangu_auto",
+            model: Optional[str] = None,
             temperature: float = 0.3,
             max_tokens: int = 8192,
             max_workers: int = 5
@@ -8128,11 +8854,23 @@ CURRENT CHAPTER CONTENT:
 
             # 获取自定义LLM配置
             model_config = get_config().get_custom_llm_config()
-            PANGU_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-            model_name = model or model_config.get('model') or os.getenv('MODEL_NAME', '')
+            model_URL = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
+            configured_model = model_config.get('model') or os.getenv('MODEL_NAME', '')
+            model_override = (model or "").strip()
+            if model_override == "MODEL_NAME":
+                model_override = ""
+            if configured_model and model_override:
+                logger.warning(
+                    "document_qa ignoring tool-supplied model=%s; using configured model=%s",
+                    model_override,
+                    configured_model,
+                )
+            model_name = configured_model or model_override
+            if not model_name:
+                raise ValueError("MODEL_NAME is not configured; set MODEL_NAME in config/.env or pass model explicitly.")
             model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
             model_timeout = model_config.get('timeout', 180)
-            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
+            headers = build_model_request_headers(model_token)
 
             # 处理单个任务
             def process_single_task(task: Dict) -> Dict:
@@ -8162,40 +8900,18 @@ CURRENT CHAPTER CONTENT:
 
                 # 3. 调用自定义大模型API
                 try:
-                    # Add retry logic for AI model call
-                    max_retries = 5
-                    response = None
-
-                    for attempt in range(max_retries):
-                        try:
-                            response = requests.post(
-                                url=PANGU_URL,
-                                headers=headers,
-                                json={
-                                    "model": model_name,
-                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                    "messages": [
-                                        {"role": "system", "content": system_prompt},
-                                        {"role": "user", "content": question}
-                                    ],
-                                    "max_tokens": max_tokens,
-                                    "spaces_between_special_tokens": False,
-                                    "temperature": temperature,
-                                },
-                                timeout=model_config.get("timeout", 180)
-                            )
-                            response = response.json()
-                            break  # Success, exit retry loop
-                        except Exception as e:
-                            logger.warning(f"LLM API call attempt {attempt + 1} failed: {e}")
-                            if attempt == max_retries - 1:
-                                raise e  # Last attempt, re-raise the exception
-                            time.sleep(1)  # Simple 1 second delay between retries
-
-                    if response is None:
-                        raise Exception("Failed to get response after all retries")
-
-                    answer = response["choices"][0]["message"]["content"]
+                    answer = llm_chat(
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": question},
+                        ],
+                        model=model_name,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=model_config.get("timeout", 180),
+                        max_retries=5,
+                        retry_sleep=1.0,
+                    )
                     return {
                         'file_path': file_path,
                         'question': question,
@@ -8305,12 +9021,12 @@ CURRENT CHAPTER CONTENT:
 
                     if os.path.isabs(filename):
                         raise Exception(f"Path '{filename}' is absolute. Only relative paths are allowed.")
-                    # 检测是否为PDF文件（网页下载）
+                    # [方案A] 检测是否为网页直链 PDF。
+                    # 历史缺陷：旧代码仅把 .pdf 后缀改成 .txt，却把 PDF 原始二进制字节写入文件，
+                    # 从不做真正的文本提取，导致后续 file_read 严格 UTF-8 解码崩溃、参考来源丢失。
+                    # 现改为：先落盘原始 .pdf -> 调用 _read_pdf_text 提取文本 -> 写入 .txt 并删除 PDF；
+                    # 提取失败时保留原始 PDF（不再生成“假 txt”）。逻辑与 arxiv download_pdf 保持一致。
                     is_pdf_from_web = filename.lower().endswith('.pdf')
-                    # 如果是PDF文件，修改扩展名为.txt以避免PDF格式问题
-                    if is_pdf_from_web:
-                        filename = filename[:-4] + '.txt'
-                        logger.info(f"网页下载的PDF文件将转换为文本格式: {filename}")
 
                     # 仅做 '..' 穿越/绝对路径检查，避免在不存在的目标上调用
                     # os.path.realpath 时的 Windows 并发竞态（见 _validate_workspace_path）。
@@ -8324,13 +9040,18 @@ CURRENT CHAPTER CONTENT:
                         raise Exception(f"Path '{filename}' is outside workspace directory.")
                     file_path = download_dir / normalized_filename
 
+                    # PDF 提取成功后的最终产物是同名 .txt；存在性检查针对最终产物，
+                    # 与历史行为（下载前即把文件名改成 .txt）保持一致。
+                    final_path = file_path.with_suffix('.txt') if is_pdf_from_web else file_path
+
                     # Check if file exists
-                    if file_path.exists() and not overwrite:
+                    if not overwrite and (final_path.exists() or (is_pdf_from_web and file_path.exists())):
+                        existing_path = final_path if final_path.exists() else file_path
                         return {
                             'url': url,
                             'success': False,
                             'error': 'File already exists',
-                            'file_path': str(file_path)
+                            'file_path': str(existing_path)
                         }
 
                     # Download file
@@ -8347,10 +9068,43 @@ CURRENT CHAPTER CONTENT:
                             'file_path': None
                         }
 
-                    # Save file
+                    # Save file（PDF 先按原始字节落盘为 .pdf，随后再提取文本）
                     with open(file_path, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
                             f.write(chunk)
+
+                    # [方案A] 对 PDF 真正提取文本，替代原来“只改后缀写二进制”的假转换
+                    if is_pdf_from_web:
+                        try:
+                            extracted_text = self._read_pdf_text(file_path)
+                        except Exception as extract_err:
+                            extracted_text = ''
+                            logger.error(f"PDF 文本提取异常，保留原始 PDF: {file_path} ({extract_err})")
+
+                        if extracted_text and len(extracted_text.strip()) >= 100:
+                            txt_path = file_path.with_suffix('.txt')
+                            txt_path.write_text(extracted_text, encoding='utf-8')
+                            try:
+                                file_path.unlink()  # 删除原始 PDF，仅保留可分析的 .txt
+                            except Exception as unlink_err:
+                                logger.debug(f"删除临时 PDF 失败（忽略）: {file_path} ({unlink_err})")
+                            logger.info(f"网页下载的PDF已成功提取文本: {txt_path.name}")
+                            return {
+                                'url': url,
+                                'success': True,
+                                'file_path': str(txt_path),
+                                'file_size': txt_path.stat().st_size
+                            }
+                        else:
+                            # 提取失败：保留原始 PDF，不生成“假 txt”，并明确告知
+                            logger.warning(f"PDF 文本提取失败或内容过短，保留原始 PDF 文件: {file_path}")
+                            return {
+                                'url': url,
+                                'success': True,
+                                'file_path': str(file_path),
+                                'file_size': file_path.stat().st_size,
+                                'note': 'PDF text extraction failed; original PDF kept (not analyzable as text).'
+                            }
 
                     return {
                         'url': url,
@@ -9127,7 +9881,30 @@ CURRENT CHAPTER CONTENT:
                     error=f"File does not exist: {file_path}"
                 )
 
-            content = full_path.read_text(encoding=encoding)
+            # [方案B - 安全网] 读取端兜底，防止因“假 txt”或非 UTF-8 编码导致整篇丢弃：
+            #   1) 若文件首字节为 %PDF-（历史遗留或其它路径产生的 PDF 二进制），改用 _read_pdf_text 提取；
+            #   2) 非 UTF-8 文本用 errors='ignore' 兜底，永不因编码问题抛 UnicodeDecodeError。
+            # 正常 UTF-8 文本路径与原行为完全一致。
+            try:
+                with open(full_path, 'rb') as _fh:
+                    raw_head = _fh.read(5)
+            except Exception:
+                raw_head = b''
+
+            if raw_head == b'%PDF-':
+                logger.warning(f"file_read 检测到 PDF 二进制文件，改用 PDF 文本提取: {file_path}")
+                content = self._read_pdf_text(full_path)
+                if not content or not content.strip():
+                    return MCPToolResult(
+                        success=False,
+                        error=f"File is a PDF but text extraction failed: {file_path}"
+                    )
+            else:
+                try:
+                    content = full_path.read_text(encoding=encoding)
+                except UnicodeDecodeError:
+                    logger.warning(f"file_read 遇到非 {encoding} 编码，改用 errors='ignore' 兜底: {file_path}")
+                    content = full_path.read_text(encoding=encoding, errors='ignore')
             # Differential quota based on file source for optimal context usage
             # Dynamic quota strategy:
             # - With user files: user=15K, research=8K (prioritize user files)
@@ -9490,26 +10267,7 @@ CURRENT CHAPTER CONTENT:
         [webpaeg22] / [webpage22] markers into standard numeric
         citations [22].
         """
-        if not content:
-            return content
-
-        try:
-            # Remove any [unusedXX] style control tokens
-            content = re.sub(r"\[unused\d+\]", "", content)
-
-            # Normalize [webpaeg22] or [webpage22] -> [22]
-            content = re.sub(r"\[webp(?:aeg|age)(\d+)\]", r"[\1]", content)
-
-            # Normalize multi-citation [53, 57] -> [53][57]
-            def _split_multi_cite(m):
-                nums = [n.strip() for n in m.group(1).split(",") if n.strip().isdigit()]
-                return "".join(f"[{n}]" for n in nums)
-            content = re.sub(r"\[(\d+(?:\s*,\s*\d+)+)\]", _split_multi_cite, content)
-        except Exception:
-            # On regex errors, return original content to be safe
-            return content
-
-        return content
+        return normalize_report_artifacts(content)
 
     # ================ ENHANCED FILE ANALYSIS TOOLS ================
 
@@ -9731,11 +10489,21 @@ CURRENT CHAPTER CONTENT:
     def file_write(
             self,
             file_path: str,
-            content: str,
+            content: Optional[str] = None,
             encoding: str = 'utf-8',
             create_dirs: bool = True
     ) -> MCPToolResult:
         """Write content to file"""
+        if content is None:
+            return MCPToolResult(
+                success=False,
+                error=(
+                    "Missing required argument 'content'. "
+                    "file_write requires BOTH 'file_path' AND 'content'. "
+                    "If you intend to create an empty stub file, pass content=\"\". "
+                    "For long markdown content, prefer str_replace_based_edit_tool with action='create' and the file_text field."
+                )
+            )
         try:
             try:
                 path_obj = Path(file_path)
@@ -9747,24 +10515,43 @@ CURRENT CHAPTER CONTENT:
             except Exception:
                 pass
 
-            # Normalize misformatted report chapter filenames such as
-            # ./report/part_2_1.md or ./report/part_2.1..md to
-            # the canonical ./report/part_2.md format.
-            try:
-                file_path = self._normalize_report_part_path(file_path)
-            except Exception:
-                pass
+            # Keep one compatibility recovery for the first malformed chapter
+            # path, but never allow a later subsection-shaped call to overwrite
+            # an existing canonical chapter.
+            normalized_input = str(file_path or "").replace("\\", "/")
+            canonical_suggestion = suggested_canonical_part_path(file_path)
+            if canonical_suggestion != normalized_input:
+                canonical_target = self._safe_join(canonical_suggestion)
+                if canonical_target.exists():
+                    return MCPToolResult(
+                        success=False,
+                        error=(
+                            f"非规范章节路径 {file_path} 将覆盖已有章节。"
+                            f"请改用 {canonical_suggestion} 并一次写入完整章节。"
+                        ),
+                    )
+                logger.warning(
+                    "首次检测到非规范章节路径，安全纠正: %s -> %s",
+                    file_path,
+                    canonical_suggestion,
+                )
+                file_path = canonical_suggestion
 
             # For report markdown files, strip internal control markers like
             # [unused17] and normalize leaked [webpaeg22]/[webpage22] tokens
             # to standard numeric citations [22].
-            try:
-                path_obj = Path(file_path)
-                parts = [p for p in path_obj.parts if p not in ('.',)]
-                if ("report" in parts or path_obj.parent.name == "report") and path_obj.suffix.lower() == ".md":
-                    content = self._clean_report_artifacts(content)
-            except Exception:
-                pass
+            path_obj = Path(file_path)
+            parts = [p for p in path_obj.parts if p not in ('.',)]
+            if ("report" in parts or path_obj.parent.name == "report") and path_obj.suffix.lower() == ".md":
+                content, marker_issues = normalize_and_validate_report(
+                    content,
+                    source_citations=bool(re.fullmatch(r"part_\d+\.md", path_obj.name)),
+                )
+                if marker_issues:
+                    return MCPToolResult(
+                        success=False,
+                        error=f"报告内容仍包含内部标记: {marker_issues[:10]}",
+                    )
 
             full_path = self._safe_join(file_path)
 
@@ -9772,7 +10559,8 @@ CURRENT CHAPTER CONTENT:
                 full_path.parent.mkdir(parents=True, exist_ok=True)
 
             # full_path.write_text(content, encoding=encoding)
-            with open(full_path, "a", encoding=encoding) as f:
+            # [FIX-P0] 使用覆盖模式("w")而非追加模式("a")，避免重试/多轮运行时内容叠加
+            with open(full_path, "w", encoding=encoding) as f:
                 f.write(content)
 
             return MCPToolResult(
@@ -12709,6 +13497,7 @@ def get_pubmed_metadata(pmid):
 
 
 # ================ MCP TOOL SCHEMAS ================
+# Note: tool schemas omit the model field; tools use the configured MODEL_NAME.
 
 MCP_TOOL_SCHEMAS = {
     "think": {
@@ -12920,11 +13709,6 @@ MCP_TOOL_SCHEMAS = {
                     },
                     "description": "List of research files to be classified according to the outline"
                 },
-                "model": {
-                    "type": "string",
-                    "default": "pangu_auto",
-                    "description": "AI model to use for classification and organization"
-                },
                 "temperature": {
                     "type": "number",
                     "default": 0.3,
@@ -12932,7 +13716,7 @@ MCP_TOOL_SCHEMAS = {
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "default": 2000,
+                    "default": 16384,
                     "description": "Maximum tokens for the AI response"
                 },
                 "reasoning_text": {
@@ -12969,11 +13753,6 @@ MCP_TOOL_SCHEMAS = {
                     },
                     "description": "List of tasks, each containing a file path and a question"
                 },
-                "model": {
-                    "type": "string",
-                    "default": "pangu_auto",
-                    "description": "AI model to use for generating answers"
-                },
                 "temperature": {
                     "type": "number",
                     "default": 0.3,
@@ -12994,6 +13773,18 @@ MCP_TOOL_SCHEMAS = {
         }
     },
 
+    "prepare_writer_sources": {
+        "name": "prepare_writer_sources",
+        "description": "Internal Writer preflight; not a model-selected research tool.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key_files": {"type": "array", "items": {"type": "object"}},
+                "user_query": {"type": "string"},
+            },
+            "required": ["key_files", "user_query"],
+        },
+    },
     "document_extract": {
         "name": "document_extract",
         "description": "Multi-dimensional analysis of locally stored files using AI models. Evaluates each file across four key dimensions: web page time extraction, source authority assessment, task relevance evaluation, and core content summarization (~300 words). Provides structured document analysis for research and content evaluation purposes.",
@@ -13017,11 +13808,6 @@ MCP_TOOL_SCHEMAS = {
                         "required": ["file_path", "task"]
                     },
                     "description": "List of tasks, each containing a file path and the current task"
-                },
-                "model": {
-                    "type": "string",
-                    "default": "pangu_auto",
-                    "description": "AI model to use for generating answers"
                 },
                 "temperature": {
                     "type": "number",
@@ -13087,11 +13873,6 @@ MCP_TOOL_SCHEMAS = {
                     },
                     "description": "These files are the source materials required for drafting the current chapter."
                 },
-                "model": {
-                    "type": "string",
-                    "default": "pangu_auto",
-                    "description": "AI model to use for classification and organization"
-                },
                 "temperature": {
                     "type": "number",
                     "default": 0.3,
@@ -13099,11 +13880,11 @@ MCP_TOOL_SCHEMAS = {
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "default": 5000,
-                    "description": "Maximum tokens for the AI response"
+                    "default": 16384,
+                    "description": "Maximum tokens for one complete chapter; the server enforces MODEL_MAX_TOKENS as the minimum budget"
                 },
             },
-            "required": ["user_query", "current_chapter_outline", "overall_outline", "target_file_path", "key_files"]
+            "required": ["written_chapters_summary", "task_content", "user_query", "current_chapter_outline", "overall_outline", "target_file_path", "key_files"]
         }
     },
 
