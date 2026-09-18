@@ -30,12 +30,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))  # 添加项目根�
 
 # 导入日志配置
 from config.logging_config import get_logger, quick_setup
+from config.config import get_config, get_mcp_config
 
 # 导入核心模块
 from src.agents.planner_agent import PlannerAgent
 from src.agents.base_agent import AgentConfig
 from src.tools.mcp_tools import MCPTools
+from src.tools.mcp_client import MCPClient
 from src.utils.task_manager import task_manager, TaskStatus
+from src.utils.report_quality import normalize_and_validate_report
+from src import clear_thread_session, set_thread_session
 
 # 配置日志 - 捕获所有日志到文件
 import logging
@@ -44,6 +48,30 @@ import logging
 log_dir = Path(__file__).parent.parent.parent / 'logs'
 quick_setup(environment='production', log_dir=str(log_dir))
 logger = get_logger(__name__)
+
+
+def _apply_final_report_artifact_gate(content, report_path: Path):
+    """Normalize internal markers and reject only unsupported residual markers."""
+    if not content:
+        return content
+    normalized, marker_issues = normalize_and_validate_report(content)
+    if marker_issues:
+        raise ValueError(f"最终报告仍包含内部标记: {marker_issues[:10]}")
+    if normalized != content or not report_path.exists():
+        report_path.write_text(normalized, encoding="utf-8")
+    return normalized
+try:
+    cfg = get_config()
+    logger.info(
+        "[config] debug_mode=%s (env=%s), model_name=%s, model_provider=%s, model_request_url=%s",
+        cfg.debug_mode,
+        os.getenv("DEBUG_MODE"),
+        cfg.model_name,
+        cfg.model_provider,
+        cfg.model_request_url,
+    )
+except Exception as exc:
+    logger.warning("[config] Failed to read deepdiver config: %s", exc)
 
 # 确保第三方库的日志也写入文件
 logging.getLogger('config.config').setLevel(logging.INFO)
@@ -93,6 +121,15 @@ progress_history: Dict[str, List[dict]] = {}  # 历史进度消息存储：task_
 queue_executor = None  # 队列处理线程池
 cancel_executor = None  # 专用取消操作线程池，避免被任务执行阻塞
 MAX_CONCURRENT_TASKS = 4  # 最大并发任务数
+
+
+def _create_task_mcp_client(session_id: str) -> MCPClient:
+    """Create a task-bound client while preserving the configured MCP endpoint."""
+    mcp_config = get_mcp_config()
+    server_url = "http://localhost:6274/mcp"
+    if mcp_config.get("server_url") and not mcp_config.get("use_stdio", True):
+        server_url = mcp_config["server_url"]
+    return MCPClient(server_url=server_url, session_id=session_id)
 
 
 # 数据模型（请求/响应格式）
@@ -424,13 +461,24 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             }
         }
 
-        # 设置环境变量，让 Agent 使用已创建的 workspace
-        os.environ['AGENT_SESSION_ID'] = session_id
-        os.environ['AGENT_WORKSPACE_PATH'] = str(workspace_path)
+        request_search_sources = dict(search_sources_dict or {})
+        if search_sources_dict:
+            # 全局禁用 RAG 时，单个请求不能重新启用。
+            request_search_sources['rag'] = (
+                bool(search_sources_dict.get('rag', False))
+                and bool(app_config.search_source_rag)
+            )
+
+        # 绑定当前请求上下文，避免并发任务覆盖进程级环境变量。
+        set_thread_session(
+            session_id,
+            str(workspace_path),
+            human_in_loop_phase2=False,
+            search_sources=request_search_sources,
+        )
         
         # Human in the loop 模式：通过 workspace 文件传递状态
         os.environ['HUMAN_IN_LOOP'] = 'true' if human_in_loop else 'false'
-        os.environ.pop('HUMAN_IN_LOOP_PHASE2', None)  # 阶段1 确保不设置 PHASE2 标志
         
         # 创建 .human_in_loop 标记文件，供 MCP 工具读取
         human_in_loop_file = workspace_path / '.human_in_loop'
@@ -455,30 +503,23 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         
         # 设置搜索源偏好
         if search_sources_dict:
-            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', False))
-            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', False))
-            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
-            os.environ['SEARCH_SOURCE_GOOGLE_SCHOLAR'] = str(search_sources_dict.get('google_scholar', False))
-            os.environ['SEARCH_SOURCE_SCIHUB'] = str(search_sources_dict.get('scihub', False))
-            
-            # 如果在 .env/全局配置中禁用了 RAG，则即使前端请求启用，也将强制其禁用
-            rag_enabled = search_sources_dict.get('rag', False) and app_config.search_source_rag
-            os.environ['SEARCH_SOURCE_RAG'] = str(rag_enabled)
-            
             logger.info(f"[SEARCH_SOURCES] WebSearch: {search_sources_dict.get('websearch', False)}, "
                        f"PubMed: {search_sources_dict.get('pubmed', False)}, "
                        f"arXiv: {search_sources_dict.get('arxiv', False)}, "
                        f"GoogleScholar: {search_sources_dict.get('google_scholar', False)}, "
                        f"SciHub: {search_sources_dict.get('scihub', False)}, "
-                       f"RAG: {rag_enabled} (Global default: {app_config.search_source_rag})"
+                       f"RAG: {request_search_sources.get('rag', False)} "
+                       f"(Global default: {app_config.search_source_rag})"
                       )
 
+        task_mcp_client = _create_task_mcp_client(session_id)
         agent = create_planner_agent(
             agent_name=f"PlannerAgent",
             model=app_config.model_name,
             max_iterations=app_config.planner_max_iterations or 40,
             sub_agent_configs=sub_agent_configs,
-            task_id=task_id
+            task_id=task_id,
+            shared_mcp_client=task_mcp_client,
         )
         # 设置取消令牌
         cancellation_token = task_manager.get_cancellation_token(task_id)
@@ -600,6 +641,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             if final_report_path.exists():
                 with open(final_report_path, 'r', encoding='utf-8') as f:
                     final_report_content = f.read()
+                final_report_content = _apply_final_report_artifact_gate(
+                    final_report_content,
+                    final_report_path,
+                )
                 report_relative_path = "report/final_report.md"
                 logger.info(f"成功读取最终报告: {final_report_path} (大小: {len(final_report_content)} 字符)")
                 
@@ -803,8 +848,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
 💡 **建议**: 
 - 重新提交相同问题以获取完整报告
 """
-                                final_report_path.write_text(final_content, encoding='utf-8')
-                                final_report_content = final_content
+                                final_report_content = _apply_final_report_artifact_gate(
+                                    final_content,
+                                    final_report_path,
+                                )
                                 report_relative_path = "report/final_report.md"
                                 logger.info(f"[降级兜底B] 已保存草稿 ({len(final_content)} 字符)")
                         else:
@@ -823,8 +870,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
 
 ⚠️ **编辑说明**: 本报告因系统异常未能完成最终审校和参考文献整理，内容仅供参考。如需完整报告，建议重新提问。
 """
-                                final_report_path.write_text(final_content, encoding='utf-8')
-                                final_report_content = final_content
+                                final_report_content = _apply_final_report_artifact_gate(
+                                    final_content,
+                                    final_report_path,
+                                )
                                 report_relative_path = "report/final_report.md"
                                 logger.info(f"[降级兜底B] 成功合并为 final_report.md ({len(final_content)} 字符)")
                 except Exception as fallback_err:
@@ -917,6 +966,12 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                         logger.error(f"存储回复异常: {e}")
         except Exception as e:
             logger.error(f"读取最终报告失败: {e}")
+
+        if final_report_content:
+            final_report_content = _apply_final_report_artifact_gate(
+                final_report_content,
+                final_report_path,
+            )
 
         # 构建完整的结果对象
         result_data = {
@@ -1017,6 +1072,8 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             'final_report': None,
             'report_path': None
         }
+    finally:
+        clear_thread_session()
 
 
 # 批量处理任务（用于后台执行）
@@ -2132,19 +2189,14 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
             }
         }
         
-        # 设置环境变量
-        os.environ['AGENT_SESSION_ID'] = session_id
-        os.environ['AGENT_WORKSPACE_PATH'] = str(workspace_path)
+        # Phase2 状态、检索源与 session/workspace 一起按请求隔离。
+        set_thread_session(
+            session_id,
+            str(workspace_path),
+            human_in_loop_phase2=True,
+            search_sources=search_sources_dict or {},
+        )
         os.environ['HUMAN_IN_LOOP'] = 'true'
-        os.environ['HUMAN_IN_LOOP_PHASE2'] = 'true'  # 标记为阶段2，跳过搜索直接写作
-        
-        # 设置搜索源偏好
-        if search_sources_dict:
-            os.environ['SEARCH_SOURCE_WEBSEARCH'] = str(search_sources_dict.get('websearch', False))
-            os.environ['SEARCH_SOURCE_PUBMED'] = str(search_sources_dict.get('pubmed', False))
-            os.environ['SEARCH_SOURCE_ARXIV'] = str(search_sources_dict.get('arxiv', False))
-            os.environ['SEARCH_SOURCE_GOOGLE_SCHOLAR'] = str(search_sources_dict.get('google_scholar', False))
-            os.environ['SEARCH_SOURCE_SPRINGER'] = str(search_sources_dict.get('springer', False))
         
         # 确保 .human_in_loop 标记文件存在（供 MCP 工具读取）
         human_in_loop_file = workspace_path / '.human_in_loop'
@@ -2163,12 +2215,14 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
         if outline_pending_path.exists():
             outline_pending_path.unlink()
         
+        task_mcp_client = _create_task_mcp_client(session_id)
         agent = create_planner_agent(
             agent_name=f"PlannerAgent",
             model=app_config.model_name,
             max_iterations=app_config.planner_max_iterations or 40,
             sub_agent_configs=sub_agent_configs,
-            task_id=task_id
+            task_id=task_id,
+            shared_mcp_client=task_mcp_client,
         )
         # 直接注入确认后的大纲，避免在并发场景下依赖全局环境变量读取错误工作区文件
         try:
@@ -2211,6 +2265,10 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
             if final_report_path.exists():
                 with open(final_report_path, 'r', encoding='utf-8') as f:
                     final_report_content = f.read()
+                final_report_content = _apply_final_report_artifact_gate(
+                    final_report_content,
+                    final_report_path,
+                )
                 report_relative_path = "report/final_report.md"
                 logger.info(f"[HITL Phase2] 成功读取最终报告: {final_report_path} (大小: {len(final_report_content)} 字符)")
                 
@@ -2343,6 +2401,12 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
                 logger.warning(f"[HITL Phase2] 最终报告文件不存在: {final_report_path}")
         except Exception as e:
             logger.error(f"[HITL Phase2] 读取最终报告失败: {e}")
+
+        if final_report_content:
+            final_report_content = _apply_final_report_artifact_gate(
+                final_report_content,
+                final_report_path,
+            )
         
         planner_success = bool(getattr(response, 'success', False))
         planner_error = (getattr(response, 'error', None) or '').strip()
@@ -2469,8 +2533,7 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
             except Exception:
                 pass
     finally:
-        # 清理阶段2 环境变量
-        os.environ.pop('HUMAN_IN_LOOP_PHASE2', None)
+        clear_thread_session()
 
 
 if __name__ == "__main__":

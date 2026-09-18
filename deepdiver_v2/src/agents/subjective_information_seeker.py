@@ -1,11 +1,18 @@
 # Copyright (c) 2026 South China Sea Institute of Oceanology, Chinese Academy of Sciences (SCSIO, CAS). All rights reserved.
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import time
-import requests
 import os
 from .base_agent import BaseAgent, AgentConfig, AgentResponse, TaskInput
+from .. import get_thread_search_source
 from config.logging_config import get_logger
+from config.config import (
+    extract_reasoning_from_response,
+    extract_tool_calls_from_response,
+    get_tool_call_format_instruction,
+    get_tool_schemas_prompt,
+)
+from src.utils.llm_client import LLMOutputTruncatedError, llm_chat
 logger = get_logger()
 
 
@@ -18,6 +25,14 @@ class InformationSeekerAgent(BaseAgent):
     thinks interleaved (reasoning -> action -> reasoning -> action),
     uses MCP tools to gather information, and returns structured results.
     """
+
+    MAX_UNSAFE_GENERATION_CORRECTIONS = 2
+    MAX_TOOL_CALLS_PER_GENERATION = 24
+    UNSAFE_GENERATION_CORRECTION_PROMPT = (
+        "上一轮响应因输出截断或工具调用数量异常而被系统整体丢弃，其中没有任何工具调用被执行。"
+        "不要假设上一轮的任何步骤已经完成。请只生成当前下一步真正需要的工具调用，"
+        "优先使用批量工具参数合并同类请求，不要展开大量重复调用，并将本轮工具调用控制在 8 个以内。 /no_think"
+    )
 
     def __init__(self, config: AgentConfig = None, shared_mcp_client=None):
         # Set default agent name if not specified
@@ -53,15 +68,16 @@ class InformationSeekerAgent(BaseAgent):
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the ReAct agent"""
-        tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
+        tool_schemas_str = get_tool_schemas_prompt(self.tool_schemas)
+        tool_call_format = get_tool_call_format_instruction()
 
-        # Read search source preferences from environment variables
-        use_websearch = os.environ.get('SEARCH_SOURCE_WEBSEARCH', 'True').lower() == 'true'
-        use_pubmed = os.environ.get('SEARCH_SOURCE_PUBMED', 'True').lower() == 'true'
-        use_arxiv = os.environ.get('SEARCH_SOURCE_ARXIV', 'True').lower() == 'true'
-        use_google_scholar = os.environ.get('SEARCH_SOURCE_GOOGLE_SCHOLAR', 'True').lower() == 'true'
-        use_scihub = os.environ.get('SEARCH_SOURCE_SCIHUB', 'True').lower() == 'true'
-        use_rag = os.environ.get('SEARCH_SOURCE_RAG', 'True').lower() == 'true'
+        # Search-source preferences are request-scoped for concurrent tasks.
+        use_websearch = get_thread_search_source('websearch')
+        use_pubmed = get_thread_search_source('pubmed')
+        use_arxiv = get_thread_search_source('arxiv')
+        use_google_scholar = get_thread_search_source('google_scholar')
+        use_scihub = get_thread_search_source('scihub')
+        use_rag = get_thread_search_source('rag')
         # use_springer = os.environ.get('SEARCH_SOURCE_SPRINGER', 'True').lower() == 'true'  # DISABLED
 
         # Get all available tools from MCP
@@ -209,8 +225,8 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
 {lang_instruction}
 
 **IMPORTANT - Current Date: {current_date}**
-        When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
-
+When searching for recent information or papers, be aware that the current date is {current_date}. Papers and content from 2024, 2025, and 2026 are recent and relevant.
+        
         Your role is to:
         1. Take decomposed sub-questions or tasks from parent agents
         2. Think step-by-step through reasoning 
@@ -218,15 +234,15 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
         4. Continue reasoning based on tool results
         5. Repeat this process until you have sufficient information
         6. Call info_seeker_subjective_task_done to provide a structured summary and key files
-
+        
         TOOL USAGE STRATEGY:
         Follow this optimized workflow for information gathering:
-
+        
         0. **FIRST STEP - Check Workspace Files (Smart Detection):**
            - Use `list_workspace` to quickly check if `./user_uploads/` or `./library_refs/` contain any files
            - If files exist: Use `document_extract` to analyze ALL files (include ALL .pdf, .doc, .docx, .txt files)
            - If no files: Skip this step and proceed directly to web search
-
+        
         1. INITIAL RESEARCH:{search_source_guidance}
            - Generate focused search queries (≤10) to avoid increased failure rates from excessive decomposition
            - Use `batch_web_search` to find relevant URLs for your queries. When calling the search statement, consider the language of the user's question. For example, for a Chinese question, generate a part of the search statement in Chinese.
@@ -264,36 +280,43 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
            - Use `url_crawler` to extract content from URLs and save to `./url_crawler_save_files/`
            - For known paper IDs, you can use dedicated tools (arxiv_read_paper, get_pubmed_article, medrxiv_read_paper, etc.)
            - Store results with meaningful file paths (e.g., `url_crawler_save_files/research/ai_trends_2024.txt`)
-
+        
         3. CONTENT ANALYSIS:
            - Use `document_qa` to ask focused questions about saved files
            - Use `document_extract` for multi-dimensional analysis of saved files:
                 a) Provides structured analysis across five key dimensions: doc time source authority, core content and task relevance
-
+        
         4. FILE MANAGEMENT:
            - Use `file_write` to save important findings or summaries
            - For reviewing saved content:
                 a) Prefer `document_extract` to get comprehensive multi-dimensional analysis of saved files
                 b) Use `file_read` ONLY for small files (<1000 tokens) when you need the entire content
                 c) Avoid reading large files directly as it may exceed context limits
-
+        
         5. TASK COMPLETION:
            - Call `info_seeker_subjective_task_done` with markdown summary and list of key files
-
+        
         ### Systematic Tools:
-            - `think` is a systematic tool. After receiving the response from the complex tool or before invoking any other tools, you must **first invoke the `think` tool**: to deeply reflect on the results of previous tool invocations (if any), and to thoroughly consider and plan the user's task. The `think` tool does not acquire new information; it only saves your thoughts into memory.
-            - `reflect` is a systematic tool. When encountering a failure in tool execution, it is necessary to invoke the reflect tool to conduct a review and revise the task plan. It does not acquire new information; it only saves your thoughts into memory.
-
+        - `think` is a systematic tool. After receiving the response from the complex tool or before invoking any other tools, you must **first invoke the `think` tool**: to deeply reflect on the results of previous tool invocations (if any), and to thoroughly consider and plan the user's task. The `think` tool does not acquire new information; it only saves your thoughts into memory.
+        
         Always provide clear reasoning for your actions and synthesize information effectively.
 
-        Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
-        <tools>
-        $tool_schemas
-        </tools>
-        For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-        [unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
-        """
-        return system_prompt_template.replace("$tool_schemas", tool_schemas_str)
+Below, within the <tools></tools> tags, are the descriptions of each tool and the required fields for invocation:
+<tools>
+$tool_schemas
+</tools>
+For each function call, return a JSON object with function name and arguments:
+$tool_call_format
+"""
+        return (
+            system_prompt_template
+            .replace("$tool_schemas", tool_schemas_str)
+            .replace("$tool_call_format", tool_call_format)
+        )
+# For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+# [unused11][{{"name": <function name>, "arguments": <args json object>}}][unused12]
+# """
+#         return system_prompt_template.replace("$tool_schemas", tool_schemas_str)
 
     @staticmethod
     def _build_initial_message_from_task_input(task_input: TaskInput) -> str:
@@ -342,14 +365,12 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
 
             iteration = 0
             task_completed = False
+            unsafe_generation_correction_count = 0
+            terminal_error = None
             # Get model configuration from config
             from config.config import get_config
             config = get_config()
             model_config = config.get_custom_llm_config()
-
-            pangu_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
 
             # ReAct Loop: Reasoning -> Acting -> Reasoning -> Acting...
             while iteration < self.config.max_iterations and not task_completed:
@@ -358,37 +379,29 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
 
                 try:
                     # Get LLM response (reasoning + potential tool calls)
-                    retry_num = 1
-                    max_retry_num = 10
-                    while retry_num < max_retry_num:
-                        try:
-                            response = requests.post(
-                                url=pangu_url,
-                                headers=headers,
-                                json={
-                                    "model": model_config.get('model', 'pangu_auto'),
-                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                    "messages": conversation_history,
-                                    "spaces_between_special_tokens": False,
-                                    "temperature": self.config.temperature,
-                                },
-                                timeout=model_config.get("timeout", 180)
-                            )
-                            response = response.json()
-                            self.logger.debug(f"API response received")
-                            break
-                        except Exception as e:
-                            time.sleep(3)
-                            retry_num += 1
-                            if retry_num == max_retry_num:
-                                raise ValueError(str(e))
-                            continue
-
-                    assistant_message = response["choices"][0]["message"]
+                    llm_turn = llm_chat(
+                        conversation_history,
+                        model=self.config.model,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        timeout=model_config.get("timeout", 180),
+                        max_retries=10,
+                        reject_truncated=True,
+                        retry_truncated_same_request=False,
+                        tool_schemas=self.tool_schemas,
+                        tool_call_mode=model_config.get("tool_call_mode"),
+                        return_tool_turn=True,
+                    )
+                    llm_turn = self._coerce_llm_tool_turn(llm_turn)
+                    assistant_text = llm_turn.content
+                    assistant_message = {"content": assistant_text}
                     # Log the reasoning
                     try:
-                        if assistant_message["content"]:
-                            reasoning_content = assistant_message["content"].split("[unused16]")[-1].split("[unused17]")[0]
+                        reasoning_source = llm_turn.reasoning_content or assistant_message.get("content")
+                        if reasoning_source:
+                            reasoning_content = extract_reasoning_from_response(reasoning_source)
+                        # if assistant_message["content"]:
+                        #     reasoning_content = assistant_message["content"].split("[unused16]")[-1].split("[unused17]")[0]
                             if len(reasoning_content) > 0:
                                 self.log_reasoning(iteration, reasoning_content)
                     except Exception as e:
@@ -399,86 +412,98 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
                         continue
 
 
-                    def extract_tool_calls(content):
-                        import re
-                        if not content:
-                            return []
-                        tool_call_str = re.findall(r"\[unused11\]([\s\S]*?)\[unused12\]", content)
-                        if len(tool_call_str) > 0:
-                            try:
-                                tool_calls = json.loads(tool_call_str[0].strip())
-                                # 防护：JSON 解析结果可能是 null（None）
-                                if tool_calls is None:
-                                    return []
-                                if not isinstance(tool_calls, list):
-                                    tool_calls = [tool_calls]
-                            except Exception as ee:
-                                return ["fail_tools_load", ee]
-                        else:
-                            return []
-                        return tool_calls
+                    # def extract_tool_calls(content):
+                    #     import re
+                    #     if not content:
+                    #         return []
+                    #     tool_call_str = re.findall(r"\[unused11\]([\s\S]*?)\[unused12\]", content)
+                    #     if len(tool_call_str) > 0:
+                    #         try:
+                    #             tool_calls = json.loads(tool_call_str[0].strip())
+                    #         except Exception as ee:
+                    #             return ["fail_tools_load", ee]
+                    #     else:
+                    #         return []
+                    #     return tool_calls
 
-                    # Add assistant message to conversation
-                    conversation_history.append({
-                        "role": "assistant",
-                        "content": assistant_message["content"]
-                    })
+                    # tool_calls = extract_tool_calls(assistant_message["content"])
+                    if llm_turn.tool_call_mode == "native":
+                        tool_calls = llm_turn.tool_calls
+                    else:
+                        tool_calls = extract_tool_calls_from_response(
+                            assistant_message["content"],
+                            tool_schemas=self.tool_schemas,
+                            api_profile=model_config.get("api_profile"),
+                        )
 
-                    tool_calls = extract_tool_calls(assistant_message["content"])
-                    document_extract_calls = [
-                        call for call in tool_calls
-                        if isinstance(call, dict) and call.get("name") == "document_extract"
-                    ]
-                    has_rag_extract_call = False
-                    for doc_call in document_extract_calls:
-                        arguments = doc_call.get("arguments", {}) if isinstance(doc_call, dict) else {}
-                        tasks = arguments.get("tasks", []) if isinstance(arguments, dict) else []
-                        if not isinstance(tasks, list):
-                            continue
-                        for task in tasks:
-                            if not isinstance(task, dict):
-                                continue
-                            file_path = str(task.get("file_path", ""))
-                            normalized_path = file_path[2:] if file_path.startswith("./") else file_path
-                            if normalized_path.startswith("rag_downloads/"):
-                                has_rag_extract_call = True
-                                break
-                        if has_rag_extract_call:
-                            break
-
-                    def build_rag_tasks(tool_result: Dict[str, Any], default_task: str) -> List[Dict[str, Any]]:
-                        data = tool_result.get("data", [])
-                        if not isinstance(data, list):
-                            return []
-                        rag_tasks = []
-                        seen_paths = set()
-                        for item in data:
-                            if not isinstance(item, dict):
-                                continue
-                            if not item.get("success"):
-                                continue
-                            file_path = item.get("file_path")
-                            if not file_path or file_path in seen_paths:
-                                continue
-                            seen_paths.add(file_path)
-                            rag_tasks.append({
-                                "file_path": file_path,
-                                "task": default_task
+                    if len(tool_calls) > self.MAX_TOOL_CALLS_PER_GENERATION:
+                        if (
+                            unsafe_generation_correction_count
+                            < self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                            and iteration < self.config.max_iterations
+                        ):
+                            unsafe_generation_correction_count += 1
+                            self.logger.warning(
+                                "InformationSeeker discarded generation with %s tool calls "
+                                "and requested correction (%s/%s; limit=%s)",
+                                len(tool_calls),
+                                unsafe_generation_correction_count,
+                                self.MAX_UNSAFE_GENERATION_CORRECTIONS,
+                                self.MAX_TOOL_CALLS_PER_GENERATION,
+                            )
+                            conversation_history.append({
+                                "role": "user",
+                                "content": self.UNSAFE_GENERATION_CORRECTION_PROMPT,
                             })
-                        return rag_tasks
+                            continue
 
-                    if len(tool_calls) > 0 and tool_calls[0] == "fail_tools_load":
-                        # Parse error, rerun
-                        followup_prompt = f"There was a parsing error in the format of the tool call" \
-                                          f" you generated:{tool_calls[1]} Please regenerate it."
-                        conversation_history.append({"role": "user", "content": followup_prompt + " /no_think"})
-                        continue
+                        if (
+                            unsafe_generation_correction_count
+                            >= self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                        ):
+                            terminal_error = (
+                                "InformationSeeker tool-call batch remained unsafe after "
+                                f"{self.MAX_UNSAFE_GENERATION_CORRECTIONS} corrective generations "
+                                f"(received {len(tool_calls)}, limit "
+                                f"{self.MAX_TOOL_CALLS_PER_GENERATION})"
+                            )
+                        else:
+                            terminal_error = (
+                                "InformationSeeker tool-call batch exceeded the per-generation "
+                                "limit and no iteration remained for a corrective generation "
+                                f"(received {len(tool_calls)}, limit "
+                                f"{self.MAX_TOOL_CALLS_PER_GENERATION})"
+                            )
+                        self.log_error(iteration, terminal_error)
+                        break
+
+                    # Add only a validated, bounded assistant message to conversation.
+                    self._append_assistant_tool_turn(
+                        conversation_history,
+                        llm_turn,
+                        assistant_message["content"],
+                    )
+
+                    # if len(tool_calls) > 0 and tool_calls[0] == "fail_tools_load":
+                    #     # Parse error, rerun
+                    #     followup_prompt = f"There was a parsing error in the format of the tool call" \
+                    #                       f" you generated:{tool_calls[1]} Please regenerate it."
+                    #     conversation_history.append({"role": "user", "content": followup_prompt + " /no_think"})
+                    #     continue
 
 
                     # Execute tool calls if any (Acting phase)
 
                     for tool_call in tool_calls:
+                        if not isinstance(tool_call, dict) or "name" not in tool_call or "arguments" not in tool_call:
+                            continue
                         arguments = tool_call["arguments"]
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except Exception:
+                                arguments = {"raw_arguments": arguments}
+                        tool_call["arguments"] = arguments
 
                         # Check if planning is complete
                         if tool_call["name"] in ["info_seeker_subjective_task_done"]:
@@ -494,25 +519,12 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
                         self.log_action(iteration, tool_call["name"], arguments, tool_result)
 
                         # Add tool result to conversation
-                        conversation_history.append({
-                            "role": "tool",
-                            "content": json.dumps(tool_result, ensure_ascii=False, indent=2) + " /no_think"
-                        })
-
-                        if tool_call["name"] == "rag_document_saver" and not has_rag_extract_call:
-                            default_task = task_input.task_content or "RAG document analysis"
-                            rag_tasks = build_rag_tasks(tool_result, default_task)
-                            if rag_tasks:
-                                auto_tool_call = {
-                                    "name": "document_extract",
-                                    "arguments": {"tasks": rag_tasks}
-                                }
-                                auto_result = self.execute_tool_call(auto_tool_call)
-                                self.log_action(iteration, "document_extract", auto_tool_call["arguments"], auto_result)
-                                conversation_history.append({
-                                    "role": "tool",
-                                    "content": json.dumps(auto_result, ensure_ascii=False, indent=2) + " /no_think"
-                                })
+                        self._append_tool_result_turn(
+                            conversation_history,
+                            tool_call,
+                            tool_result,
+                            llm_turn.tool_call_mode,
+                        )
 
                     # If no tool calls, encourage continued planning
                     if len(tool_calls) == 0:
@@ -526,9 +538,45 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
                         followup_prompt = "Due to length and number of rounds restrictions, you must now call the `info_seeker_subjective_task_done` tool to report the completion of your task."
                         conversation_history.append({"role": "user", "content": followup_prompt + " /no_think"})
 
+                except LLMOutputTruncatedError as e:
+                    if (
+                        unsafe_generation_correction_count
+                        < self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                        and iteration < self.config.max_iterations
+                    ):
+                        unsafe_generation_correction_count += 1
+                        self.logger.warning(
+                            "InformationSeeker discarded truncated generation and requested "
+                            "correction (%s/%s): %s",
+                            unsafe_generation_correction_count,
+                            self.MAX_UNSAFE_GENERATION_CORRECTIONS,
+                            e,
+                        )
+                        conversation_history.append({
+                            "role": "user",
+                            "content": self.UNSAFE_GENERATION_CORRECTION_PROMPT,
+                        })
+                        continue
 
+                    if (
+                        unsafe_generation_correction_count
+                        >= self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                    ):
+                        terminal_error = (
+                            "InformationSeeker output remained unsafe after "
+                            f"{self.MAX_UNSAFE_GENERATION_CORRECTIONS} corrective generations; "
+                            "last generation was truncated"
+                        )
+                    else:
+                        terminal_error = (
+                            "InformationSeeker output was truncated and no iteration remained "
+                            "for a corrective generation"
+                        )
+                    self.log_error(iteration, f"{terminal_error}: {e}")
+                    break
                 except Exception as e:
                     error_msg = f"Error in planning iteration {iteration}: {e}"
+                    terminal_error = error_msg
                     self.log_error(iteration, error_msg)
                     break
 
@@ -551,7 +599,7 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
             else:
                 return self.create_response(
                     success=False,
-                    error=f"Task not completed within {self.config.max_iterations} iterations",
+                    error=terminal_error or f"Task not completed within {self.config.max_iterations} iterations",
                     iterations=iteration,
                     execution_time=execution_time
                 )
@@ -661,7 +709,7 @@ All reasoning, findings, and outputs MUST be in English exclusively."""
 
 # Factory function for creating the agent
 def create_subjective_information_seeker(
-    model: str = "pangu_auto",
+    model: Optional[str] = None,
     max_iterations: int = 10,
     shared_mcp_client=None,
     **kwargs
