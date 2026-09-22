@@ -8,7 +8,6 @@ working together. It implements the ReAct pattern for reasoning and action.
 import time
 import logging
 import json
-import requests
 import os
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -20,8 +19,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Base imports
 from .base_agent import BaseAgent, AgentConfig, AgentResponse, WriterAgentTaskInput
+from config.config import (
+    build_llm_request_body,
+    build_model_request_headers,
+    extract_reasoning_from_response,
+    extract_tool_calls_from_response,
+    get_tool_call_format_instruction,
+    get_tool_schemas_prompt,
+)
 # Import agent creators for built-in task assignment
 from .writer_agent import create_writer_agent
+from .. import (
+    clear_thread_session,
+    get_thread_human_in_loop_phase2,
+    get_thread_search_sources,
+    get_thread_session_id,
+    get_thread_workspace_path,
+    inherit_thread_session,
+)
 
 
 class PlannerAgent(BaseAgent):
@@ -32,6 +47,15 @@ class PlannerAgent(BaseAgent):
     break them down into manageable tasks, and coordinate the appropriate agents
     to complete the work.
     """
+
+    MAX_UNSAFE_GENERATION_CORRECTIONS = 2
+    MAX_TOOL_CALLS_PER_GENERATION = 24
+    MAX_TOOL_PROTOCOL_CORRECTIONS = 5
+    UNSAFE_GENERATION_CORRECTION_PROMPT = (
+        "上一轮 Planner 响应因工具调用数量异常而被系统整体丢弃，其中没有任何工具调用被执行。"
+        "不要假设上一轮的任何步骤已经完成。请只生成当前下一步真正需要的工具调用，"
+        "优先合并同类操作，不要重复查询工作区，并将本轮工具调用控制在 8 个以内。 /no_think"
+    )
 
     def __init__(self, config: AgentConfig = None, shared_mcp_client=None, task_id: Optional[str] = None):
         # Set default agent name if not specified
@@ -97,7 +121,8 @@ class PlannerAgent(BaseAgent):
         })
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the planner agent"""
-        tool_schemas_str = json.dumps(self.tool_schemas, ensure_ascii=False)
+        tool_schemas_str = get_tool_schemas_prompt(self.tool_schemas)
+        tool_call_format = get_tool_call_format_instruction()
 
         # Use pre-detected language flag to make EXPLICIT language instruction
         _is_cn = getattr(self, '_is_chinese_query', False)
@@ -198,8 +223,10 @@ Below, within the <tools></tools> tags, are the descriptions of each tool and th
 <tools>
 $tool_schemas
 </tools>
-For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
+For each function call, return a JSON object with function name and arguments:
+$tool_call_format"""
+# For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+# [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         writing_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator
 
@@ -215,8 +242,8 @@ $lang_instruction
 
 ### Optimized Workflow  
 #### 1. Analysis & Planning Phase  
-**Goal:** Analyze the problem and determine whether it is a simple task or a complex task. If it is a complex task, it is necessary to further analyze whether it is a subject-driven question or an objective-driven question, so as to decompose the problem into multiple clear and executable subtasks according to the specific problem type. The main characteristic of objective-driven questions is that their answers are clear and verifiable entities, otherwise they are subject-driven questions. 
-- **Simple Tasks:** For simple tasks that do not require sub-agent invocation, you can directly answer without creating a todo.md file
+**Goal:** Writing mode is already selected: deliver a long-form report through the writer agent. Assess the query's complexity only to determine research scope and depth, not whether to write a report. Distinguish subject-driven and objective-driven research needs to plan appropriate subtasks.
+- **All Tasks:** Create a task plan, gather sufficient supporting material, and invoke `assign_subjective_task_to_writer`. Even a simple or specific question requires a report in writing mode; do not finish with a direct answer or an invented report path.
 - **Complex Tasks:**  
   - For Objective-driven tasks, Adopt *diverge-converge* strategy:  
     1. Use `assign_multi_subjective_tasks_to_info_seeker` call for divergent background research  
@@ -289,8 +316,10 @@ Below, within the <tools></tools> tags, are the descriptions of each tool and th
 <tools>
 $tool_schemas
 </tools>
-For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
+For each function call, return a JSON object with function name and arguments:
+$tool_call_format"""
+# For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+# [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         qa_system_prompt_template = """### PlannerAgent: Multi-Agent Task Coordinator
 
@@ -359,8 +388,10 @@ Below, within the <tools></tools> tags, are the descriptions of each tool and th
 <tools>
 $tool_schemas
 </tools>
-For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
-[unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
+For each function call, return a JSON object with function name and arguments:
+$tool_call_format"""
+# For each function call, return a JSON object placed within the [unused11][unused12] tags, which includes the function name and the corresponding function arguments:
+# [unused11][{\"name\": <function name>, \"arguments\": <args json object>}][unused12]"""
 
         planner_mode_system_prompt_map = {
             "auto": auto_system_prompt_template,
@@ -368,7 +399,13 @@ For each function call, return a JSON object placed within the [unused11][unused
             "qa": qa_system_prompt_template
         }
 
-        system_prompt = planner_mode_system_prompt_map[self.config.planner_mode].replace("$tool_schemas", tool_schemas_str).replace("$lang_instruction", lang_instruction)
+        # system_prompt = planner_mode_system_prompt_map[self.config.planner_mode].replace("$tool_schemas", tool_schemas_str)
+        system_prompt = (
+            planner_mode_system_prompt_map[self.config.planner_mode]
+            .replace("$tool_schemas", tool_schemas_str)
+            .replace("$tool_call_format", tool_call_format)
+			.replace("$lang_instruction", lang_instruction)
+        )
 
         return system_prompt
 
@@ -421,10 +458,20 @@ For each function call, return a JSON object placed within the [unused11][unused
             results = []
             import threading
             lock = threading.Lock()
+            parent_session_id = get_thread_session_id()
+            parent_workspace_path = get_thread_workspace_path()
+            parent_phase2 = get_thread_human_in_loop_phase2()
+            parent_search_sources = get_thread_search_sources()
             
             def process_task(task: Dict[str, str]):
                 """Process a single task with thread-safe result collection"""
                 try:
+                    inherit_thread_session(
+                        parent_session_id,
+                        parent_workspace_path,
+                        parent_phase2,
+                        parent_search_sources,
+                    )
                     
                     
                     # Create TaskInput object
@@ -490,6 +537,8 @@ For each function call, return a JSON object placed within the [unused11][unused
                             "error": error_msg
                         })
                     return None
+                finally:
+                    clear_thread_session()
             
             # Execute tasks in parallel with thread pool
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -570,10 +619,20 @@ For each function call, return a JSON object placed within the [unused11][unused
             results = []
             import threading
             lock = threading.Lock()
+            parent_session_id = get_thread_session_id()
+            parent_workspace_path = get_thread_workspace_path()
+            parent_phase2 = get_thread_human_in_loop_phase2()
+            parent_search_sources = get_thread_search_sources()
 
             def process_task(task: Dict[str, str]):
                 """Process a single task with thread-safe result collection"""
                 try:
+                    inherit_thread_session(
+                        parent_session_id,
+                        parent_workspace_path,
+                        parent_phase2,
+                        parent_search_sources,
+                    )
                     # Create TaskInput object
                     task_input = TaskInput(
                         task_content=task["task_content"],
@@ -636,6 +695,8 @@ For each function call, return a JSON object placed within the [unused11][unused
                             "error": error_msg
                         })
                     return None
+                finally:
+                    clear_thread_session()
 
             # Execute tasks in parallel with thread pool
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -709,7 +770,8 @@ For each function call, return a JSON object placed within the [unused11][unused
                 model=writer_config.get('model', self.config.model),
                 max_iterations=writer_config.get('max_iterations', 20),
                 temperature=writer_config.get('temperature', 0.3),
-                max_tokens=writer_config.get('max_tokens', 16384),
+                # max_tokens=writer_config.get('max_tokens', 16384),
+                max_tokens=writer_config.get('max_tokens', 8192),
                 task_id=self.task_id
             )
             # 【关键修复】传递取消令牌给子 Agent
@@ -735,13 +797,15 @@ For each function call, return a JSON object placed within the [unused11][unused
                     "agent_name": response.agent_name,
                     "iterations": response.iterations,
                     "execution_time": response.execution_time,
+                    "metadata": response.metadata,
                     # "reasoning_trace": response.reasoning_trace
                 }
             else:
                 return {
                     "success": False,
                     "error": response.error,
-                    "agent_name": response.agent_name
+                    "agent_name": response.agent_name,
+                    "metadata": response.metadata,
                 }
 
         except Exception as e:
@@ -752,6 +816,21 @@ For each function call, return a JSON object placed within the [unused11][unused
                 "success": False,
                 "error": f"Task assignment failed: {str(e)}"
             }
+
+    @staticmethod
+    def _is_terminal_ultra_writer_failure(tool_result: Dict[str, Any]) -> bool:
+        """Classify only explicit, structured Ultra Writer terminal failures."""
+        if not isinstance(tool_result, dict) or tool_result.get("success"):
+            return False
+        metadata = tool_result.get("metadata") or {}
+        return (
+            metadata.get("retryable") is False
+            and metadata.get("error_type") in {
+                "pangu_ultra_classifier_format_failure",
+                "pangu_ultra_writer_fallback_exhausted",
+                "pangu_ultra_writer_invocation_budget_exhausted",
+            }
+        )
 
     def _build_agent_specific_tool_schemas(self) -> List[Dict[str, Any]]:
         """
@@ -1087,6 +1166,11 @@ For each function call, return a JSON object placed within the [unused11][unused
             # Initialize conversation history
             conversation_history = []
 
+            has_assigned_info_tasks = False
+            forced_assignment_prompted = False
+            writer_terminal_failure = None
+            writer_invocation_count = 0
+
             # Build system prompt for planning
             system_prompt = self._build_system_prompt()
             localtime = time.localtime()
@@ -1096,15 +1180,29 @@ For each function call, return a JSON object placed within the [unused11][unused
 
             iteration = 0
             task_completed = False
+            unsafe_generation_correction_count = 0
+            tool_protocol_correction_count = 0
+            writer_invoked = False
 
             # Get model endpoint configuration from env-backed config
             from config.config import get_config
             config = get_config()
             model_config = config.get_custom_llm_config()
+            from config.config import get_model_provider, is_pangu_ultra_moe_compat_enabled
+            writer_model_config = getattr(self, "sub_agent_configs", {}).get("writer", {})
+            planner_model_name = writer_model_config.get("model") or model_config.get("model") or self.config.model
+            ultra_compat_enabled = is_pangu_ultra_moe_compat_enabled(
+                model_name=planner_model_name,
+                provider=model_config.get("provider") or get_model_provider(planner_model_name),
+                enabled=model_config.get("pangu_ultra_moe_compat_enabled", False),
+            )
+            ultra_writer_max_invocations = max(
+                1,
+                int(model_config.get("pangu_ultra_writer_max_invocations", 2)),
+            )
             
-            pangu_url = model_config.get('url') or os.getenv('MODEL_REQUEST_URL', '')
-            model_token = model_config.get('token') or os.getenv('MODEL_REQUEST_TOKEN', '')
-            headers = {'Content-Type': 'application/json', 'csb-token': model_token}
+            # Centralized LLM client usage
+            from src.utils.llm_client import LLMEmptyContentError, llm_chat
             # ReAct Loop: Reasoning -> Acting -> Reasoning -> Acting...
             while iteration < self.config.max_iterations and not task_completed:
                 # 【关键修复】检查任务是否被取消
@@ -1122,6 +1220,25 @@ For each function call, return a JSON object placed within the [unused11][unused
                 self.logger.info(f"Planning iteration {iteration}")
 
                 try:
+                    # Only constrain the final four iterations after successful
+                    # information gathering. Normal planning/research behavior
+                    # remains unchanged while the iteration budget is healthy.
+                    from src.utils.planner_budget import get_planner_convergence_policy
+                    convergence_instruction, allowed_convergence_tools = (
+                        get_planner_convergence_policy(
+                            planner_mode=self.config.planner_mode,
+                            total_iterations=self.config.max_iterations,
+                            current_iteration=iteration,
+                            has_assigned_info_tasks=has_assigned_info_tasks,
+                            writer_invoked=writer_invoked,
+                        )
+                    )
+                    if convergence_instruction:
+                        conversation_history.append({
+                            "role": "user",
+                            "content": convergence_instruction,
+                        })
+
                     # 【取消检查】在LLM调用前检查取消状态
                     if self._check_cancellation():
                         self.logger.info(f"Task {self.task_id} cancelled before LLM call at iteration {iteration}")
@@ -1134,59 +1251,38 @@ For each function call, return a JSON object placed within the [unused11][unused
                         }
                     
                     # Get LLM response (reasoning + potential tool calls)
-                    retry_num = 1
-                    max_retry_num = 10
-                    while retry_num < max_retry_num:
-                        try:
-                            # 【取消检查】在每次重试前检查
-                            if self._check_cancellation():
-                                self.logger.info(f"Task {self.task_id} cancelled during LLM retry {retry_num}")
-                                return {
-                                    "success": False,
-                                    "error": "Task was cancelled by user",
-                                    "reasoning_trace": self.reasoning_trace,
-                                    "iterations": iteration,
-                                    "execution_time": time.time() - start_time
-                                }
-                            
-                            response = requests.post(
-                                url=pangu_url,
-                                headers=headers,
-                                json={
-                                    "model": self.config.model,
-                                    "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<s>[unused9]系统：[unused10]' }}{% endif %}{% if message['role'] == 'system' %}{{'<s>[unused9]系统：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'assistant' %}{{'[unused9]助手：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'tool' %}{{'[unused9]工具：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'function' %}{{'[unused9]方法：' + message['content'] + '[unused10]'}}{% endif %}{% if message['role'] == 'user' %}{{'[unused9]用户：' + message['content'] + '[unused10]'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '[unused9]助手：' }}{% endif %}",
-                                    "spaces_between_special_tokens": False,
-                                    "messages": conversation_history,
-                                    "temperature": self.config.temperature,
-                                    "max_tokens": self.config.max_tokens,
-                                },
-                                timeout=model_config.get("timeout", 180)
-                            )
-                            response = response.json()
-                            self.logger.debug(f"API response received")
-                            break
-                        except Exception as e:
-                            # 【取消检查】在异常处理时也检查取消状态
-                            if self._check_cancellation():
-                                self.logger.info(f"Task {self.task_id} cancelled during LLM error handling")
-                                return {
-                                    "success": False,
-                                    "error": "Task was cancelled by user",
-                                    "reasoning_trace": self.reasoning_trace,
-                                    "iterations": iteration,
-                                    "execution_time": time.time() - start_time
-                                }
-                            time.sleep(1)  # 减少重试间隔
-                            retry_num += 1
-                            if retry_num == max_retry_num:
-                                raise ValueError(str(e))
-                            continue
-                    assistant_message = response["choices"][0]["message"]
+                    # 【取消检查】在每次重试前检查
+                    if self._check_cancellation():
+                        self.logger.info(f"Task {self.task_id} cancelled during LLM retry preparation")
+                        return {
+                            "success": False,
+                            "error": "Task was cancelled by user",
+                            "reasoning_trace": self.reasoning_trace,
+                            "iterations": iteration,
+                            "execution_time": time.time() - start_time
+                        }
+
+                    llm_turn = llm_chat(
+                        conversation_history,
+                        model=self.config.model,
+                        temperature=self.config.temperature,
+                        max_tokens=self.config.max_tokens,
+                        timeout=model_config.get("timeout", 180),
+                        max_retries=10,
+                        tool_schemas=self.tool_schemas,
+                        tool_call_mode=model_config.get("tool_call_mode"),
+                        return_tool_turn=True,
+                    )
+                    llm_turn = self._coerce_llm_tool_turn(llm_turn)
+                    assistant_text = llm_turn.content
+                    assistant_message = {"content": assistant_text}
 
                     # Log the reasoning
                     try:
-                        if assistant_message["content"]:
-                            reasoning_content = assistant_message["content"].split("[unused16]")[-1].split("[unused17]")[0]
+                        reasoning_source = llm_turn.reasoning_content or assistant_message["content"]
+                        if reasoning_source:
+                            # reasoning_content = assistant_message["content"].split("[unused16]")[-1].split("[unused17]")[0]
+                            reasoning_content = extract_reasoning_from_response(reasoning_source)
                             if len(reasoning_content) > 0:
                                 self.log_reasoning(iteration, reasoning_content)
                     except Exception as e:
@@ -1196,36 +1292,101 @@ For each function call, return a JSON object placed within the [unused11][unused
                         conversation_history.append({"role": "user", "content": followup_prompt + " /no_think"})
                         continue
 
-                    def extract_tool_calls(content):
-                        import re
-                        if not content:
-                            return []
-                        tool_call_str = re.findall(r"\[unused11\]([\s\S]*?)\[unused12\]", content)
-                        if len(tool_call_str) > 0:
-                            try:
-                                tool_calls = json.loads(tool_call_str[0].strip())
-                                # 防护：JSON 解析结果可能是 null（None）
-                                if tool_calls is None:
-                                    return []
-                                if not isinstance(tool_calls, list):
-                                    tool_calls = [tool_calls]
-                            except:
-                                return []
+                    # def extract_tool_calls(content):
+                    #     import re
+                    #     if not content:
+                    #         return []
+                    #     tool_call_str = re.findall(r"\[unused11\]([\s\S]*?)\[unused12\]", content)
+                    #     if len(tool_call_str) > 0:
+                    #         try:
+                    #             tool_calls = json.loads(tool_call_str[0].strip())
+                    #         except:
+                    #             return []
+                    #     else:
+                    #         return []
+                    #     return tool_calls
+
+                    # tool_calls = extract_tool_calls(assistant_message["content"])
+                    if llm_turn.tool_call_mode == "native":
+                        tool_calls = llm_turn.tool_calls
+                    else:
+                        tool_calls = extract_tool_calls_from_response(
+                            assistant_message["content"],
+                            tool_schemas=self.tool_schemas,
+                            api_profile=model_config.get("api_profile"),
+                        )
+
+                    if len(tool_calls) > self.MAX_TOOL_CALLS_PER_GENERATION:
+                        if (
+                            unsafe_generation_correction_count
+                            < self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                            and iteration < self.config.max_iterations
+                        ):
+                            unsafe_generation_correction_count += 1
+                            self.logger.warning(
+                                "Planner discarded generation with %s tool calls and requested "
+                                "correction (%s/%s; limit=%s); no tools were executed",
+                                len(tool_calls),
+                                unsafe_generation_correction_count,
+                                self.MAX_UNSAFE_GENERATION_CORRECTIONS,
+                                self.MAX_TOOL_CALLS_PER_GENERATION,
+                            )
+                            conversation_history.append({
+                                "role": "user",
+                                "content": self.UNSAFE_GENERATION_CORRECTION_PROMPT,
+                            })
+                            continue
+
+                        if (
+                            unsafe_generation_correction_count
+                            >= self.MAX_UNSAFE_GENERATION_CORRECTIONS
+                        ):
+                            error_msg = (
+                                "Planner tool-call batch remained unsafe after "
+                                f"{self.MAX_UNSAFE_GENERATION_CORRECTIONS} corrective generations "
+                                f"(received {len(tool_calls)}, limit "
+                                f"{self.MAX_TOOL_CALLS_PER_GENERATION})"
+                            )
                         else:
-                            return []
-                        return tool_calls
+                            error_msg = (
+                                "Planner tool-call batch exceeded the per-generation limit and "
+                                "no iteration remained for a corrective generation "
+                                f"(received {len(tool_calls)}, limit "
+                                f"{self.MAX_TOOL_CALLS_PER_GENERATION})"
+                            )
+                        self.log_error(iteration, error_msg)
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "reasoning_trace": self.reasoning_trace,
+                            "iterations": iteration,
+                            "execution_time": time.time() - start_time,
+                        }
 
-                    # Add assistant message to conversation
-                    conversation_history.append({
-                        "role": "assistant",
-                        "content": assistant_message["content"]
-                    })
+                    # Keep a rollback point. If every call in this generation
+                    # fails schema validation, replace the malformed response
+                    # and verbose tool errors with one compact correction.
+                    generation_history_start = len(conversation_history)
+                    self._append_assistant_tool_turn(
+                        conversation_history,
+                        llm_turn,
+                        assistant_message["content"],
+                    )
+                    generation_tool_results = []
 
-                    tool_calls = extract_tool_calls(assistant_message["content"])
+                    if tool_calls:
+                        parsed_names = [call.get("name") for call in tool_calls if isinstance(call, dict)]
+                        self.logger.info(f"Parsed tool calls: {parsed_names}")
+                    else:
+                        preview = (assistant_message["content"] or "").strip()
+                        preview = preview[:2000] + ("..." if len(preview) > 2000 else "")
+                        self.logger.warning(f"No tool calls parsed. Assistant content preview: {preview}")
 
                     # Execute tool calls if any (Acting phase)
 
                     for tool_call in tool_calls:
+                        if not isinstance(tool_call, dict) or "name" not in tool_call or "arguments" not in tool_call:
+                            continue
                         # 【取消检查】在每个工具调用前检查取消状态
                         if self._check_cancellation():
                             self.logger.info(f"Task {self.task_id} cancelled during tool execution loop")
@@ -1238,14 +1399,61 @@ For each function call, return a JSON object placed within the [unused11][unused
                             }
                         
                         arguments = tool_call["arguments"]
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except Exception:
+                                arguments = {"raw_arguments": arguments}
+                        tool_call["arguments"] = arguments
                         self.logger.debug(f"Arguments is string: {isinstance(arguments, str)}")
 
-                        # Check if planning is complete
-                        if tool_call["name"] in ["planner_subjective_task_done", "planner_objective_task_done", "writer_subjective_task_done"]:
-                            task_completed = True
-                            self.log_action(iteration, tool_call["name"], arguments, arguments)
-                            break
-                        if tool_call["name"] in ["think", "reflect"]:
+                        # Validate every tool uniformly. Completion and
+                        # think/reflect used to bypass BaseAgent validation,
+                        # allowing malformed terminal calls or polluted text
+                        # arguments to be treated as successful actions.
+                        validation_error = self._validate_tool_call_arguments(
+                            tool_call["name"],
+                            arguments,
+                        )
+
+                        # Check if planning is complete only after validation.
+                        if validation_error:
+                            tool_result = validation_error
+                        elif (
+                            allowed_convergence_tools is not None
+                            and tool_call["name"] not in allowed_convergence_tools
+                        ):
+                            tool_result = {
+                                "success": False,
+                                "error_code": "PLANNER_CONVERGENCE_TOOL_BLOCKED",
+                                "error": (
+                                    f"Tool '{tool_call['name']}' is not allowed during Planner "
+                                    "convergence. Use one of: "
+                                    f"{sorted(allowed_convergence_tools)}"
+                                ),
+                                "tool_name": tool_call["name"],
+                                "retryable": True,
+                            }
+                        elif tool_call["name"] in ["planner_subjective_task_done", "planner_objective_task_done", "writer_subjective_task_done"]:
+                            if (
+                                self.config.planner_mode == "writing"
+                                and not writer_invoked
+                            ):
+                                tool_result = {
+                                    "success": False,
+                                    "error_code": "PLANNER_WRITER_NOT_DELIVERED",
+                                    "error": (
+                                        "Writing mode cannot complete before Writer successfully "
+                                        "delivers its result. Invoke assign_subjective_task_to_writer."
+                                    ),
+                                    "retryable": True,
+                                }
+                            else:
+                                task_completed = True
+                                self.log_action(iteration, tool_call["name"], arguments, arguments)
+                                generation_tool_results.append((tool_call["name"], arguments))
+                                break
+                        elif tool_call["name"] in ["think", "reflect"]:
                             tool_result = {"tool_results": "You can proceed to invoke other tools if needed. "}
                         else:
                             # 【取消检查】在执行工具前最后检查一次
@@ -1259,7 +1467,68 @@ For each function call, return a JSON object placed within the [unused11][unused
                                     "execution_time": time.time() - start_time
                                 }
                             
-                            tool_result = self.execute_tool_call(tool_call)
+                            if (
+                                ultra_compat_enabled
+                                and tool_call["name"] == "assign_subjective_task_to_writer"
+                                and writer_terminal_failure is not None
+                            ):
+                                tool_result = {
+                                    "success": False,
+                                    "error": (
+                                        "Writer terminal failure already recorded for this task; "
+                                        "duplicate Writer invocation was blocked."
+                                    ),
+                                    "metadata": dict(writer_terminal_failure),
+                                }
+                                self.logger.warning(
+                                    "Blocked duplicate Ultra Writer invocation after terminal failure: %s",
+                                    writer_terminal_failure.get("error_type"),
+                                )
+                            elif (
+                                ultra_compat_enabled
+                                and tool_call["name"] == "assign_subjective_task_to_writer"
+                                and writer_invocation_count >= ultra_writer_max_invocations
+                            ):
+                                writer_terminal_failure = {
+                                    "error_type": "pangu_ultra_writer_invocation_budget_exhausted",
+                                    "retryable": False,
+                                    "stage": "planner",
+                                    "writer_invocations": writer_invocation_count,
+                                }
+                                tool_result = {
+                                    "success": False,
+                                    "error": "Pangu Ultra Writer invocation budget exhausted.",
+                                    "metadata": dict(writer_terminal_failure),
+                                }
+                                self.logger.warning(
+                                    "Blocked Ultra Writer invocation after budget %s was exhausted.",
+                                    ultra_writer_max_invocations,
+                                )
+                            else:
+                                if tool_call["name"] == "assign_subjective_task_to_writer":
+                                    writer_invocation_count += 1
+                                tool_result = self.execute_tool_call(tool_call)
+                                if (
+                                    tool_call["name"] == "assign_subjective_task_to_writer"
+                                    and isinstance(tool_result, dict)
+                                    and tool_result.get("success") is True
+                                ):
+                                    writer_invoked = True
+
+                            if ultra_compat_enabled and tool_call["name"] == "assign_subjective_task_to_writer":
+                                writer_metadata = tool_result.get("metadata") or {}
+                                if self._is_terminal_ultra_writer_failure(tool_result):
+                                    writer_terminal_failure = dict(writer_metadata)
+
+                            if (
+                                tool_call["name"] in [
+                                    "assign_multi_subjective_tasks_to_info_seeker",
+                                    "assign_multi_objective_tasks_to_info_seeker",
+                                ]
+                                and isinstance(tool_result, dict)
+                                and tool_result.get("success") is True
+                            ):
+                                has_assigned_info_tasks = True
                             
                             # 【取消检查】工具执行后立即检查
                             if self._check_cancellation():
@@ -1274,12 +1543,98 @@ For each function call, return a JSON object placed within the [unused11][unused
 
                         # Log the action using base class method
                         self.log_action(iteration, tool_call["name"], arguments, tool_result)
+                        generation_tool_results.append((tool_call["name"], tool_result))
 
                         # Add tool result to conversation
+                        self._append_tool_result_turn(
+                            conversation_history,
+                            tool_call,
+                            tool_result,
+                            llm_turn.tool_call_mode,
+                        )
+
+                    validation_only_generation = bool(generation_tool_results) and all(
+                        isinstance(result, dict)
+                        and result.get("error_code") in {
+                            "TOOL_ARGUMENT_VALIDATION_FAILED",
+                            "TOOL_CALL_PROTOCOL_FAILED",
+                        }
+                        for _, result in generation_tool_results
+                    )
+                    if validation_only_generation:
+                        tool_protocol_correction_count += 1
+                        # The malformed assistant text may contain thousands of
+                        # tokens and broken tool-result markers. Do not feed it
+                        # back to the model; preserve it only in raw logs/trace.
+                        del conversation_history[generation_history_start:]
+
+                        first_tool, first_error = generation_tool_results[0]
+                        target_tool = first_error.get("suggested_tool_name") or first_tool
+                        input_schema = self._get_tool_input_schema(target_tool)
+                        properties = input_schema.get("properties", {})
+                        if not isinstance(properties, dict):
+                            properties = {}
+                        contract = {
+                            name: (
+                                schema.get("type", "any")
+                                if isinstance(schema, dict)
+                                else "any"
+                            )
+                            for name, schema in properties.items()
+                        }
+                        correction_protocol = (
+                            "请只重新通过 API 原生 function calling 调用该工具；"
+                            "不要在 message.content 中输出 <tool_call>、Markdown JSON 或标签。"
+                            if llm_turn.tool_call_mode == "native"
+                            else (
+                                "请只重新生成一个该工具调用，使用完整格式 "
+                                f"<tool_call>{target_tool}({{\"参数名\": \"参数值\"}})</tool_call>。"
+                                "数组和对象必须输出为真正的 JSON，不要放在字符串中；"
+                                "不要省略 arg_key/arg_value 标签，不要拼接工具返回结果。"
+                            )
+                        )
+                        correction_prompt = (
+                            "上一轮工具调用未执行，因为工具名或参数格式不符合 Schema。"
+                            f"原始工具：{first_tool}；应使用工具：{target_tool}；参数类型："
+                            f"{json.dumps(contract, ensure_ascii=False)}；"
+                            f"缺失参数：{first_error.get('missing_required_fields', [])}；"
+                            f"非法参数：{first_error.get('invalid_fields', [])}。"
+                            f"{correction_protocol} /no_think"
+                        )
+
+                        if (
+                            tool_protocol_correction_count
+                            >= self.MAX_TOOL_PROTOCOL_CORRECTIONS
+                            or iteration >= self.config.max_iterations
+                        ):
+                            error_msg = (
+                                "Planner stopped after repeated malformed tool arguments "
+                                f"({tool_protocol_correction_count} consecutive corrective "
+                                f"generations; last tool={first_tool})"
+                            )
+                            self.log_error(iteration, error_msg)
+                            return {
+                                "success": False,
+                                "error": error_msg,
+                                "reasoning_trace": self.reasoning_trace,
+                                "iterations": iteration,
+                                "execution_time": time.time() - start_time,
+                            }
+
+                        self.logger.warning(
+                            "Planner discarded validation-only generation and requested compact "
+                            "tool protocol correction (%s/%s; tool=%s)",
+                            tool_protocol_correction_count,
+                            self.MAX_TOOL_PROTOCOL_CORRECTIONS,
+                            first_tool,
+                        )
                         conversation_history.append({
-                            "role": "tool",
-                            "content": json.dumps(tool_result, ensure_ascii=False, indent=2) + " /no_think"
+                            "role": "user",
+                            "content": correction_prompt,
                         })
+                        continue
+                    elif generation_tool_results:
+                        tool_protocol_correction_count = 0
 
                     # If no tool calls, encourage continued planning
                     if len(tool_calls) == 0:
@@ -1289,8 +1644,47 @@ For each function call, return a JSON object placed within the [unused11][unused
                             "search for information, or coordinate work. When you have a complete answer, "
                             "call planner_subjective_task_done or planner_objective_task_done. /no_think"
                         )
+                        if self.config.planner_mode == "writing":
+                            followup_prompt = (
+                                "Writing mode requires a report delivered by the Writer; a direct answer "
+                                "does not complete this task. Create a plan and gather sufficient supporting "
+                                "material, then invoke assign_subjective_task_to_writer. If Writer has already "
+                                "successfully delivered its result, call planner_subjective_task_done. /no_think"
+                            )
                         conversation_history.append({"role": "user", "content": followup_prompt})
+                    elif (
+                        not has_assigned_info_tasks
+                        and not forced_assignment_prompted
+                        and self.config.planner_mode in ["writing", "auto"]
+                        and any(call.get("name") in ["file_write", "str_replace_based_edit_tool"] for call in tool_calls if isinstance(call, dict))
+                    ):
+                        forced_assignment_prompted = True
+                        conversation_history.append({
+                            "role": "user",
+                            "content": (
+                                "The planning document is ready. You must now call "
+                                "assign_multi_subjective_tasks_to_info_seeker to dispatch 1-6 parallel research tasks. "
+                                "Do not call file_write or str_replace_based_edit_tool again. /no_think"
+                            ),
+                        })
 
+                except LLMEmptyContentError as e:
+                    error_msg = (
+                        "Planner stopped because the upstream LLM repeatedly returned empty "
+                        f"content: {e}"
+                    )
+                    self.log_error(iteration, error_msg)
+                    self.logger.error(
+                        "Planner is terminating the current execution after empty-response "
+                        "retries were exhausted; the outer task runner may retry the whole task"
+                    )
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "reasoning_trace": self.reasoning_trace,
+                        "iterations": iteration,
+                        "execution_time": time.time() - start_time,
+                    }
                 except Exception as e:
                     error_msg = f"Error in planning iteration {iteration}: {e}"
                     self.log_error(iteration, error_msg)
@@ -1367,12 +1761,12 @@ For each function call, return a JSON object placed within the [unused11][unused
             self._send_progress('init', _init_msg, {'query': user_query[:100]})
 
             # Human in the loop 阶段2：跳过搜索，直接使用已有结果调用 WriterAgent
-            human_in_loop_phase2 = os.environ.get('HUMAN_IN_LOOP_PHASE2', 'false').lower() == 'true'
+            human_in_loop_phase2 = get_thread_human_in_loop_phase2()
             if human_in_loop_phase2:
                 self.logger.info("Human in the loop Phase 2: 跳过搜索阶段，直接调用 WriterAgent")
                 
                 # 读取 workspace 中已有的 key_files
-                workspace_path = os.environ.get('AGENT_WORKSPACE_PATH', '')
+                workspace_path = get_thread_workspace_path()
                 key_files = []
                 # 优先使用调用方显式注入的大纲（避免并发任务下全局环境变量串扰）
                 user_outline = (getattr(self, "_hitl_user_outline", "") or "").strip()

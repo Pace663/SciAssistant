@@ -343,6 +343,7 @@ def get_tool_function(tool_name: str):
         
         # Internal tools - available to server but NOT exposed to agents via tool schemas
         "internal_file_read_unlimited": lambda tools, **kwargs: tools.internal_file_read_unlimited(**kwargs),
+        "prepare_writer_sources": lambda tools, **kwargs: tools.prepare_writer_sources(**kwargs),
         # Resource Library - PubMed tools
         "search_pubmed_key_words": lambda tools, **kwargs: tools.search_pubmed_key_words(**kwargs),
         "search_pubmed_advanced": lambda tools, **kwargs: tools.search_pubmed_advanced(**kwargs),
@@ -1167,7 +1168,7 @@ async def _call_session_tool_async(session: Session, tool_name: str, tool_args: 
         logger.info(f"Session {session.id}: Executing tool '{tool_name}' with args: {list(tool_args.keys())}")
         
         # Use keep-alive wrapper for tools that might take a long time
-        long_running_tools = {'batch_web_search', 'url_crawler', 'document_qa', 'document_extract', 'bash'}
+        long_running_tools = {'batch_web_search', 'url_crawler', 'document_qa', 'document_extract', 'prepare_writer_sources', 'bash'}
         
         # Check if the tool method is async
         import inspect
@@ -1841,4 +1842,4 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main() 
+    main()
