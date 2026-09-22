@@ -1,44 +1,33 @@
-
 ## 项目简介
 
 SciAssistant 是一个基于大语言模型的智能研究助手系统，通过多智能体协作架构，帮助用户进行深度信息检索、文档分析和研究报告生成。
 
-###  核心特点
+### 核心特点
 
 - **多智能体协作** - Planner、Information Seeker、Writer 三大智能体协同工作
-- **智能文档处理** - 本地文件库创建，支持 PDF、DOC、DOCX、TXT等多种格式
+- **智能文档处理** - 本地文件库创建，支持 PDF、DOC、DOCX、TXT 等多种格式
 - **深度信息检索** - 批量网络搜索、网页爬取
 - **专业报告生成** - 自动生成结构化研究报告，支持 Markdown 和 PDF 导出
 - **会话管理** - 多会话支持，历史记录追溯
 - **模式概览** - Chat (普通对话)/Reasoner(深度推理)/DeepDiver(万字长文)模式
-- **MCP server 开放空间搜索服务** - 本地知识库、Google search、PubMed API、ArXiv API等
-
+- **MCP server 开放空间搜索服务** - 本地知识库、Google search、PubMed API、ArXiv API 等
 
 ### Powered by openPangu
 
-本项目基于盘古DeepDiver-V2深度增量开发，采用多智能体协作架构（Multi-Agent System）
-，提供完整的前后端服务化解决方案。
-
-核心特性：
-* 智能体协同编排 - Planner、Information Seeker、Writer 三大智能体
-
-* 服务化封装 - RESTful API + SSE 实时进度推送
-
-* 前后端一体 - Flask/FastAPI 后端 + 现代化 Web 前端
-
-* 支持用户管理、会话管理、文档处理
+本项目基于盘古 DeepDiver-V2 增量开发，提供 Flask/FastAPI 后端、Web 前端及 RESTful API + SSE 实时进度推送，并扩展了多模型接口适配。
 
 盘古DeepDiver-V2参考链接(包含模型推理服务)：https://ai.gitcode.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver
 
-也可以下二选其一的模型推理服务：
+其他盘古模型推理服务参考：
+
 - 模型1：https://ai.gitcode.com/ascend-tribe/openPangu-R-72B-2512-Int8
 - 模型2：https://gitcode.com/ascend-tribe/openPangu-2.0-Infer
 
 ---
 
-##  功能特性
+## 功能特性
 
-###  多智能体系统
+### 多智能体系统
 
 ```
 ┌─────────────────┐
@@ -60,11 +49,12 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 ```
 
 ### 模式概览
+
 *   **Chat (普通对话)**: 标准的 LLM 对话模式，直接与大模型交互。
 *   **Reasoner (深度推理)**: 针对支持 "思维链 (Chain of Thought)" 的模型设计（如 DeepSeek-R1, Pangu-Reasoner），界面会展示模型的思考/推理过程 (`reasoning_content`)。
 *   **DeepDiver (万字长文)**: 调用后端 Multi-Agent 系统，执行复杂的长文写作和深度信息检索任务。
 
-###  文档处理能力
+### 文档处理能力
 
 | 功能 | 说明               |
 |------|------------------|
@@ -77,12 +67,12 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 - **网页爬取** - 异步并发爬取，智能内容提取
 - **搜索结果分类** - 自动分类搜索结果，提取关键信息
 
-###  报告生成
+### 报告生成
 
 - **结构化输出** - 自动生成目录、章节、引用
 - **多格式导出** - Markdown（便于编辑）、PDF（专业排版）
-- Title标题/abstract摘要/KeyWords关键词/Citation参考文献生成
-- PDF生成优先使用用户系统自带字体以提升加载性能，同时内置了开源字体作为备用方案
+- **报告要素** - 标题、摘要、关键词和参考文献
+- **PDF 字体** - 优先使用系统字体，并提供内置开源字体作为备用
 
 ### 会话管理
 
@@ -95,7 +85,7 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 - **用户认证** - 注册、登录、密码重置
 - **JWT 令牌** - 无状态身份验证，支持"记住我"
 - **权限控制** - 会话隔离、文档访问控制
-- **安全加密** - SHA-256 密码加密，SQL 注入防护
+- **密码存储** - 使用 SHA-256 哈希处理密码
 
 ---
 
@@ -110,6 +100,8 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 
 ### 安装
 
+以下命令使用 Bash 语法，可在 Linux 终端或 Windows Git Bash 中执行。启动服务前，请按下方配置说明设置数据库连接。
+
 ```bash
 # 1. 克隆项目
 git clone <repository-url>
@@ -118,7 +110,7 @@ cd SciAssistant
 # 2. 安装依赖
 pip install -r deepdiver_v2/requirements.txt
 
-# 3. 配置环境变量
+# 3. 首次部署时复制配置模板；已有 .env 时保留原文件
 cp deepdiver_v2/env.template deepdiver_v2/config/.env
 # 编辑 deepdiver_v2/config/.env，配置模型、搜索和爬虫服务
 
@@ -138,23 +130,21 @@ python deepdiver_v2/cli/a.py
 
 以上三个服务需要分别启动。前端页面位于 `chatAi/`，其中的请求路径使用 `/5000` 和 `/8000` 前缀；部署前端时，请通过 Nginx 或其他网关将这两个前缀分别反向代理到 Flask 的 `5000` 端口和 FastAPI 的 `8000` 端口；直接打开 HTML 文件不能替代该代理配置。
 
-
-
 ---
 
 ## 系统架构
 
 ### 技术栈
 
-| 类别 | 技术 |
-|------|------|
+| 类别 | 技术                                        |
+|------|-------------------------------------------|
 | **Web 框架** | Flask (用户管理), FastAPI (智能体服务), Flask-CORS |
-| **数据库** | MySQL, PyMySQL |
-| **AI/LLM** | OpenPangu |
-| **HTTP 客户端** | httpx, aiohttp, requests |
-| **文档处理** | pdfminer.six, PyPDF2, ReportLab |
-| **认证** | PyJWT |
-| **其他** | python-dotenv, Rich, Pydantic |
+| **数据库** | MySQL, PyMySQL                            |
+| **AI/LLM** | OpenPangu、DeepSeek、GLM 接口适配               |
+| **HTTP 客户端** | httpx, aiohttp, requests                  |
+| **文档处理** | pdfminer.six, PyPDF2, ReportLab           |
+| **认证** | PyJWT                                     |
+| **其他** | python-dotenv, Rich, Pydantic             |
 
 ### 项目结构
 
@@ -188,36 +178,45 @@ SciAssistant/
 
 ---
 
-
 ## 配置说明
 
-编辑 `deepdiver_v2/config/.env` 文件，参考典型配置如下：
+### 环境变量与模型适配
 
-```bash
-# ================= LLM 模型配置 =================
-# 你的大模型 API 地址
+首次部署时，复制 `deepdiver_v2/env.template` 到 `deepdiver_v2/config/.env` 并填写实际配置；已有部署保留原值，按需补充新增参数。已有进程环境变量优先于 `.env`，修改后应重启相关服务。
+
+基础配置参考（首次部署需替换占位值，已有部署按需调整）：
+
+```dotenv
+# ================= 模型服务 =================
+# 完整模型接口地址
 MODEL_REQUEST_URL=http://your-llm-endpoint/v1/chat/completions
 # 模型 API Token
 MODEL_REQUEST_TOKEN=your-service-token
 # 模型名称
 MODEL_NAME=your-model-name
+MODEL_PROVIDER=auto
+MODEL_API_PROFILE=default
+MODEL_TOOL_CALL_MODE=text
+MODEL_TEMPERATURE=0.3
+MODEL_MAX_TOKENS=8192
+MODEL_REQUEST_TIMEOUT=900
 
-# ================= MCP 服务器配置 =================
+# ================= MCP 服务 =================
 # MCP Server 地址 (默认为本机 6274 端口)
 MCP_SERVER_URL=http://localhost:6274/mcp
 MCP_USE_STDIO=false
 
-# ================= 搜索与爬虫配置 =================
+# ================= 搜索与网页提取 =================
 # 搜索引擎 API (如 Bing/Google Custom Search)
 SEARCH_ENGINE_BASE_URL=https://google.serper.dev/search
-SEARCH_ENGINE_API_KEYS=your-google-key
+SEARCH_ENGINE_API_KEYS=your-search-key
 
 # URL 爬虫配置 (用于读取网页内容)
 URL_CRAWLER_BASE_URL=http://your-crawler-api
-URL_CRAWLER_API_KEYS=your-api-key
+URL_CRAWLER_API_KEYS=your-crawler-key
 URL_CRAWLER_MAX_TOKENS=100000
 
-# ================= Agent 迭代限制 =================
+# ================= Agent 控制 =================
 PLANNER_MAX_ITERATION=40
 INFORMATION_SEEKER_MAX_ITERATION=30
 WRITER_MAX_ITERATION=40
@@ -234,10 +233,11 @@ REPORT_OUTPUT_PATH=./report
 DEBUG_MODE=false
 MAX_RETRIES=3
 TIMEOUT=30
-
 ```
 
+**模型适配配置**：切换模型时按需调整 `MODEL_PROVIDER` 和 `MODEL_TOOL_CALL_MODE`。思考模式、Pangu 兼容策略及 RAG 等可选参数，参见 [环境变量模板](deepdiver_v2/env.template) 中的注释。
 
+### 数据库与 MCP 服务配置
 
 编辑根目录 `app.py` 文件中的数据库配置：
 ```python
@@ -247,8 +247,6 @@ MYSQL_USER = "root"
 MYSQL_PASSWORD = "your-password"
 MYSQL_DATABASE = "chatai"
 ```
-
-
 
 编辑 `deepdiver_v2/src/tools/server_config.yaml` 文件，参考典型配置如下：
 
@@ -273,8 +271,6 @@ tool_rate_limits:
 PDF 生成会优先使用系统字体，并自动回退到仓库根目录 `Font/` 中附带的开源字体，通常不需要手工修改字体路径。
 
 ---
-
-
 
 ## API 接口
 
@@ -366,7 +362,6 @@ POST /api/files/batch-delete
   "file_ids": ["file-id-1", "file-id-2"]
 }
 ```
-
 
 ### 报告下载
 
