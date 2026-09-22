@@ -81,7 +81,7 @@ class APIConfig:
     search_engine_base_url: Optional[str] = None
     search_engine_api_keys: Optional[str] = None  # Can be comma-separated for rotation
     
-    # URL Crawler Configuration (Generic)
+    # Webpage Fetcher Configuration (Generic)
     url_crawler_base_url: Optional[str] = None
     url_crawler_api_keys: Optional[str] = None  # Can be comma-separated for rotation
     url_crawler_max_tokens: int = 100000
@@ -208,7 +208,7 @@ class APIConfig:
         self.search_engine_base_url = os.getenv("SEARCH_ENGINE_BASE_URL")
         self.search_engine_api_keys = os.getenv("SEARCH_ENGINE_API_KEYS")
         
-        # URL Crawler Configuration
+        # Webpage Fetcher Configuration
         self.url_crawler_base_url = os.getenv("URL_CRAWLER_BASE_URL")
         self.url_crawler_api_keys = os.getenv("URL_CRAWLER_API_KEYS")
         self.url_crawler_max_tokens = int(os.getenv("URL_CRAWLER_MAX_TOKENS", self.url_crawler_max_tokens))
@@ -341,7 +341,7 @@ def validate_api_key(api_key: Optional[str], service_name: str) -> bool:
 
 
 def get_url_crawler_config() -> Dict[str, Any]:
-    """Get generic URL crawler configuration"""
+    """Get generic Webpage fetcher configuration"""
     api_keys = config.url_crawler_api_keys
     base_url = config.url_crawler_base_url
     

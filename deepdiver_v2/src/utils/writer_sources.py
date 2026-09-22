@@ -1,7 +1,7 @@
 """Offline role separation and bounded retrieval for Writer handoffs.
 
 This is candidate retrieval, not claim-level provenance verification. Only the
-known crawler directory is promoted; unknown paths keep the existing behavior.
+known fetcher directory is promoted; unknown paths keep the existing behavior.
 """
 import re
 

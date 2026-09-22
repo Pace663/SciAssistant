@@ -2339,7 +2339,7 @@ class MCPTools:
     def _get_academic_sites_list(self, query: str = "") -> List[str]:
         """
         Get list of academic websites for targeted searching.
-        Ordered by open access priority (higher success rate for content crawling).
+        Ordered by open access priority (higher success rate for content fetching).
         
         Args:
             query: Optional search query for dynamic site selection
@@ -2348,7 +2348,7 @@ class MCPTools:
             List of academic website domains, prioritized by accessibility and relevance
         """
         return [
-            # ===== TIER 1: Preprint Servers & Full Open Access (Crawl Success Rate: 90%+) =====
+            # ===== TIER 1: Preprint Servers & Full Open Access (Fetch Success Rate: 90%+) =====
             "arxiv.org",            # arXiv - Physics, Math, CS preprints (fully open)
             "biorxiv.org",          # bioRxiv - Biology preprints (fully open)
             "plos.org",             # PLOS - Public Library of Science (fully open)
@@ -2934,7 +2934,7 @@ class MCPTools:
             max_workers: int = 10
     ) -> MCPToolResult:
         """
-        Save RAG documents to workspace files using RAG content. Similar to url_crawler.
+        Save RAG documents to workspace files using RAG content.
 
         SIMPLE USAGE: Call with no arguments to use cached result from last search_rag_knowledge.
 
@@ -2951,7 +2951,7 @@ class MCPTools:
         Returns:
             MCPToolResult with list of saved files and their metadata
         """
-        # 【新增】验证保存目录，防止 Agent 传入错误的 url_crawler 目录
+        # 【新增】验证保存目录，防止 Agent 传入错误的目录
         if save_directory and save_directory.startswith('url_crawler_save_files'):
             logger.warning(
                 f"[RAG_SAVER] Invalid directory '{save_directory}' for RAG documents. Using default 'rag_downloads/research'")
@@ -3296,7 +3296,7 @@ class MCPTools:
                         'error': str(e)
                     }
 
-            # Process all documents concurrently (similar to url_crawler)
+            # Process all documents concurrently
             results = []
             with ThreadPoolExecutor(max_workers=min(max_workers, len(documents))) as executor:
                 future_to_doc = {
@@ -3613,13 +3613,6 @@ class MCPTools:
                     'Content-Type': 'application/json'
                 }
 
-                # Users need to implement this - placeholder for custom URL crawler
-                # raise NotImplementedError(
-                #     "URL crawler not implemented. Please implement your own URL crawling logic. "
-                #     "The function should extract text content from URLs and return it in a structured format "
-                #     "with metadata like title, publication date, and word count."
-                # )
-
                 # Example implementation for content extractor (commented out):
                 crawler_url = f"{config.get('base_url', 'https://api.content-extractor.com')}/{url}"
                 response = requests.get(crawler_url, headers=headers, timeout=config.get('timeout', 30), verify=False)
@@ -3648,11 +3641,11 @@ class MCPTools:
             max_workers: int = 10
     ) -> MCPToolResult:
         """
-        Extract LLM-friendly content from URLs using configurable crawler service.
+        Extract LLM-friendly content from URLs using configurable fetcher service.
         Content is saved to specified file paths.
 
-        Users need to implement their own URL crawler. The return format should include:
-        - Extracted text content from the URL
+        Users need to implement their own Webpage fetcher. The return format should include:
+        - Extracted text content from the Webpage
         - Metadata like title, publication date, word count
         - Success/error status for each URL
 
@@ -3673,7 +3666,7 @@ class MCPTools:
             if not crawler_config:
                 return MCPToolResult(
                     success=False,
-                    error="URL crawler not configured"
+                    error="URL fetcher not configured"
                 )
 
             def _is_blocked_or_verification_page(text: str) -> bool:
@@ -3857,7 +3850,7 @@ class MCPTools:
             )
 
         except Exception as e:
-            logger.error(f"URL crawler batch processing failed: {e}")
+            logger.error(f"URL fetcher batch processing failed: {e}")
             return MCPToolResult(success=False, error=str(e))
 
     def _extract_original_filename(self, filename: str) -> str:
@@ -5510,9 +5503,9 @@ class MCPTools:
                                     title = self._extract_title_from_research_filename(file_path)
                                     logger.warning(f"警告: 文件不存在: {direct_file_path} 或 {research_file_path}，使用文件名提取标题")
 
-                    # 【过滤无效引用】跳过 ResearchGate 的反爬虫页面
+                    # 【过滤无效引用】跳过 ResearchGate 的页面
                     if title == "Just a moment..." or title.strip() == "Just a moment...":
-                        logger.warning(f"跳过无效引用 {num}: ResearchGate 反爬虫页面 - {url_source}")
+                        logger.warning(f"跳过无效引用 {num}: ResearchGate 页面 - {url_source}")
                         continue
                     
                     # 【修复 arXiv PDF 文件名作为标题】
@@ -12616,7 +12609,6 @@ Strictly follow the following format for output:
                     )
                 
             else:
-                # Use url_crawler for web pages
                 filename = f"google_scholar_{url_hash}.txt"
                 file_path = f"url_crawler_save_files/{filename}"
                 
@@ -12632,7 +12624,7 @@ Strictly follow the following format for output:
                         error=f"Failed to fetch paper: {crawler_result.error}"
                     )
                 
-                # Extract content from crawler result
+                # Extract content from fetcher result
                 # url_crawler returns data as a list of result dicts directly
                 crawled_data = crawler_result.data if isinstance(crawler_result.data, list) else []
                 if not crawled_data:
@@ -12643,11 +12635,11 @@ Strictly follow the following format for output:
                 
                 result_data = crawled_data[0]
                 
-                # Check if crawling was successful
+                # Check if fetching was successful
                 if not result_data.get('success', False):
                     return MCPToolResult(
                         success=False,
-                        error=f"Failed to crawl URL: {result_data.get('error', 'Unknown error')}"
+                        error=f"Failed to fetch URL: {result_data.get('error', 'Unknown error')}"
                     )
                 
                 paper_title = result_data.get('title', 'Google Scholar Paper')
@@ -12656,7 +12648,7 @@ Strictly follow the following format for output:
                 if not saved_file_path:
                     return MCPToolResult(
                         success=False,
-                        error="File path not found in crawler result"
+                        error="File path not found in fetcher result"
                     )
             
             # Use document_extract to analyze the paper
@@ -13026,14 +13018,14 @@ Markdown Content:
                 if not result_data.get('success', False):
                     return MCPToolResult(
                         success=False,
-                        error=f"Failed to crawl DOI URL: {result_data.get('error', 'Unknown error')}"
+                        error=f"Failed to fetch DOI URL: {result_data.get('error', 'Unknown error')}"
                     )
                 
                 saved_file_path = result_data.get('file_path')
                 if not saved_file_path:
                     return MCPToolResult(
                         success=False,
-                        error="File path not found in crawler result"
+                        error="File path not found in fetcher result"
                     )
             
             # Use document_extract to analyze the paper
@@ -13558,7 +13550,7 @@ MCP_TOOL_SCHEMAS = {
 
     "url_crawler": {
         "name": "url_crawler",
-        "description": "Extract content from web pages using configurable URL crawler API. Input is a list of documents with metadata including URL and local file path for saving extracted content.",
+        "description": "Extract content from web pages using configurable URL fetcher API. Input is a list of documents with metadata including URL and local file path for saving extracted content.",
         "inputSchema": {
             "type": "object",
             "properties": {
