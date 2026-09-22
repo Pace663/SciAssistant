@@ -688,7 +688,7 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                                             if isinstance(queries, list):
                                                 total_search_count += len(queries)
                                         
-                                        # 统计 url_crawler 的抓取次数
+                                        # 统计网页解析次数
                                         elif tool_name == 'url_crawler':
                                             input_args = rec.get('input_args') or {}
                                             documents = input_args.get('documents') or []
