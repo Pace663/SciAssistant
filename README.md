@@ -15,15 +15,13 @@ SciAssistant 是一个基于大语言模型的智能研究助手系统，通过�
 ### Powered by openPangu
 
 本项目基于盘古 DeepDiver-V2 增量开发，提供 Flask/FastAPI 后端、Web 前端及 RESTful API + SSE 实时进度推送，并扩展了多模型接口适配。
-建议优先使用 openPangu 模型，如：
-盘古DeepDiver-V2参考链接(包含模型推理服务)：https://ai.gitcode.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver
+建议优先使用 openPangu 最新模型openPangu 2.0 Pro/Flash：https://gitcode.com/ascend-tribe/openPangu-2.0-Infer
 
-其他盘古模型推理服务参考：
+1） 其它 openPangu 模型与推理服务参考：
+- https://ai.gitcode.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver
+- https://ai.gitcode.com/ascend-tribe/openPangu-R-72B-2512-Int8
 
-- 模型1：https://ai.gitcode.com/ascend-tribe/openPangu-R-72B-2512-Int8
-- 模型2：https://gitcode.com/ascend-tribe/openPangu-2.0-Infer
-
-其他模型可选：deepseek-V3.2、glm5.1、glm5.2
+2） 其他三方模型可选：deepseek-V3.2、glm5.1、glm5.2
 
 ---
 
@@ -140,15 +138,15 @@ python deepdiver_v2/cli/a.py
 
 ### 技术栈
 
-| 类别 | 技术                                        |
-|------|-------------------------------------------|
+| 类别 | 技术                                  |
+|------|-------------------------------------|
 | **Web 框架** | Flask (用户管理), FastAPI (智能体服务), Flask-CORS |
-| **数据库** | MySQL, PyMySQL                            |
-| **AI/LLM** | OpenPangu、DeepSeek、GLM 接口适配               |
-| **HTTP 客户端** | httpx, aiohttp, requests                  |
-| **文档处理** | pdfminer.six, PyPDF2, ReportLab           |
-| **认证** | PyJWT                                     |
-| **其他** | python-dotenv, Rich, Pydantic             |
+| **数据库** | MySQL, PyMySQL                      |
+| **AI/LLM** | 优选：OpenPangu；可选：DeepSeek、GLM    |
+| **HTTP 客户端** | httpx, aiohttp, requests            |
+| **文档处理** | pdfminer.six, PyPDF2, ReportLab     |
+| **认证** | PyJWT                               |
+| **其他** | python-dotenv, Rich, Pydantic       |
 
 ### 项目结构
 
