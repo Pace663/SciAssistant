@@ -132,15 +132,17 @@
             return INLINE_CODE_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
 
-        // 3. 数学公式 - 块级 $$...$$
-        html = html.replace(/\$\$([\s\S]*?)\$\$/g, function(match, formula) {
+        // 3. 数学公式 - 块级 $$...$$ 或 \[...\]
+        html = html.replace(/\$\$[\s\S]*?\$\$|(?<!\\)\\\[(?:(?!\\\[)[\s\S])*?(?<!\\)\\\]/g, function(match) {
+            const formula = match.slice(2, -2);
             const rendered = '<div class="math-block my-3 text-center" data-math="' + escapeHtml(formula.trim()) + '"></div>';
             codeBlocks.push(rendered);
             return MATH_BLOCK_PLACEHOLDER + (codeBlocks.length - 1) + '___';
         });
         
-        // 4. 数学公式 - 行内 $...$（排除$$和货币符号如 $100）
-        html = html.replace(/(?<!\$)\$(?!\$|\d)([^\$\n]+?)\$(?!\$)/g, function(match, formula) {
+        // 4. 数学公式 - 行内 $...$ 或 \(...\)（排除$$和货币符号如 $100）
+        html = html.replace(/(?<!\$)\$(?!\$|\d)([^\$\n]+?)\$(?!\$)|(?<!\\)\\\(((?:(?!\\\()[^\r\n])+?)(?<!\\)\\\)/g, function(match, dollarFormula, parenFormula) {
+            const formula = dollarFormula ?? parenFormula;
             const rendered = '<span class="math-inline" data-math="' + escapeHtml(formula.trim()) + '"></span>';
             codeBlocks.push(rendered);
             return MATH_INLINE_PLACEHOLDER + (codeBlocks.length - 1) + '___';
@@ -377,9 +379,11 @@
         html = html.replace(/^\s*([-*_]){3,}\s*$/gm, '<hr class="my-6 border-t border-gray-300">');
 
         // 5. 列表处理 - 无序列表
+        // 匹配可能跨过空行，缩进只取列表标记所在行。
         html = html.replace(/^(\s*)[-*+] (.*$)/gm, function(match, indent, content) {
-            const level = indent ? Math.min(indent.length / 2, 5) : 0;
-            const padding = level * 1.5;
+            const lineIndent = indent.split(/[\r\n\u2028\u2029]/).pop();
+            const level = Math.min(lineIndent.length / 2, 5);
+            const padding = 0.75 + level * 1.5;
             return `<div style="padding-left: ${padding}rem" class="flex items-start mt-0.5">
                       <span class="mr-2 mt-1.5 w-1.5 h-1.5 bg-gray-600 rounded-full flex-shrink-0"></span>
                       <span>${content}</span>
@@ -388,7 +392,8 @@
 
         // 有序列表
         html = html.replace(/^(\s*)(\d+)\. (.*$)/gm, function(match, indent, number, content) {
-            const level = indent ? Math.min(indent.length / 3, 5) : 0;
+            const lineIndent = indent.split(/[\r\n\u2028\u2029]/).pop();
+            const level = Math.min(lineIndent.length / 3, 5);
             const padding = level * 1.5;
             return `<div style="padding-left: ${padding}rem" class="flex items-start mt-0.5">
                       <span class="mr-2 font-medium text-gray-700 flex-shrink-0">${number}.</span>

@@ -341,6 +341,10 @@ class WriterAgent(BaseAgent):
         self, tool_call: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Recover missing citations once, independently of chapter quality review."""
+        # Keep the task language on both the initial write and any citation rewrite.
+        is_chinese_query = getattr(self, "_is_chinese_query", None)
+        if is_chinese_query is not None and isinstance(tool_call.get("arguments"), dict):
+            tool_call = {**tool_call, "arguments": {**tool_call["arguments"], "is_chinese_query": is_chinese_query}}
         result = self.execute_tool_call(tool_call)
         if not result.get("success"):
             return result

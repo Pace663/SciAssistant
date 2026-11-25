@@ -7261,7 +7261,8 @@ CURRENT CHAPTER CONTENT:
             key_files: List[Dict],
             model: Optional[str] = None,
             temperature: Optional[float] = None,
-            max_tokens: Optional[int] = None
+            max_tokens: Optional[int] = None,
+            is_chinese_query: Optional[bool] = None,
     ) -> MCPToolResult:
         """
         Write the current chapter content based on given web information and chapter structure; also consider user questions, completed chapters, and overall outline to ensure content relevance while avoiding duplication or contradictions.
@@ -7295,20 +7296,11 @@ CURRENT CHAPTER CONTENT:
                 requested_max_tokens, configured_max_tokens, max_tokens
             )
 
-            # ============================================================
-            # LANGUAGE DETECTION: explicitly detect query language at the
-            # Python level instead of relying on the LLM to "detect" it.
-            # This is the PRIMARY fix for the bug where English queries
-            # produce Chinese table content/headings and occasional Korean.
-            # ============================================================
-            import re as _re_lang
-            _query_zh_count = len(_re_lang.findall(r'[一-鿿]', user_query or ''))
-            is_english_query = (_query_zh_count == 0)
-
-            logger.info(
-                f"[section_writer] Language detection: query_zh_count={_query_zh_count}, "
-                f"is_english_query={is_english_query}"
-            )
+            # Standalone callers without a task language retain the original query-based fallback.
+            if is_chinese_query is None:
+                is_chinese_query = bool(re.search(r'[一-鿿]', user_query or ''))
+            is_english_query = not is_chinese_query
+            logger.info("[section_writer] is_english_query=%s", is_english_query)
 
             key_files_dict = {}
             # Create full path relative to workspace using config
@@ -13980,6 +13972,10 @@ MCP_TOOL_SCHEMAS = {
                 "user_query": {
                     "type": "string",
                     "description": "The user query, ensure the drafted content is highly relevant to the user's inquiry."
+                },
+                "is_chinese_query": {
+                    "type": "boolean",
+                    "description": "Task language supplied by the writer runtime."
                 },
                 "current_chapter_outline": {
                     "type": "string",
