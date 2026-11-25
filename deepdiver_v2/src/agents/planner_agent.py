@@ -9,6 +9,7 @@ import time
 import logging
 import json
 import os
+import re
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 try:
@@ -37,6 +38,12 @@ from .. import (
     get_thread_workspace_path,
     inherit_thread_session,
 )
+
+
+def detect_chinese_query(query: str) -> bool:
+    """Apply the task language threshold to the original user text."""
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', query))
+    return chinese_chars / max(len(query.strip()), 1) > 0.3
 
 
 class PlannerAgent(BaseAgent):
@@ -1735,12 +1742,13 @@ $tool_call_format"""
             }
 
 
-    def execute_task(self, user_query: str) -> AgentResponse:
+    def execute_task(self, user_query: str, *, is_chinese_query: Optional[bool] = None) -> AgentResponse:
         """
         Execute a planning task for the given user query
 
         Args:
             user_query: The user's query or request
+            is_chinese_query: Language determined before adding file instructions and model controls.
 
         Returns:
             AgentResponse with planning results and process trace
@@ -1750,12 +1758,7 @@ $tool_call_format"""
         try:
             self.logger.info(f"Starting planner task: {user_query}")
             
-            # 检测用户查询语言
-            import re as _re
-            _zh_count = len(_re.findall(r'[\u4e00-\u9fff]', user_query))
-            _total_chars = len(user_query.strip())
-            # 只有当中文字符占比超过30%时才判定为中文查询
-            self._is_chinese_query = (_zh_count / max(_total_chars, 1)) > 0.3
+            self._is_chinese_query = detect_chinese_query(user_query) if is_chinese_query is None else is_chinese_query
             
             # 发送初始进度（根据语言切换）
             _init_msg = '开始分析任务' if self._is_chinese_query else 'Analyzing task'

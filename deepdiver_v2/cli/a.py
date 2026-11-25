@@ -89,7 +89,7 @@ import queue
 
 # 导入原有核心模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.agents.planner_agent import PlannerAgent, create_planner_agent
+from src.agents.planner_agent import PlannerAgent, create_planner_agent, detect_chinese_query
 from src.agents.base_agent import AgentConfig
 from config.config import get_config
 from fastapi.middleware.cors import CORSMiddleware
@@ -346,16 +346,12 @@ def _download_user_files(user_files_data: List[Dict[str, str]], workspace_path: 
 
 
 # 辅助函数：构建增强的查询文本
-def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]]) -> str:
+def _build_enhanced_query(query_text: str, user_files_data: List[Dict[str, str]], is_chinese_query: Optional[bool] = None) -> str:
     """构建包含用户文件信息的增强查询文本"""
     if not user_files_data:
         return query_text
 
-    # 检测用户query的语言(使用30%阈值)
-    import re
-    _zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-    _total_chars = len(query_text.strip())
-    _is_chinese = (_zh_count / max(_total_chars, 1)) > 0.3
+    _is_chinese = detect_chinese_query(query_text) if is_chinese_query is None else is_chinese_query
 
     # 分离强制文件和可选文件
     mandatory_files = [f for f in user_files_data if f.get('type') == 'mandatory']
@@ -408,6 +404,7 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                          human_in_loop: bool = False, user_outline: Optional[str] = None):
     """处理单个查询（独立进程，使用持久化工作区）"""
     query_text, query_index, user_files_data, search_sources_dict = query_data
+    is_chinese_query = detect_chinese_query(query_text)
     process_id = os.getpid()
     if not task_id:
         task_id = f"req_{int(time.time() * 1000)}_{query_index}"  # 生成唯一请求ID
@@ -544,17 +541,10 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             task_manager.update_task_status(task_id, TaskStatus.CANCELLED)
             raise HTTPException(status_code=499, detail="Task was cancelled by user")
 
-        # 【关键修复】先基于原始query检测语言，避免enhanced_query中的文件提示文本影响语言判断
-        import re
-        _zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-        _total_chars = len(query_text.strip())
-        _is_chinese_query = (_zh_count / max(_total_chars, 1)) > 0.3
-        # 将语言标志传递给agent，确保在execute_task之前就设置好
-        agent._is_chinese_query = _is_chinese_query
-        logger.info(f"[语言检测] 原始query: {query_text[:100]}, 中文字符数: {_zh_count}, 总字符数: {_total_chars}, 判定为中文: {_is_chinese_query}")
+        logger.info("[语言检测] 原始query: %s, 判定为中文: %s", query_text[:100], is_chinese_query)
         
         # 构建增强的查询文本
-        enhanced_query = _build_enhanced_query(query_text, user_files_data)
+        enhanced_query = _build_enhanced_query(query_text, user_files_data, is_chinese_query)
 
         # 再次检查取消状态
         if task_manager.is_task_cancelled(task_id):
@@ -563,7 +553,7 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
             raise HTTPException(status_code=499, detail="Task was cancelled by user")
 
         start_time = time.time()
-        response = agent.execute_task(enhanced_query + " /no_think")
+        response = agent.execute_task(enhanced_query + " /no_think", is_chinese_query=is_chinese_query)
         execution_time = time.time() - start_time
 
         # 检查是否被取消（通过agent响应或直接检查状态）
@@ -711,13 +701,6 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
                 
                 # 在报告末尾添加统计信息
                 try:
-                    # 检测用户查询语言，决定统计信息的语言
-                    import re
-                    query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-                    query_total_chars = len(query_text.strip())
-                    # 只有当中文字符占比超过30%时才判定为中文查询
-                    is_chinese_query = (query_zh_count / max(query_total_chars, 1)) > 0.3
-                    
                     # 添加换页符，使统计信息显示在新的一页
                     if is_chinese_query:
                         stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
@@ -1023,14 +1006,9 @@ def process_single_query(query_data, task_id: Optional[str] = None, username: st
         # 但如果是用户主动取消（499），则跳过存储，避免显示多余的错误提示
         try:
             if frontend_session_id and not is_user_cancelled:
-                # 检测用户查询语言，决定错误提示的语言
-                import re
-                query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-                is_chinese = query_zh_count > len(query_text) * 0.3
-                
                 error_message = (
                     f"抱歉，处理您的请求时遇到了问题：{str(e)}\n\n请尝试重新提问或简化您的问题。" 
-                    if is_chinese 
+                    if is_chinese_query
                     else f"Sorry, an error occurred while processing your request: {str(e)}\n\nPlease try rephrasing or simplifying your question."
                 )
                 
@@ -2174,6 +2152,7 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
                                  outline_confirm_wait_time: float = 0.0):
     """Human in the loop 阶段2：使用用户确认的大纲继续生成报告"""
     query_text, query_index, user_files_data, search_sources_dict = query_data
+    is_chinese_query = detect_chinese_query(query_text)
     workspace_path = Path(workspace_path)
     
     try:
@@ -2239,10 +2218,10 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
             agent.set_progress_callback(send_progress_update)
         
         # 构建增强的查询文本
-        enhanced_query = _build_enhanced_query(query_text, user_files_data)
+        enhanced_query = _build_enhanced_query(query_text, user_files_data, is_chinese_query)
         
         start_time = time.time()
-        response = agent.execute_task(enhanced_query + " /no_think")
+        response = agent.execute_task(enhanced_query + " /no_think", is_chinese_query=is_chinese_query)
         execution_time = time.time() - start_time
         phase2_execution_time = execution_time
         total_generation_time = max(0.0, phase1_execution_time) + phase2_execution_time
@@ -2320,11 +2299,6 @@ def process_single_query_phase2(query_data, task_id: str, username: str,
                 
                 # 添加统计信息
                 try:
-                    import re
-                    query_zh_count = len(re.findall(r'[\u4e00-\u9fff]', query_text))
-                    query_total_chars = len(query_text.strip())
-                    is_chinese_query = (query_zh_count / max(query_total_chars, 1)) > 0.3
-                    
                     if is_chinese_query:
                         stats_section = f"\n\n<div style=\"page-break-before: always;\"></div>\n\n## 报告统计信息\n\n"
                         stats_section += f"- 报告字数: {word_count:,} 字\n"
